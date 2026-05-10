@@ -355,23 +355,40 @@ ULTIMO_PROFIT_FACTOR = 1.0
 REGLAS_APRENDIDAS = "Aún no hay lecciones. Busca confluencia."
 TOKENS_ACUMULADOS = 0
 
-# =================== TELEGRAM ===================
+# =================== TELEGRAM MEJORADO CON LOGS ===================
 def telegram_mensaje(texto):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("⚠️ Telegram no configurado: falta token o chat_id")
+        return
     try:
         if len(texto) > 4000:
             texto = texto[:4000]
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", 
-                      data={"chat_id": TELEGRAM_CHAT_ID, "text": texto}, timeout=10)
-    except Exception as e: print(f"Error Telegram: {e}")
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        resp = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": texto}, timeout=10)
+        if resp.status_code != 200:
+            print(f"❌ Error Telegram: status {resp.status_code} - {resp.text[:200]}")
+        else:
+            print("✅ Mensaje enviado a Telegram")
+    except Exception as e:
+        print(f"❌ Excepción en telegram_mensaje: {e}")
 
 def telegram_enviar_imagen(ruta_imagen, caption=""):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("⚠️ Telegram no configurado para imagen")
+        return
     try:
+        if not os.path.exists(ruta_imagen):
+            print(f"⚠️ Imagen no encontrada: {ruta_imagen}")
+            return
         with open(ruta_imagen, 'rb') as foto:
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto", 
-                          data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption}, files={"photo": foto}, timeout=15)
-    except Exception as e: print(f"Error imagen Telegram: {e}")
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
+            resp = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption}, files={"photo": foto}, timeout=15)
+        if resp.status_code != 200:
+            print(f"❌ Error imagen Telegram: {resp.status_code} - {resp.text[:200]}")
+        else:
+            print("✅ Imagen enviada a Telegram")
+    except Exception as e:
+        print(f"❌ Excepción en telegram_enviar_imagen: {e}")
 
 def reporte_estado():
     if PAPER_TRADE:
@@ -1111,6 +1128,10 @@ def run_bot():
     global paper_balance, paper_trade_counter, paper_win_count, paper_loss_count, paper_total_trades, paper_trade_history, paper_positions
     cargar_memoria()
     set_leverage()
+    
+    # Mensaje de prueba de Telegram al inicio
+    telegram_mensaje("🤖 Bot iniciando - Prueba de conexión")
+    
     if PAPER_TRADE:
         print(f"📄 Iniciando BOT PAPER TRADE con saldo simulado: {paper_balance:.2f} USDT")
         telegram_mensaje(f"📄 Bot Paper Trade Online - Saldo simulado: {paper_balance:.2f} USDT - Riesgo ajustable máx 3 USDT")
