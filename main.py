@@ -1,4 +1,5 @@
 # BOT TRADING CON ANÁLISIS ESTRUCTURADO PASO A PASO (Bybit + Qwen3-VL-32B-Instruct)
+# Versión 3.0 - Análisis crítico, sin sesgos, con contexto_pensamiento, condiciones_espera, zonas_liquidez
 # ==============================================================================
 import os, time, requests, json, numpy as np, pandas as pd
 from scipy.stats import linregress
@@ -44,7 +45,7 @@ paper_loss_count = 0
 paper_total_trades = 0
 paper_trade_history = []
 
-# =================== FUNCIONES BYBIT (igual que antes) ===================
+# =================== FUNCIONES BYBIT ===================
 def bybit_request(endpoint, method="GET", params=None, body=None):
     timestamp = str(int(time.time() * 1000))
     recv_window = "5000"
@@ -207,7 +208,7 @@ def close_position_qty_confirm(qty, side_to_close, max_wait=5):
     print(f"❌ No se confirmó reducción tras {max_wait}s")
     return None
 
-# ====== MEMORIA PERSISTENTE (similar) ======
+# ====== MEMORIA PERSISTENTE ======
 MEMORY_FILE = "memoria_bot_paper.json" if PAPER_TRADE else "memoria_bot_real.json"
 
 def convertir_serializable(obj):
@@ -313,7 +314,7 @@ def parse_json_seguro(raw):
         return json.loads(repaired)
     except: return None
 
-# =================== CONFIGURACIÓN DEL BOT (modificada) ===================
+# =================== CONFIGURACIÓN DEL BOT ===================
 SYMBOL = "BTCUSDT"
 INTERVAL_LTF = "5"
 INTERVAL_HTF = "60"
@@ -324,10 +325,10 @@ GRAFICO_VELAS_LIMIT = 120
 MAX_CONCURRENT_TRADES = 3
 MIN_MARGIN_PER_TRADE = 3.0
 TP1_PERCENT = 0.5
-# Ya no usamos MIN_RISK_REWARD_TP1/TP2 fijos, los define la IA.
-# Pero mantenemos límites de seguridad para SL (evitar SL demasiado justos o absurdos)
-MIN_SL_DIST_PCT = 0.001   # 0.1% mínimo (antes 0.15%)
-MAX_SL_DIST_PCT = 0.01    # 1% máximo (antes 0.5%) - se amplía para dar más libertad a la IA
+
+# Límites de seguridad para SL (solo para evitar valores extremos)
+MIN_SL_DIST_PCT = 0.001   # 0.1% mínimo
+MAX_SL_DIST_PCT = 0.01    # 1% máximo
 
 REAL_BALANCE = None
 REAL_ACTIVE_TRADES = {}
@@ -347,7 +348,7 @@ ULTIMO_PROFIT_FACTOR = 1.0
 REGLAS_APRENDIDAS = "Aún no hay lecciones. Busca confluencia."
 TOKENS_ACUMULADOS = 0
 
-# =================== TELEGRAM (igual, con logs) ===================
+# =================== TELEGRAM (con logs) ===================
 def telegram_mensaje(texto):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ Telegram no configurado")
@@ -489,7 +490,7 @@ def pil_to_base64(img):
     img.save(buffered, format="PNG")
     return f"data:image/png;base64,{base64.b64encode(buffered.getvalue()).decode()}"
 
-# =================== NUEVO PROMPT ESTRUCTURADO PASO A PASO ===================
+# =================== PROMPT DEFINITIVO (sin restricciones, con todos los campos) ===================
 def analizar_con_qwen(img_ltf, img_htf):
     global TOKENS_ACUMULADOS
     try:
@@ -497,16 +498,16 @@ def analizar_con_qwen(img_ltf, img_htf):
         img_htf_b64 = pil_to_base64(img_htf)
         
         prompt = """
-Eres un trader profesional, objetivo y crítico. No tienes sesgo de confirmación. Analiza la siguiente idea de trade paso a paso.
+Eres un trader profesional, objetivo y crítico. No tienes sesgo de confirmación.
 
 **ACTIVO:** BTC/USDT
 **MARCO DE TIEMPO:** LTF = 5 minutos, HTF = 1 hora
-**PRECIO ACTUAL:** (lo ves en el gráfico LTF)
-**CONTEXTO:** Bot automatizado con apalancamiento 34x, riesgo máximo 3 USDT por trade. Solo se abren operaciones si el análisis lo justifica.
+**PRECIO ACTUAL:** (obsérvalo en el gráfico LTF)
+**CONTEXTO DEL ACTIVO:** Bot automatizado con apalancamiento 34x, riesgo máximo 3 USDT por trade. El mercado de criptomonedas es muy volátil. Este análisis es para una operación de corto plazo (minutos/horas).
 
 ---
 
-### ESTRUCTURA DEL ANÁLISIS
+### ESTRUCTURA DEL ANÁLISIS (sigue cada paso)
 
 #### 1. Análisis de tendencia
 - **HTF (1h):** ¿alcista, bajista o lateral? Usa la línea de tendencia blanca y la EMA20. ¿Hay máximos/mínimos crecientes o decrecientes?
@@ -514,34 +515,36 @@ Eres un trader profesional, objetivo y crítico. No tienes sesgo de confirmació
 - **Alineación:** ¿HTF y LTF coinciden? Si no, ¿cuál es el conflicto?
 
 #### 2. Niveles clave
-- **Soporte/resistencia:** Líneas cyan y magenta en ambos gráficos.
-- **EMA20:** ¿Actúa como soporte o resistencia dinámica?
-- **Liquidez:** Identifica máximos/mínimos iguales recientes o zonas de congestión.
-- **Contexto:** ¿El precio está en rango o rompiendo un nivel?
+- **Soporte/resistencia:** líneas cyan y magenta en ambos gráficos.
+- **EMA20:** ¿actúa como soporte o resistencia dinámica?
+- **Liquidez:** identifica máximos/mínimos iguales recientes o zonas de congestión (stop hunts).
+- **Contexto de ruptura o rango:** ¿El precio está en rango (entre soporte y resistencia) o está rompiendo un nivel? Describe si es una ruptura limpia o un fakeout.
 
 #### 3. Evaluación del setup del trade
 - **Dirección sugerida:** Long / Short / Neutral.
-- **Calidad de entrada:** Temprana (recién tocando nivel), óptima (confirmación con vela), tardía (lejos del nivel).
-- **Tipo de operación:** ¿Momentum (continuación) o reversión a la media?
+- **Calidad de entrada:** temprana (recién tocando nivel), óptima (confirmación con vela), tardía (lejos del nivel).
+- **Tipo de operación:** ¿momentum (continuación) o reversión a la media?
 
-#### 4. Riesgo / Beneficio (propuesta numérica)
-Define niveles concretos basándote en el gráfico:
-- **Entrada:** Precio actual (si es razonable) o un nivel límite. Ponlo en el campo `entry_price`.
-- **Stop loss:** Precio donde la tesis se invalidaría (justo debajo de soporte en Long, encima de resistencia en Short). Distancia en % con respecto a entrada.
-- **Take profit 1:** Primer objetivo (mínimo 1.5 veces la distancia del SL).
-- **Take profit 2:** Segundo objetivo (mínimo 2.5 veces la distancia del SL).
-- **Relación R:R estimada:** (TP1 - entrada) / (entrada - SL) para Long, o inversa para Short.
-- **¿Es asimétrico?** (Ganancia potencial vs pérdida)
+#### 4. Riesgo / Beneficio (sobre el gráfico, sin reglas fijas)
+Define niveles concretos que veas en el gráfico:
+- **Entrada:** precio exacto (puede ser el actual o un nivel límite).
+- **Stop loss:** precio donde la tesis se invalida (justo debajo de soporte en Long, encima de resistencia en Short). Calcula la **distancia en %**.
+- **Take profit 1:** primer objetivo (un nivel visible, puede ser una resistencia previa, un soporte, etc.).
+- **Take profit 2:** segundo objetivo (más lejano, donde esperarías una reacción fuerte).
+- **Relación R aproximada:** (TP1 - entrada) / (entrada - SL) para Long, o inversa para Short. No la fuerces, calcula la que realmente se obtiene de los niveles que elegiste.
+- **¿El trade es asimétrico?** (la ganancia potencial es mucho mayor que la pérdida, o es simétrico, o incluso negativo). Sé honesto.
 
 #### 5. Decisión final
-- **¿Debería tomar el trade?** (Sí / No / Solo con condiciones)
-- **Si sí:** ¿Qué debo esperar? (ej. cruce de EMA, ruptura de micro nivel, etc.)
-- **Si no:** ¿Por qué? ¿Qué falta?
+- **¿Debería tomarlo?** (Sí / No / Solo con condiciones)
+- **Si sí:** ¿qué tengo que esperar para confirmar la entrada? (ej. que el precio cierre por encima de la EMA, que se respete un soporte, etc.)
+- **Si no:** ¿por qué? ¿qué falta?
 
-Responde ÚNICAMENTE con un JSON válido en una línea, sin texto adicional. La estructura es:
+Responde ÚNICAMENTE con un JSON válido en una línea. La estructura es:
 {
   "decision": "Buy/Sell/Hold",
-  "razon": "resumen breve de por qué",
+  "razon": "resumen breve de la decisión",
+  "contexto_pensamiento": "aquí describes tu razonamiento paso a paso, qué estás considerando, qué te preocupa, etc.",
+  "condiciones_espera": "si la decisión es Sí, qué esperar para entrar; si es No o Condiciones, qué falta o qué monitorear",
   "entry_price": 0.0,
   "sl_price": 0.0,
   "tp1_price": 0.0,
@@ -551,9 +554,12 @@ Responde ÚNICAMENTE con un JSON válido en una línea, sin texto adicional. La 
     "tendencia_htf": "alcista/bajista/lateral",
     "tendencia_ltf": "alcista/bajista/lateral",
     "alineacion": "alineada/conflicto",
+    "zonas_liquidez": "descripción de las zonas de liquidez detectadas",
+    "contexto_ruptura_rango": "texto corto",
     "calidad_entrada": "temprana/optima/tardia",
     "tipo_operacion": "momentum/reversion",
     "rr_estimada": 2.5,
+    "asimétrico": true/false,
     "decision_texto": "Sí/No/Condiciones"
   }
 }
@@ -572,11 +578,12 @@ Responde ÚNICAMENTE con un JSON válido en una línea, sin texto adicional. La 
         TOKENS_ACUMULADOS += response.usage.total_tokens if response.usage else 0
         datos = parse_json_seguro(response.choices[0].message.content)
         if not datos:
-            return "Hold", "Error parsing", None, None, None, None, "BREAKEVEN", {}
+            return "Hold", "Error parsing", "", "", None, None, None, None, "BREAKEVEN", {}
         
-        # Extraer campos con valores por defecto seguros
         decision = datos.get("decision", "Hold")
         razon = datos.get("razon", "")
+        contexto_pensamiento = datos.get("contexto_pensamiento", "")
+        condiciones_espera = datos.get("condiciones_espera", "")
         entry_price = datos.get("entry_price")
         sl_price = datos.get("sl_price")
         tp1_price = datos.get("tp1_price")
@@ -584,12 +591,12 @@ Responde ÚNICAMENTE con un JSON válido en una línea, sin texto adicional. La 
         trailing = datos.get("trailing_logic", "BREAKEVEN")
         analisis = datos.get("analisis", {})
         
-        return decision, razon, entry_price, sl_price, tp1_price, tp2_price, trailing, analisis
+        return decision, razon, contexto_pensamiento, condiciones_espera, entry_price, sl_price, tp1_price, tp2_price, trailing, analisis
     except Exception as e:
         print(f"❌ Error en IA: {e}")
-        return "Hold", "Error API", None, None, None, None, "BREAKEVEN", {}
+        return "Hold", "Error API", "", "", None, None, None, None, "BREAKEVEN", {}
 
-# =================== GESTIÓN DE RIESGO Y APERTURA (modificada) ===================
+# =================== GESTIÓN DE RIESGO Y APERTURA (respetando niveles de IA) ===================
 def calcular_riesgo_dinamico(free_margin):
     if free_margin >= 20:
         return RISK_PER_TRADE_MAX
@@ -598,27 +605,9 @@ def calcular_riesgo_dinamico(free_margin):
     else:
         return 1.0
 
-def validar_calidad_entrada_opcional(decision, precio, soporte, resistencia, ema20):
-    """Filtro adicional: exige que el precio esté a menos de 0.3% de S/R o EMA. Puedes desactivarlo cambiando a return True."""
-    tolerancia = precio * 0.003
-    if decision == "Buy":
-        cerca_soporte = abs(precio - soporte) <= tolerancia if soporte > 0 else False
-        cerca_ema = abs(precio - ema20) <= tolerancia if ema20 > 0 else False
-        return cerca_soporte or cerca_ema
-    elif decision == "Sell":
-        cerca_resistencia = abs(resistencia - precio) <= tolerancia if resistencia > 0 else False
-        cerca_ema = abs(ema20 - precio) <= tolerancia if ema20 > 0 else False
-        return cerca_resistencia or cerca_ema
-    return False
-
-def abrir_posicion_con_ia(decision, precio_actual, razon, sl_ia, tp1_ia, tp2_ia, analisis, df_ltf, sop, res, slope, inter):
-    """
-    Nueva función unificada para abrir posición (paper o real) usando los niveles propuestos por la IA.
-    Se aplican solo límites de seguridad en SL (distancia mínima y máxima).
-    """
+def abrir_posicion_con_ia(decision, precio_actual, razon, contexto_pensamiento, condiciones_espera, sl_ia, tp1_ia, tp2_ia, analisis, df_ltf, sop, res, slope, inter):
     global paper_balance, paper_positions, paper_trade_counter, REAL_BALANCE, TRADE_COUNTER, REAL_ACTIVE_TRADES
     
-    # Determinar modo
     if PAPER_TRADE:
         balance = paper_balance
         positions = paper_positions
@@ -635,7 +624,6 @@ def abrir_posicion_con_ia(decision, precio_actual, razon, sl_ia, tp1_ia, tp2_ia,
         counter_ref = TRADE_COUNTER
         is_paper = False
     
-    # Máximo de trades simultáneos
     max_trades = get_dynamic_max_trades()
     if len(positions) >= max_trades:
         print(f"⚠️ Máximo dinámico de trades ({max_trades}) alcanzado.")
@@ -646,28 +634,26 @@ def abrir_posicion_con_ia(decision, precio_actual, razon, sl_ia, tp1_ia, tp2_ia,
         print("❌ Margen libre insuficiente.")
         return
     
-    # Riesgo por trade
     risk_per_trade = calcular_riesgo_dinamico(free_margin)
     print(f"💰 Riesgo fijado en {risk_per_trade} USDT (margen libre: {free_margin:.2f})")
     
-    # Precio de entrada: usar el propuesto por IA o el actual si es None/0
-    entrada = precio_actual if not sl_ia else precio_actual  # La IA puede sugerir entry_price, pero por simplicidad usamos el actual
-    # Si la IA devolvió entry_price y es diferente al actual, podríamos usar orden límite, pero por ahora usamos market.
+    entrada = precio_actual  # usamos precio actual (se puede cambiar por entry_price de IA si se implementan órdenes límite)
     
-    # Verificar SL y TP proporcionados
+    # Validar SL
     if not sl_ia or sl_ia <= 0:
         print("❌ La IA no proporcionó un stop loss válido. Cancelando.")
         return
+    # Validar TP
     if not tp1_ia or tp1_ia <= 0:
-        print("⚠️ La IA no dio TP1, se usará TP2 o se cancelará.")
+        print("⚠️ La IA no dio TP1, se usará un TP por defecto (podría no ejecutarse).")
         if tp2_ia and tp2_ia > 0:
-            tp1_ia = tp2_ia  # en caso extremo
+            tp1_ia = tp2_ia
         else:
-            return
+            tp1_ia = entrada * (1.005 if decision=="Buy" else 0.995)  # TP muy conservador
     if not tp2_ia or tp2_ia <= 0:
-        tp2_ia = tp1_ia * 1.5 if decision == "Buy" else tp1_ia * 0.75
+        tp2_ia = tp1_ia * (1.003 if decision=="Buy" else 0.997) if decision=="Buy" else tp1_ia * (0.997 if decision=="Buy" else 1.003)
     
-    # Aplicar límites de seguridad a la distancia del SL (evitar SL demasiado ajustados o absurdos)
+    # Aplicar límites de seguridad al SL (distancia entre 0.1% y 1%)
     if decision == "Buy":
         distancia_propuesta = entrada - sl_ia
         if distancia_propuesta <= 0:
@@ -701,7 +687,7 @@ def abrir_posicion_con_ia(decision, precio_actual, razon, sl_ia, tp1_ia, tp2_ia,
             sl_ajustado = sl_ia
         distancia_final = sl_ajustado - entrada
     
-    # Calcular cantidad basada en riesgo y distancia real
+    # Calcular cantidad
     qty_btc = risk_per_trade / distancia_final
     max_qty = (balance * LEVERAGE) / entrada
     qty_btc = min(qty_btc, max_qty)
@@ -709,34 +695,11 @@ def abrir_posicion_con_ia(decision, precio_actual, razon, sl_ia, tp1_ia, tp2_ia,
         print(f"⚠️ Cantidad muy pequeña ({qty_btc:.4f} BTC). No se abre.")
         return
     
-    # Verificar margen necesario
+    # Margen necesario
     margen_necesario = (qty_btc * entrada) / LEVERAGE
     if margen_necesario > free_margin * 0.98:
         print(f"❌ Margen insuficiente: necesario {margen_necesario:.2f} USDT > libre {free_margin:.2f} USDT.")
         return
-    
-    # Validación opcional de calidad de entrada (cercanía a S/R/EMA)
-    ema20_actual = df_ltf['ema20'].iloc[-1] if not df_ltf.empty and 'ema20' in df_ltf else 0
-    if not validar_calidad_entrada_opcional(decision, entrada, sop, res, ema20_actual):
-        print(f"❌ Entrada rechazada por filtro de cercanía: precio {entrada:.2f} no está cerca de soporte/resistencia/EMA (0.3%).")
-        # Si quieres que la IA sea la única que decida, comenta esta línea.
-        return
-    
-    # Ajustar TP1 y TP2 según la IA, pero respetando distancia mínima respecto a SL (1.5x y 2.5x)
-    if decision == "Buy":
-        tp1_min = entrada + distancia_final * 1.5
-        tp2_min = entrada + distancia_final * 2.5
-        tp1_ajustado = max(tp1_ia, tp1_min) if tp1_ia else tp1_min
-        tp2_ajustado = max(tp2_ia, tp2_min) if tp2_ia else tp2_min
-        if tp2_ajustado <= tp1_ajustado:
-            tp2_ajustado = tp1_ajustado + distancia_final * 0.5
-    else:
-        tp1_min = entrada - distancia_final * 1.5
-        tp2_min = entrada - distancia_final * 2.5
-        tp1_ajustado = min(tp1_ia, tp1_min) if tp1_ia else tp1_min
-        tp2_ajustado = min(tp2_ia, tp2_min) if tp2_ia else tp2_min
-        if tp2_ajustado >= tp1_ajustado:
-            tp2_ajustado = tp1_ajustado - distancia_final * 0.5
     
     # Redondear cantidad y mínimo nocional
     qty_btc = round(qty_btc, 3)
@@ -749,10 +712,9 @@ def abrir_posicion_con_ia(decision, precio_actual, razon, sl_ia, tp1_ia, tp2_ia,
             print(f"❌ Tras ajuste por nocional, margen excedido. Cancelado.")
             return
     
-    # Abrir orden (simulada o real)
+    # Abrir orden
     if is_paper:
         order_id = f"paper_{paper_trade_counter+1}"
-        # Simulación: no se ejecuta orden real
         print(f"📄 PAPER: Orden {decision} {qty_btc} BTC simulada")
     else:
         order_id = place_market_order(decision, qty_btc)
@@ -760,45 +722,53 @@ def abrir_posicion_con_ia(decision, precio_actual, razon, sl_ia, tp1_ia, tp2_ia,
             print("❌ No se pudo abrir la orden real.")
             return
     
-    # Registrar operación
+    # Registrar trade
+    qty_tp1 = round(qty_btc * TP1_PERCENT, 3)
+    qty_restante = round(qty_btc - qty_tp1, 3)
     if is_paper:
         paper_trade_counter += 1
         trade_id = paper_trade_counter
-        positions[paper_trade_counter] = {
+        positions[trade_id] = {
             "id": trade_id, "decision": decision, "entrada": entrada,
             "sl_inicial": sl_ajustado, "sl_actual": sl_ajustado,
-            "tp1": tp1_ajustado, "tp2": tp2_ajustado, "trailing_logic": "BREAKEVEN",
-            "qty_original": qty_btc, "qty_restante": qty_btc - round(qty_btc * TP1_PERCENT, 3),
+            "tp1": tp1_ia, "tp2": tp2_ia, "trailing_logic": "BREAKEVEN",
+            "qty_original": qty_btc, "qty_restante": qty_restante,
             "tp1_ejecutado": False, "tp2_ejecutado": False, "pnl_parcial": 0.0,
-            "razon": razon, "order_id": order_id, "breakeven_activado": False
+            "razon": razon, "order_id": order_id, "breakeven_activado": False,
+            "contexto_pensamiento": contexto_pensamiento, "condiciones_espera": condiciones_espera
         }
-        msg = (f"📄 PAPER: [#{trade_id}] {decision} en {entrada:.2f} | Qty {qty_btc} BTC (riesgo {risk_per_trade} USDT)\n"
-               f"SL: {sl_ajustado:.2f} (dist {distancia_final:.1f} USD)\n"
-               f"TP1: {tp1_ajustado:.2f} | TP2: {tp2_ajustado:.2f}\n"
-               f"Razón: {razon}\nAnálisis IA: {analisis.get('decision_texto','')} | RR: {analisis.get('rr_estimada','?')}\n"
-               f"Margen usado: {margen_necesario:.2f} / {free_margin:.2f} USDT")
-        print(msg)
-        telegram_mensaje(msg)
+        modo = "📄 PAPER"
     else:
         TRADE_COUNTER += 1
         trade_id = TRADE_COUNTER
         positions[trade_id] = {
             "id": trade_id, "decision": decision, "entrada": entrada,
             "sl_inicial": sl_ajustado, "sl_actual": sl_ajustado,
-            "tp1": tp1_ajustado, "tp2": tp2_ajustado, "trailing_logic": "BREAKEVEN",
-            "qty_original": qty_btc, "qty_restante": qty_btc - round(qty_btc * TP1_PERCENT, 3),
+            "tp1": tp1_ia, "tp2": tp2_ia, "trailing_logic": "BREAKEVEN",
+            "qty_original": qty_btc, "qty_restante": qty_restante,
             "tp1_ejecutado": False, "tp2_ejecutado": False, "pnl_parcial": 0.0,
-            "razon": razon, "order_id": order_id, "breakeven_activado": False
+            "razon": razon, "order_id": order_id, "breakeven_activado": False,
+            "contexto_pensamiento": contexto_pensamiento, "condiciones_espera": condiciones_espera
         }
-        msg = (f"🚀 REAL: [#{trade_id}] {decision} en {entrada:.2f} | Qty {qty_btc} BTC (riesgo {risk_per_trade} USDT)\n"
-               f"SL: {sl_ajustado:.2f} (dist {distancia_final:.1f} USD)\n"
-               f"TP1: {tp1_ajustado:.2f} | TP2: {tp2_ajustado:.2f}\n"
-               f"Razón: {razon}\nAnálisis IA: {analisis.get('decision_texto','')} | RR: {analisis.get('rr_estimada','?')}\n"
-               f"Margen usado: {margen_necesario:.2f} / {free_margin:.2f} USDT")
-        print(msg)
-        telegram_mensaje(msg)
+        modo = "🚀 REAL"
     
-    # Enviar gráfico (usar el LTF)
+    # Construir mensaje detallado para Telegram
+    msg = (f"{modo} [#{trade_id}] {decision} en {entrada:.2f} | Qty {qty_btc} BTC (riesgo {risk_per_trade} USDT)\n"
+           f"SL: {sl_ajustado:.2f} (dist {distancia_final:.1f} USD)\n"
+           f"TP1: {tp1_ia:.2f} | TP2: {tp2_ia:.2f}\n"
+           f"Razón: {razon}\n"
+           f"🧠 Contexto pensamiento: {contexto_pensamiento[:200]}\n"
+           f"⏳ Condiciones espera: {condiciones_espera[:150]}\n"
+           f"📊 Análisis: HTF={analisis.get('tendencia_htf','?')} LTF={analisis.get('tendencia_ltf','?')} | {analisis.get('alineacion','')}\n"
+           f"🔍 Liquidez: {analisis.get('zonas_liquidez','')}\n"
+           f"📐 Contexto: {analisis.get('contexto_ruptura_rango','')}\n"
+           f"🎯 Calidad: {analisis.get('calidad_entrada','')} | Tipo: {analisis.get('tipo_operacion','')}\n"
+           f"📏 R:R≈{analisis.get('rr_estimada','?')} | Asimétrico: {analisis.get('asimétrico',False)} | Decisión: {analisis.get('decision_texto','')}\n"
+           f"💰 Margen usado: {margen_necesario:.2f} / {free_margin:.2f} USDT")
+    print(msg)
+    telegram_mensaje(msg)
+    
+    # Enviar gráfico de entrada
     img_completa = generar_grafico_para_vision(df_ltf, "Entrada - 5m", sop, res, slope, inter)
     if img_completa:
         img_completa.save("/tmp/in_completo.png")
@@ -806,7 +776,7 @@ def abrir_posicion_con_ia(decision, precio_actual, razon, sl_ia, tp1_ia, tp2_ia,
     
     guardar_memoria()
 
-# =================== FUNCIONES DE GESTIÓN DE TRADES ACTIVOS (sin cambios significativos) ===================
+# =================== GESTIÓN DE TRADES ACTIVOS (sin cambios relevantes) ===================
 def sync_active_trades_with_bybit():
     if PAPER_TRADE:
         return
@@ -842,7 +812,6 @@ def get_dynamic_max_trades():
     return min(MAX_CONCURRENT_TRADES, max_by_balance)
 
 def revisar_sl_tp_simulado(df):
-    # Misma lógica que tenías, sin cambios. Solo asegura usar paper_positions
     global paper_balance, paper_win_count, paper_loss_count, paper_total_trades, paper_trade_history, paper_positions
     if not paper_positions:
         return
@@ -905,9 +874,6 @@ def revisar_sl_tp_simulado(df):
         aprender_de_trades()
 
 def real_revisar_sl_tp(df):
-    # Similar pero con llamadas reales a close_position_qty_confirm. Mantén tu código original o adapta.
-    # Por brevedad, asumimos que mantienes el que ya funcionaba. Si quieres, te lo paso completo.
-    # Por ahora, pongo un placeholder que llama a la versión real que ya tenías.
     global REAL_BALANCE, WIN_COUNT, LOSS_COUNT, TOTAL_TRADES, TRADE_HISTORY, REAL_ACTIVE_TRADES
     if not REAL_ACTIVE_TRADES: return
     h = df['high'].iloc[-1]; l = df['low'].iloc[-1]
@@ -930,13 +896,57 @@ def real_revisar_sl_tp(df):
                         print(f"🎯 TP1 #{tid} +{pnl_parcial:.2f} USDT")
                         telegram_mensaje(f"🎯 TP1 #{tid}: +{pnl_parcial:.2f} USDT")
                         if t['qty_restante']<=0.0001: cerrar_ids.append(tid)
-        # TP2 y SL similares... (omitido por brevedad, pero debes incluir la lógica completa)
-        # Por favor, mantén tu función real_revisar_sl_tp original que ya funcionaba, solo cambia las referencias a REAL_ACTIVE_TRADES.
-    for tid in cerrar_ids: del REAL_ACTIVE_TRADES[tid]
-    if TOTAL_TRADES>0 and TOTAL_TRADES%10==0 and TOTAL_TRADES!=ULTIMO_APRENDIZAJE: aprender_de_trades()
+                    else:
+                        print(f"⚠️ TP1 no confirmado #{tid}")
+                else:
+                    cerrar_ids.append(tid)
+        # TP2
+        if t['tp1_ejecutado'] and not t['tp2_ejecutado'] and t['tp2']>0 and t['qty_restante']>0:
+            if (t['decision']=="Buy" and h>=t['tp2']) or (t['decision']=="Sell" and l<=t['tp2']):
+                qty_restante = t['qty_restante']
+                if qty_restante>=0.001:
+                    result = close_position_qty_confirm(qty_restante, t['decision'])
+                    if result and result!="already_closed":
+                        pnl_resto = (t['tp2']-t['entrada'])*qty_restante if t['decision']=="Buy" else (t['entrada']-t['tp2'])*qty_restante
+                        pnl_total = t['pnl_parcial']+pnl_resto
+                        REAL_BALANCE = get_real_balance()
+                        TOTAL_TRADES+=1
+                        if pnl_total>0: WIN_COUNT+=1
+                        else: LOSS_COUNT+=1
+                        TRADE_HISTORY.append(convertir_serializable({"pnl":pnl_total, "resultado_win":pnl_total>0, "decision":t['decision'], "razon":t['razon']}))
+                        cerrar_ids.append(tid)
+                        msg = f"✅ CIERRE COMPLETO #{tid} TP2 - PnL: {pnl_total:+.2f} USDT"
+                        print(msg); telegram_mensaje(msg); reporte_estado()
+                    else:
+                        print(f"❌ Falló cierre TP2 #{tid}")
+                else:
+                    cerrar_ids.append(tid)
+        # Stop Loss
+        if t['qty_restante']>0.001:
+            cond = (t['decision']=="Buy" and l<=t['sl_actual']) or (t['decision']=="Sell" and h>=t['sl_actual'])
+            if cond:
+                qty_restante = t['qty_restante']
+                result = close_position_qty_confirm(qty_restante, t['decision'])
+                if result and result!="already_closed":
+                    pnl_resto = (t['sl_actual']-t['entrada'])*qty_restante if t['decision']=="Buy" else (t['entrada']-t['sl_actual'])*qty_restante
+                    pnl_total = t['pnl_parcial']+pnl_resto
+                    REAL_BALANCE = get_real_balance()
+                    TOTAL_TRADES+=1
+                    if pnl_total>0: WIN_COUNT+=1
+                    else: LOSS_COUNT+=1
+                    TRADE_HISTORY.append(convertir_serializable({"pnl":pnl_total, "resultado_win":pnl_total>0, "decision":t['decision'], "razon":t['razon']}))
+                    cerrar_ids.append(tid)
+                    motivo = "Stop Loss inicial" if not t.get('breakeven_activado') else "Breakeven"
+                    msg = f"❌ CIERRE #{tid} por {motivo} - PnL: {pnl_total:+.2f} USDT"
+                    print(msg); telegram_mensaje(msg); reporte_estado()
+                else:
+                    print(f"❌ Falló cierre por stop #{tid}")
+    for tid in cerrar_ids:
+        del REAL_ACTIVE_TRADES[tid]
+    if TOTAL_TRADES>0 and TOTAL_TRADES%10==0 and TOTAL_TRADES!=ULTIMO_APRENDIZAJE:
+        aprender_de_trades()
 
 def aprender_de_trades():
-    # Igual que antes, sin cambios relevantes
     global REGLAS_APRENDIDAS, ULTIMO_APRENDIZAJE, ULTIMO_PROFIT_FACTOR
     try:
         if PAPER_TRADE:
@@ -954,7 +964,6 @@ def aprender_de_trades():
             winrate = (WIN_COUNT/TOTAL_TRADES*100) if TOTAL_TRADES>0 else 0
             resumen = f"📊 APRENDIZAJE #{TOTAL_TRADES}\nWinrate: {winrate:.1f}% PF: {ULTIMO_PROFIT_FACTOR:.2f}"
         telegram_mensaje(resumen)
-        # Lección IA (opcional)
         try:
             ult_serial = convertir_serializable(ult)
             prompt = f"Analiza estos 10 trades y da una lección corta (max 200 chars): {json.dumps(ult_serial)}"
@@ -991,7 +1000,7 @@ def run_bot():
     cargar_memoria()
     set_leverage()
     
-    telegram_mensaje("🤖 Bot iniciando - Modo análisis estructurado paso a paso")
+    telegram_mensaje("🤖 Bot iniciando - Modo análisis estructurado paso a paso sin restricciones forzadas")
     
     if PAPER_TRADE:
         print(f"📄 Iniciando PAPER TRADE - Saldo: {paper_balance:.2f} USDT")
@@ -1009,7 +1018,6 @@ def run_bot():
     while True:
         try:
             iteracion += 1
-            # Obtener data de ambos timeframes
             df_ltf_raw = obtener_velas(INTERVAL_LTF)
             df_htf_raw = obtener_velas(INTERVAL_HTF)
             if df_ltf_raw.empty or df_htf_raw.empty:
@@ -1025,14 +1033,13 @@ def run_bot():
             if not PAPER_TRADE:
                 REAL_BALANCE = get_real_balance()
             max_trades_actual = get_dynamic_max_trades()
-            vela_c = df_ltf.index[-2]  # referencia de vela en LTF
+            vela_c = df_ltf.index[-2]
             if ultima_vela is None:
                 ultima_vela = vela_c
             
             active_count = len(paper_positions) if PAPER_TRADE else len(REAL_ACTIVE_TRADES)
             if active_count < max_trades_actual and ultima_vela != vela_c:
                 if risk_management_check():
-                    # Detectar niveles para ambos gráficos (solo para dibujar)
                     sop_ltf, res_ltf, slope_ltf, inter_ltf, _, _ = detectar_zonas_mercado(df_ltf)
                     sop_htf, res_htf, slope_htf, inter_htf, _, _ = detectar_zonas_mercado(df_htf)
                     
@@ -1040,13 +1047,14 @@ def run_bot():
                     img_htf = generar_grafico_para_vision(df_htf, "BTC/USDT 1h (HTF)", sop_htf, res_htf, slope_htf, inter_htf)
                     
                     if img_ltf and img_htf:
-                        dec, raz, entry_ia, sl_ia, tp1_ia, tp2_ia, trailing, analisis = analizar_con_qwen(img_ltf, img_htf)
+                        dec, raz, ctx_pens, cond_esp, entry_ia, sl_ia, tp1_ia, tp2_ia, trailing, analisis = analizar_con_qwen(img_ltf, img_htf)
                         print(f"🤖 Decisión IA: {dec} - Razón: {raz}")
+                        print(f"🧠 Contexto pensamiento: {ctx_pens[:200]}")
+                        print(f"⏳ Condiciones espera: {cond_esp[:150]}")
                         print(f"📊 Análisis detallado: {analisis}")
                         
                         if dec in ["Buy","Sell"]:
-                            # Usar la nueva función unificada
-                            abrir_posicion_con_ia(dec, precio_actual, raz, sl_ia, tp1_ia, tp2_ia, analisis, df_ltf, sop_ltf, res_ltf, slope_ltf, inter_ltf)
+                            abrir_posicion_con_ia(dec, precio_actual, raz, ctx_pens, cond_esp, sl_ia, tp1_ia, tp2_ia, analisis, df_ltf, sop_ltf, res_ltf, slope_ltf, inter_ltf)
                         else:
                             print(f"⏸️ IA decidió HOLD. Motivo: {raz[:100]}")
                 ultima_vela = vela_c
@@ -1056,7 +1064,6 @@ def run_bot():
                 else:
                     print(f"⏸️ Límite de trades alcanzado ({active_count}/{max_trades_actual})")
             
-            # Revisar trades activos
             if PAPER_TRADE and paper_positions:
                 revisar_sl_tp_simulado(df_ltf)
             elif not PAPER_TRADE and REAL_ACTIVE_TRADES:
