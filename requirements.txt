@@ -1,0 +1,10 @@
+google-generativeai
+json-repair
+numpy
+pandas
+scipy
+matplotlib
+Pillow
+requests
+openai
+pybit
