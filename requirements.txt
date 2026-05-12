@@ -1,10 +1,8 @@
-google-generativeai
-json-repair
 numpy
 pandas
 scipy
 matplotlib
 Pillow
 requests
+json-repair
 openai
-pybit
