@@ -1,4 +1,4 @@
-# BOT TRADING CON ANÁLISIS ESTRUCTURADO Y GRÁFICOS - VERSIÓN CORREGIDA
+# BOT TRADING CON ANÁLISIS ESTRUCTURADO Y GRÁFICOS - VERSIÓN CON TRAILING STOP Y COLORES CORREGIDOS
 # ==============================================================================
 import os, time, requests, json, numpy as np, pandas as pd
 from scipy.stats import linregress
@@ -79,6 +79,9 @@ paper_trade_history = []
 
 # Simular comisión (0.1% por orden)
 PAPER_COMMISSION_PCT = 0.001
+
+# =================== CONFIGURACIÓN TRAILING STOP ===================
+TRAILING_PERCENT = 0.003  # 0.3% de trailing (ajustable)
 
 # =================== FUNCIONES BYBIT ===================
 def bybit_request(endpoint, method="GET", params=None, body=None):
@@ -263,11 +266,12 @@ def guardar_memoria():
             active_trades_meta[tid] = {
                 "id": t["id"], "decision": t["decision"], "entrada": t["entrada"],
                 "razon": t.get("razon", ""), "tp1_ejecutado": t["tp1_ejecutado"],
-                "tp2_ejecutado": t.get("tp2_ejecutado", False),
-                "sl_actual": t.get("sl_actual"), "trailing_logic": t.get("trailing_logic", "BREAKEVEN"),
+                "sl_actual": t.get("sl_actual"),
                 "qty_original": t.get("qty_original"), "qty_restante": t.get("qty_restante"),
                 "breakeven_activado": t.get("breakeven_activado", False),
-                "tp2_price": t.get("tp2_price")
+                "trailing_activado": t.get("trailing_activado", False),
+                "best_price": t.get("best_price"),
+                "trailing_stop": t.get("trailing_stop")
             }
         data = {
             "TRADE_HISTORY": paper_trade_history,
@@ -287,11 +291,12 @@ def guardar_memoria():
             active_trades_meta[tid] = {
                 "id": t["id"], "decision": t["decision"], "entrada": t["entrada"],
                 "razon": t.get("razon", ""), "tp1_ejecutado": t["tp1_ejecutado"],
-                "tp2_ejecutado": t.get("tp2_ejecutado", False),
-                "sl_actual": t.get("sl_actual"), "trailing_logic": t.get("trailing_logic", "BREAKEVEN"),
+                "sl_actual": t.get("sl_actual"),
                 "qty_original": t.get("qty_original"), "qty_restante": t.get("qty_restante"),
                 "breakeven_activado": t.get("breakeven_activado", False),
-                "tp2_price": t.get("tp2_price")
+                "trailing_activado": t.get("trailing_activado", False),
+                "best_price": t.get("best_price"),
+                "trailing_stop": t.get("trailing_stop")
             }
         data = {
             "TRADE_HISTORY": TRADE_HISTORY,
@@ -501,7 +506,7 @@ def detectar_zonas_mercado(df, idx=-2):
     return soporte, resistencia, slope, intercept, tend, micro
 
 def generar_grafico_para_vision(df, titulo, soporte=None, resistencia=None, slope=None, intercept=None,
-                                entry_price=None, sl_price=None, tp1_price=None, tp2_price=None, side=None):
+                                entry_price=None, sl_price=None, tp1_price=None, side=None):
     if df.empty:
         return None
     df_plot = df.tail(GRAFICO_VELAS_LIMIT).copy()
@@ -533,13 +538,20 @@ def generar_grafico_para_vision(df, titulo, soporte=None, resistencia=None, slop
         ax.axhline(sl_price, color='red', linestyle='--', linewidth=2, label=f'SL {sl_price:.0f}')
     if tp1_price is not None:
         ax.axhline(tp1_price, color='lime', linestyle='--', linewidth=2, label=f'TP1 {tp1_price:.0f}')
-    if tp2_price is not None:
-        ax.axhline(tp2_price, color='deepskyblue', linestyle='--', linewidth=2, label=f'TP2 {tp2_price:.0f}')
+    
+    # Forzar todos los textos a color blanco
     titulo_limpio = sanitize_for_matplotlib(titulo)
     ax.set_title(titulo_limpio, color='white', fontsize=14)
+    ax.set_xlabel('Tiempo (velas)', color='white')
+    ax.set_ylabel('Precio (USDT)', color='white')
+    ax.tick_params(colors='white')
+    ax.spines['bottom'].set_color('white')
+    ax.spines['top'].set_color('white')
+    ax.spines['left'].set_color('white')
+    ax.spines['right'].set_color('white')
     ax.set_facecolor('#121212')
     fig.patch.set_facecolor('#121212')
-    ax.legend(loc='upper left', bbox_to_anchor=(1, 1), framealpha=0.5, facecolor='black', edgecolor='white')
+    ax.legend(loc='upper left', bbox_to_anchor=(1, 1), framealpha=0.5, facecolor='black', edgecolor='white', labelcolor='white')
     plt.tight_layout()
     buf = io.BytesIO()
     plt.savefig(buf, format='png', dpi=100)
@@ -553,7 +565,7 @@ def pil_to_base64(img):
     img.save(buffered, format="PNG")
     return f"data:image/png;base64,{base64.b64encode(buffered.getvalue()).decode()}"
 
-# =================== PROMPT MEJORADO CON TP2 OPCIONAL ===================
+# =================== PROMPT SIN TP2 (YA NO LO USAMOS) ===================
 def analizar_con_qwen(img_ltf, img_htf):
     global TOKENS_ACUMULADOS
     try:
@@ -569,7 +581,6 @@ Si ves una oportunidad clara, da precios concretos:
 - entry_price: precio actual o muy cercano (ejecución inmediata market)
 - sl_price: stop loss lógico
 - tp1_price: primer objetivo (cierre del 50% de la posición)
-- tp2_price: (OPCIONAL) segundo objetivo más lejano para el 50% restante. Si no lo ves claro, pon 0.
 La relación riesgo/recompensa debe ser >= 2.
 
 Si no hay oportunidad, devuelve Hold.
@@ -582,13 +593,11 @@ Devuelve ÚNICAMENTE un JSON válido en una línea con esta estructura:
   "entry_price": 0.0,
   "sl_price": 0.0,
   "tp1_price": 0.0,
-  "tp2_price": 0.0,
   "confianza": 0-100
 }
 
 Importante:
 - Si decision es Hold, los precios pueden ser 0.
-- tp2_price debe ser > tp1_price para Buy, o < tp1_price para Sell. Si no aplica, pon 0.
 - No inventes niveles si no hay setup claro.
 """
         response = client.chat.completions.create(
@@ -608,7 +617,7 @@ Importante:
         else:
             datos = parse_json_seguro(contenido)
         if not datos:
-            return "Hold", "Error parsing", "", None, None, None, None, "BREAKEVEN", {}
+            return "Hold", "Error parsing", "", None, None, None, "BREAKEVEN", {}
 
         decision = datos.get("decision", "Hold")
         razon = datos.get("razon", "")
@@ -616,9 +625,6 @@ Importante:
         entry_price = datos.get("entry_price")
         sl_price = datos.get("sl_price")
         tp1_price = datos.get("tp1_price")
-        tp2_price = datos.get("tp2_price")
-        if tp2_price == 0 or tp2_price is None:
-            tp2_price = None
         trailing = "BREAKEVEN"
         analisis = {
             "tendencia_htf": "desconocida",
@@ -627,10 +633,10 @@ Importante:
             "calidad_entrada": "media",
             "decision_texto": "Sí" if decision != "Hold" else "No"
         }
-        return decision, razon, explicacion, entry_price, sl_price, tp1_price, tp2_price, trailing, analisis
+        return decision, razon, explicacion, entry_price, sl_price, tp1_price, trailing, analisis
     except Exception as e:
         logger.error(f"Error en IA: {e}")
-        return "Hold", "Error API", "", None, None, None, None, "BREAKEVEN", {}
+        return "Hold", "Error API", "", None, None, None, "BREAKEVEN", {}
 
 # =================== GESTIÓN DE RIESGO Y APERTURA (SOLO MARKET) ===================
 def calcular_riesgo_dinamico(free_margin):
@@ -641,7 +647,7 @@ def calcular_riesgo_dinamico(free_margin):
     else:
         return 1.0
 
-def abrir_posicion_con_ia(decision, precio_actual, razon, contexto, sl_ia, tp1_ia, tp2_ia, analisis, df_ltf, sop, res, slope, inter):
+def abrir_posicion_con_ia(decision, precio_actual, razon, contexto, sl_ia, tp1_ia, analisis, df_ltf, sop, res, slope, inter):
     global paper_balance, paper_positions, paper_trade_counter, REAL_BALANCE, TRADE_COUNTER, REAL_ACTIVE_TRADES
 
     if decision not in ["Buy", "Sell"]:
@@ -739,7 +745,6 @@ def abrir_posicion_con_ia(decision, precio_actual, razon, contexto, sl_ia, tp1_i
     if is_paper:
         order_id = f"paper_{paper_trade_counter+1}"
         logger.info(f"📄 PAPER: Orden MARKET {decision} {qty_btc} BTC a {entrada:.2f}")
-        # Simular comisión
         comision = nocional * PAPER_COMMISSION_PCT
         paper_balance -= comision
         logger.info(f"   Comisión estimada: {comision:.2f} USDT")
@@ -748,11 +753,12 @@ def abrir_posicion_con_ia(decision, precio_actual, razon, contexto, sl_ia, tp1_i
         positions[trade_id] = {
             "id": trade_id, "decision": decision, "entrada": entrada,
             "sl_inicial": sl_ajustado, "sl_actual": sl_ajustado,
-            "tp1": tp1_ia, "tp2": tp2_ia, "trailing_logic": "BREAKEVEN",
+            "tp1": tp1_ia, "trailing_logic": "TRAILING",
             "qty_original": qty_btc, "qty_restante": round(qty_btc - qty_btc * TP1_PERCENT, 3),
-            "tp1_ejecutado": False, "tp2_ejecutado": False, "pnl_parcial": 0.0,
+            "tp1_ejecutado": False, "pnl_parcial": 0.0,
             "razon": razon, "order_id": order_id, "breakeven_activado": False,
-            "contexto_pensamiento": contexto, "tp2_price": tp2_ia
+            "contexto_pensamiento": contexto,
+            "trailing_activado": False, "best_price": entrada, "trailing_stop": None
         }
         modo = "📄 PAPER"
     else:
@@ -765,17 +771,18 @@ def abrir_posicion_con_ia(decision, precio_actual, razon, contexto, sl_ia, tp1_i
         positions[trade_id] = {
             "id": trade_id, "decision": decision, "entrada": entrada,
             "sl_inicial": sl_ajustado, "sl_actual": sl_ajustado,
-            "tp1": tp1_ia, "tp2": tp2_ia, "trailing_logic": "BREAKEVEN",
+            "tp1": tp1_ia, "trailing_logic": "TRAILING",
             "qty_original": qty_btc, "qty_restante": round(qty_btc - qty_btc * TP1_PERCENT, 3),
-            "tp1_ejecutado": False, "tp2_ejecutado": False, "pnl_parcial": 0.0,
+            "tp1_ejecutado": False, "pnl_parcial": 0.0,
             "razon": razon, "order_id": order_id, "breakeven_activado": False,
-            "contexto_pensamiento": contexto, "tp2_price": tp2_ia
+            "contexto_pensamiento": contexto,
+            "trailing_activado": False, "best_price": entrada, "trailing_stop": None
         }
         modo = "💰 REAL"
 
     msg = (f"{modo} [#{trade_id}] {decision} MARKET en {entrada:.2f} | Qty {qty_btc} BTC (riesgo {risk_per_trade} USDT)\n"
            f"🛑 SL: {sl_ajustado:.2f} (dist {distancia_final:.1f} USD)\n"
-           f"🎯 TP1: {tp1_ia:.2f} | TP2: {tp2_ia if tp2_ia else 'Sin TP2'}\n"
+           f"🎯 TP1: {tp1_ia:.2f} | Trailing: {TRAILING_PERCENT*100:.1f}%\n"
            f"📝 Razón: {razon}\n"
            f"💰 Margen usado: {margen_necesario:.2f} / {free_margin:.2f} USDT")
     logger.info(msg)
@@ -785,16 +792,16 @@ def abrir_posicion_con_ia(decision, precio_actual, razon, contexto, sl_ia, tp1_i
     titulo_grafico = f"Entrada - {modo} #{trade_id}"
     img_completa = generar_grafico_para_vision(df_ltf, titulo_grafico, sop, res, slope, inter,
                                                entry_price=entrada, sl_price=sl_ajustado,
-                                               tp1_price=tp1_ia, tp2_price=tp2_ia, side=decision)
+                                               tp1_price=tp1_ia, side=decision)
     if img_completa:
         img_completa.save("/tmp/in_completo.png")
         caption = (f"{modo} #{trade_id} {decision}\n"
-                   f"Entry: {entrada:.2f} | SL: {sl_ajustado:.2f} | TP1: {tp1_ia:.2f} | TP2: {tp2_ia if tp2_ia else 'Sin TP2'}")
+                   f"Entry: {entrada:.2f} | SL: {sl_ajustado:.2f} | TP1: {tp1_ia:.2f} | Trailing: {TRAILING_PERCENT*100:.1f}%")
         telegram_enviar_imagen("/tmp/in_completo.png", caption)
 
     guardar_memoria()
 
-# =================== GESTIÓN DE TRADES ACTIVOS ===================
+# =================== GESTIÓN DE TRADES ACTIVOS CON TRAILING STOP ===================
 def sync_active_trades_with_bybit():
     if PAPER_TRADE:
         return
@@ -843,7 +850,6 @@ def revisar_sl_tp_simulado(df):
                 qty_tp1 = round(t['qty_original'] * TP1_PERCENT, 3)
                 if qty_tp1 >= 0.001 and t['qty_restante'] > 0:
                     pnl_parcial = (t['tp1'] - t['entrada']) * qty_tp1 if t['decision']=="Buy" else (t['entrada'] - t['tp1']) * qty_tp1
-                    # Restar comisión en paper
                     comision = abs(pnl_parcial) * PAPER_COMMISSION_PCT
                     pnl_parcial -= comision
                     t['pnl_parcial'] += pnl_parcial
@@ -851,20 +857,30 @@ def revisar_sl_tp_simulado(df):
                     t['tp1_ejecutado'] = True
                     t['breakeven_activado'] = True
                     # Mover SL a breakeven (precio de entrada)
-                    t['sl_actual'] = t['entrada']  # exactamente en entrada
-                    logger.info(f"✅ PAPER: TP1 #{tid} +{pnl_parcial:.2f} USDT (SL movido a breakeven)")
-                    telegram_mensaje(f"✅ PAPER TP1 #{tid}: +{pnl_parcial:.2f} USDT. SL en breakeven.")
+                    t['sl_actual'] = t['entrada']
+                    # Inicializar trailing stop
+                    t['trailing_activado'] = True
+                    t['best_price'] = t['entrada']
+                    t['trailing_stop'] = t['entrada']
+                    logger.info(f"✅ PAPER: TP1 #{tid} +{pnl_parcial:.2f} USDT, SL en breakeven, trailing activado")
+                    telegram_mensaje(f"✅ PAPER TP1 #{tid}: +{pnl_parcial:.2f} USDT. Trailing stop activado.")
                     if t['qty_restante'] <= 0.0001:
                         cerrar_ids.append(tid)
                 else:
                     cerrar_ids.append(tid)
 
-        # TP2 solo si existe y no se ha ejecutado
-        if t['tp1_ejecutado'] and not t.get('tp2_ejecutado', False) and t.get('tp2_price') is not None and t['tp2_price'] > 0 and t['qty_restante'] > 0:
-            if (t['decision']=="Buy" and h >= t['tp2_price']) or (t['decision']=="Sell" and l <= t['tp2_price']):
-                qty_restante = t['qty_restante']
-                if qty_restante >= 0.001:
-                    pnl_resto = (t['tp2_price'] - t['entrada']) * qty_restante if t['decision']=="Buy" else (t['entrada'] - t['tp2_price']) * qty_restante
+        # Trailing stop (después de TP1)
+        if t.get('trailing_activado', False) and t['qty_restante'] > 0:
+            if t['decision'] == 'Buy':
+                # Actualizar mejor precio (máximo)
+                if h > t['best_price']:
+                    t['best_price'] = h
+                    t['trailing_stop'] = t['best_price'] * (1 - TRAILING_PERCENT)
+                    logger.debug(f"Trailing Buy #{tid}: best={t['best_price']:.2f}, stop={t['trailing_stop']:.2f}")
+                # Verificar si se tocó el trailing stop
+                if l <= t['trailing_stop']:
+                    qty_restante = t['qty_restante']
+                    pnl_resto = (t['trailing_stop'] - t['entrada']) * qty_restante
                     comision = abs(pnl_resto) * PAPER_COMMISSION_PCT
                     pnl_resto -= comision
                     pnl_total = t['pnl_parcial'] + pnl_resto
@@ -876,15 +892,36 @@ def revisar_sl_tp_simulado(df):
                         paper_loss_count += 1
                     paper_trade_history.append(convertir_serializable({"pnl": pnl_total, "resultado_win": pnl_total>0, "decision": t['decision'], "razon": t['razon']}))
                     cerrar_ids.append(tid)
-                    msg = f"🎯 PAPER CIERRE #{tid} TP2 - PnL: {pnl_total:+.2f} USDT"
+                    msg = f"📉 PAPER CIERRE #{tid} por Trailing Stop - PnL: {pnl_total:+.2f} USDT"
                     logger.info(msg)
                     telegram_mensaje(msg)
                     reporte_estado()
-                else:
+            else:  # Sell
+                if l < t['best_price']:
+                    t['best_price'] = l
+                    t['trailing_stop'] = t['best_price'] * (1 + TRAILING_PERCENT)
+                    logger.debug(f"Trailing Sell #{tid}: best={t['best_price']:.2f}, stop={t['trailing_stop']:.2f}")
+                if h >= t['trailing_stop']:
+                    qty_restante = t['qty_restante']
+                    pnl_resto = (t['entrada'] - t['trailing_stop']) * qty_restante
+                    comision = abs(pnl_resto) * PAPER_COMMISSION_PCT
+                    pnl_resto -= comision
+                    pnl_total = t['pnl_parcial'] + pnl_resto
+                    paper_balance += pnl_total
+                    paper_total_trades += 1
+                    if pnl_total > 0:
+                        paper_win_count += 1
+                    else:
+                        paper_loss_count += 1
+                    paper_trade_history.append(convertir_serializable({"pnl": pnl_total, "resultado_win": pnl_total>0, "decision": t['decision'], "razon": t['razon']}))
                     cerrar_ids.append(tid)
+                    msg = f"📉 PAPER CIERRE #{tid} por Trailing Stop - PnL: {pnl_total:+.2f} USDT"
+                    logger.info(msg)
+                    telegram_mensaje(msg)
+                    reporte_estado()
 
-        # Stop loss
-        if t['qty_restante'] > 0.001:
+        # Stop loss inicial (si no se ha ejecutado TP1 y el precio toca SL)
+        if not t['tp1_ejecutado'] and t['qty_restante'] > 0:
             cond = (t['decision']=="Buy" and l <= t['sl_actual']) or (t['decision']=="Sell" and h >= t['sl_actual'])
             if cond:
                 qty_restante = t['qty_restante']
@@ -900,7 +937,7 @@ def revisar_sl_tp_simulado(df):
                     paper_loss_count+=1
                 paper_trade_history.append(convertir_serializable({"pnl": pnl_total, "resultado_win": pnl_total>0, "decision": t['decision'], "razon": t['razon']}))
                 cerrar_ids.append(tid)
-                motivo = "Stop Loss inicial" if not t.get('breakeven_activado') else "Breakeven"
+                motivo = "Stop Loss inicial"
                 msg = f"🛑 PAPER CIERRE #{tid} por {motivo} - PnL: {pnl_total:+.2f} USDT"
                 logger.info(msg)
                 telegram_mensaje(msg)
@@ -932,10 +969,12 @@ def real_revisar_sl_tp(df):
                         t['qty_restante']=round(t['qty_original']-qty_tp1,3)
                         t['tp1_ejecutado']=True
                         t['breakeven_activado']=True
-                        # Mover SL a breakeven (precio de entrada)
                         t['sl_actual'] = t['entrada']
-                        logger.info(f"✅ TP1 #{tid} +{pnl_parcial:.2f} USDT, SL movido a breakeven")
-                        telegram_mensaje(f"✅ TP1 #{tid}: +{pnl_parcial:.2f} USDT. SL en breakeven.")
+                        t['trailing_activado'] = True
+                        t['best_price'] = t['entrada']
+                        t['trailing_stop'] = t['entrada']
+                        logger.info(f"✅ TP1 #{tid} +{pnl_parcial:.2f} USDT, SL en breakeven, trailing activado")
+                        telegram_mensaje(f"✅ TP1 #{tid}: +{pnl_parcial:.2f} USDT. Trailing activado.")
                         if t['qty_restante']<=0.0001:
                             cerrar_ids.append(tid)
                     else:
@@ -943,34 +982,59 @@ def real_revisar_sl_tp(df):
                 else:
                     cerrar_ids.append(tid)
 
-        # TP2 opcional
-        if t['tp1_ejecutado'] and not t.get('tp2_ejecutado', False) and t.get('tp2_price') is not None and t['tp2_price']>0 and t['qty_restante']>0:
-            if (t['decision']=="Buy" and h>=t['tp2_price']) or (t['decision']=="Sell" and l<=t['tp2_price']):
-                qty_restante = t['qty_restante']
-                if qty_restante>=0.001:
+        # Trailing stop
+        if t.get('trailing_activado', False) and t['qty_restante'] > 0:
+            if t['decision'] == 'Buy':
+                if h > t['best_price']:
+                    t['best_price'] = h
+                    t['trailing_stop'] = t['best_price'] * (1 - TRAILING_PERCENT)
+                if l <= t['trailing_stop']:
+                    qty_restante = t['qty_restante']
                     result = close_position_qty_confirm(qty_restante, t['decision'])
-                    if result and result!="already_closed":
-                        pnl_resto = (t['tp2_price']-t['entrada'])*qty_restante if t['decision']=="Buy" else (t['entrada']-t['tp2_price'])*qty_restante
-                        pnl_total = t['pnl_parcial']+pnl_resto
+                    if result and result != "already_closed":
+                        pnl_resto = (t['trailing_stop'] - t['entrada']) * qty_restante
+                        pnl_total = t['pnl_parcial'] + pnl_resto
                         REAL_BALANCE = get_real_balance()
-                        TOTAL_TRADES+=1
-                        if pnl_total>0:
-                            WIN_COUNT+=1
+                        TOTAL_TRADES += 1
+                        if pnl_total > 0:
+                            WIN_COUNT += 1
                         else:
-                            LOSS_COUNT+=1
-                        TRADE_HISTORY.append(convertir_serializable({"pnl":pnl_total, "resultado_win":pnl_total>0, "decision":t['decision'], "razon":t['razon']}))
+                            LOSS_COUNT += 1
+                        TRADE_HISTORY.append(convertir_serializable({"pnl": pnl_total, "resultado_win": pnl_total>0, "decision": t['decision'], "razon": t['razon']}))
                         cerrar_ids.append(tid)
-                        msg = f"🎯 CIERRE COMPLETO #{tid} TP2 - PnL: {pnl_total:+.2f} USDT"
+                        msg = f"📉 CIERRE #{tid} por Trailing Stop - PnL: {pnl_total:+.2f} USDT"
                         logger.info(msg)
                         telegram_mensaje(msg)
                         reporte_estado()
                     else:
-                        logger.error(f"Falló cierre TP2 #{tid}")
-                else:
-                    cerrar_ids.append(tid)
+                        logger.error(f"Falló cierre por trailing #{tid}")
+            else:  # Sell
+                if l < t['best_price']:
+                    t['best_price'] = l
+                    t['trailing_stop'] = t['best_price'] * (1 + TRAILING_PERCENT)
+                if h >= t['trailing_stop']:
+                    qty_restante = t['qty_restante']
+                    result = close_position_qty_confirm(qty_restante, t['decision'])
+                    if result and result != "already_closed":
+                        pnl_resto = (t['entrada'] - t['trailing_stop']) * qty_restante
+                        pnl_total = t['pnl_parcial'] + pnl_resto
+                        REAL_BALANCE = get_real_balance()
+                        TOTAL_TRADES += 1
+                        if pnl_total > 0:
+                            WIN_COUNT += 1
+                        else:
+                            LOSS_COUNT += 1
+                        TRADE_HISTORY.append(convertir_serializable({"pnl": pnl_total, "resultado_win": pnl_total>0, "decision": t['decision'], "razon": t['razon']}))
+                        cerrar_ids.append(tid)
+                        msg = f"📉 CIERRE #{tid} por Trailing Stop - PnL: {pnl_total:+.2f} USDT"
+                        logger.info(msg)
+                        telegram_mensaje(msg)
+                        reporte_estado()
+                    else:
+                        logger.error(f"Falló cierre por trailing #{tid}")
 
-        # Stop loss
-        if t['qty_restante']>0.001:
+        # Stop loss inicial (antes de TP1)
+        if not t['tp1_ejecutado'] and t['qty_restante'] > 0:
             cond = (t['decision']=="Buy" and l<=t['sl_actual']) or (t['decision']=="Sell" and h>=t['sl_actual'])
             if cond:
                 qty_restante = t['qty_restante']
@@ -986,7 +1050,7 @@ def real_revisar_sl_tp(df):
                         LOSS_COUNT+=1
                     TRADE_HISTORY.append(convertir_serializable({"pnl":pnl_total, "resultado_win":pnl_total>0, "decision":t['decision'], "razon":t['razon']}))
                     cerrar_ids.append(tid)
-                    motivo = "Stop Loss inicial" if not t.get('breakeven_activado') else "Breakeven"
+                    motivo = "Stop Loss inicial"
                     msg = f"🛑 CIERRE #{tid} por {motivo} - PnL: {pnl_total:+.2f} USDT"
                     logger.info(msg)
                     telegram_mensaje(msg)
@@ -1055,9 +1119,9 @@ def run_bot():
     global paper_balance, paper_trade_counter, paper_win_count, paper_loss_count, paper_total_trades, paper_trade_history, paper_positions, ultima_vela
     cargar_memoria()
     set_leverage()
-    sync_active_trades_with_bybit()  # Sincronizar al inicio
+    sync_active_trades_with_bybit()
 
-    telegram_mensaje("🤖 Bot iniciado - Modo simplificado (solo market, TP2 opcional, SL a breakeven tras TP1)")
+    telegram_mensaje("🤖 Bot iniciado - Con TP1 + Trailing Stop dinámico (sin TP2 fijo)")
     logger.info("Bot iniciado")
 
     if PAPER_TRADE:
@@ -1091,13 +1155,10 @@ def run_bot():
             max_trades_actual = get_dynamic_max_trades()
             active_count = len(paper_positions) if PAPER_TRADE else len(REAL_ACTIVE_TRADES)
 
-            # Detectar si es vela nueva (cada 5 minutos)
-            vela_c = df_ltf.index[-1]  # timestamp de la última vela
+            vela_c = df_ltf.index[-1]
             es_vela_nueva = (ultima_vela is None) or (ultima_vela != vela_c)
 
-            # Solo llamar a la IA si es vela nueva, hay espacio y no estamos detenidos
             if es_vela_nueva and active_count < max_trades_actual and risk_management_check():
-                # Generar gráficos solo cuando los vamos a usar
                 sop_ltf, res_ltf, slope_ltf, inter_ltf, _, _ = detectar_zonas_mercado(df_ltf)
                 sop_htf, res_htf, slope_htf, inter_htf, _, _ = detectar_zonas_mercado(df_htf)
 
@@ -1105,11 +1166,11 @@ def run_bot():
                 img_htf = generar_grafico_para_vision(df_htf, "BTC/USDT 1h (HTF)", sop_htf, res_htf, slope_htf, inter_htf)
 
                 if img_ltf and img_htf:
-                    dec, raz, explicacion, entry_ia, sl_ia, tp1_ia, tp2_ia, trailing, analisis = analizar_con_qwen(img_ltf, img_htf)
+                    dec, raz, explicacion, entry_ia, sl_ia, tp1_ia, trailing, analisis = analizar_con_qwen(img_ltf, img_htf)
                     logger.info(f"🧠 Decisión IA: {dec} - Razón: {raz}")
                     if dec != "Hold":
                         logger.info(f"📝 Explicación: {explicacion[:200]}")
-                        abrir_posicion_con_ia(dec, precio_actual, raz, explicacion, sl_ia, tp1_ia, tp2_ia, analisis,
+                        abrir_posicion_con_ia(dec, precio_actual, raz, explicacion, sl_ia, tp1_ia, analisis,
                                               df_ltf, sop_ltf, res_ltf, slope_ltf, inter_ltf)
                 else:
                     logger.error("No se pudieron generar los gráficos")
@@ -1123,7 +1184,6 @@ def run_bot():
                 elif not risk_management_check():
                     logger.debug("Drawdown diario superado, no se consulta IA.")
 
-            # Gestión de trades activos (siempre se ejecuta)
             if PAPER_TRADE and paper_positions:
                 revisar_sl_tp_simulado(df_ltf)
             elif not PAPER_TRADE and REAL_ACTIVE_TRADES:
