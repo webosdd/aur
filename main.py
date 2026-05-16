@@ -1,4 +1,4 @@
-# BOT TRADING CON FILTROS NUMÉRICOS, CONFIRMACIÓN DE VELA Y APRENDIZAJE CONTINUO
+# BOT TRADING CON FILTROS NUMÉRICOS, CONFIRMACIÓN INTELIGENTE Y APRENDIZAJE CONTINUO
 # ==============================================================================
 import os, time, requests, json, numpy as np, pandas as pd
 from scipy.stats import linregress
@@ -93,7 +93,6 @@ MIN_MARGIN_PER_TRADE = 3.0
 TP1_PERCENT = 0.5
 TRAILING_PERCENT = 0.003      # 0.3% trailing stop
 MIN_CIERRE_EMA_PCT = 0.001    # 0.1% por encima de EMA para considerar "cierre válido"
-CONFIRMAR_VELA_SIGUIENTE = True  # Esperar a que la siguiente vela confirme la señal
 MIN_SL_DIST_PCT = 0.0005
 MAX_SL_DIST_PCT = 0.01
 
@@ -115,7 +114,7 @@ ULTIMO_PROFIT_FACTOR = 1.0
 REGLAS_APRENDIDAS = "Aún no hay lecciones."
 TOKENS_ACUMULADOS = 0
 
-# Señales pendientes de confirmación (para CONFIRMAR_VELA_SIGUIENTE)
+# Señales pendientes de confirmación (solo si la IA lo solicita)
 senal_pendiente = None  # dict con todos los datos de la señal
 
 # =================== FUNCIONES BYBIT (igual que antes) ===================
@@ -573,7 +572,7 @@ def pil_to_base64(img):
     img.save(buffered, format="PNG")
     return f"data:image/png;base64,{base64.b64encode(buffered.getvalue()).decode()}"
 
-# =================== NUEVO PROMPT ESTRICTO ===================
+# =================== PROMPT ESTRICTO CON CONFIRMACIÓN INTELIGENTE ===================
 def analizar_con_qwen(img_ltf, img_htf):
     global TOKENS_ACUMULADOS
     try:
@@ -591,13 +590,14 @@ Decide Buy, Sell o Hold siguiendo estas reglas estrictas:
 
 No te fíes de simples toques a la EMA o niveles. Debe haber un cierre sólido o una vela de confirmación.
 
-Proporciona los precios y los siguientes campos booleanos basados en velas cerradas:
+Proporciona los precios y los siguientes campos:
 
 - "cierre_sobre_ema20_ltf": true/false (si la última vela cerrada de 5m cierra por encima de EMA20 + margen)
 - "cierre_bajo_ema20_ltf": true/false
 - "rechazo_soporte": true/false (si hubo vela larga verde tocando soporte)
 - "rechazo_resistencia": true/false
 - "tendencia_htf": "alcista"/"bajista"/"lateral"
+- "confirmacion_necesaria": true/false (marca true si el contexto es dudoso, por ejemplo precio muy cerca de EMA sin cerrar con fuerza, o la tendencia mayor es contraria; marca false si la señal es muy clara y robusta)
 
 Devuelve ÚNICAMENTE un JSON en una línea con esta estructura:
 
@@ -613,7 +613,8 @@ Devuelve ÚNICAMENTE un JSON en una línea con esta estructura:
   "cierre_bajo_ema20_ltf": false,
   "rechazo_soporte": false,
   "rechazo_resistencia": false,
-  "tendencia_htf": ""
+  "tendencia_htf": "",
+  "confirmacion_necesaria": false
 }}
 
 Si no hay condiciones claras, decision = Hold y los precios a 0.
@@ -635,7 +636,7 @@ Si no hay condiciones claras, decision = Hold y los precios a 0.
         else:
             datos = parse_json_seguro(contenido)
         if not datos:
-            return "Hold", "Error parsing", "", None, None, None, 0, False, False, False, False, ""
+            return "Hold", "Error parsing", "", None, None, None, 0, False, False, False, False, "", False
 
         decision = datos.get("decision", "Hold")
         razon = datos.get("razon", "")
@@ -649,14 +650,15 @@ Si no hay condiciones claras, decision = Hold y los precios a 0.
         rechazo_sop = datos.get("rechazo_soporte", False)
         rechazo_res = datos.get("rechazo_resistencia", False)
         tend_htf = datos.get("tendencia_htf", "lateral")
+        confirmacion_necesaria = datos.get("confirmacion_necesaria", False)
         
-        return decision, razon, explicacion, entry_price, sl_price, tp1_price, confianza, cierre_sobre, cierre_bajo, rechazo_sop, rechazo_res, tend_htf
+        return decision, razon, explicacion, entry_price, sl_price, tp1_price, confianza, cierre_sobre, cierre_bajo, rechazo_sop, rechazo_res, tend_htf, confirmacion_necesaria
     except Exception as e:
         logger.error(f"Error en IA: {e}")
-        return "Hold", "Error API", "", None, None, None, 0, False, False, False, False, ""
+        return "Hold", "Error API", "", None, None, None, 0, False, False, False, False, "", False
 
 # =================== FILTRO NUMÉRICO POST-IA ===================
-def validar_setup_ia(decision, razon, df_ltf, df_htf, cierre_sobre_ia, cierre_bajo_ia, rechazo_sop_ia, rechazo_res_ia, tend_htf_ia):
+def validar_setup_ia(decision, razon, df_ltf, df_htf, cierre_sobre_ia, cierre_bajo_ia, rechazo_sop_ia, rechazo_res_ia, tend_htf_ia, confianza):
     """
     Valida con datos reales del DataFrame si la señal de la IA es confiable.
     Retorna (True/False, mensaje_rechazo)
@@ -702,8 +704,8 @@ def validar_setup_ia(decision, razon, df_ltf, df_htf, cierre_sobre_ia, cierre_ba
             return False, f"Buy rechazada: cierre sobre EMA20? {cierre_sobre_valido}, rechazo soporte? {rechazo_sop_valido}"
         if not tendencia_alineada:
             return False, f"Buy rechazada: tendencia HTF real {tendencia_htf_real} no alineada (IA dijo {tend_htf_ia})"
-        if confianza_ia < 60:
-            return False, f"Confianza IA baja ({confianza_ia})"
+        if confianza < 60:
+            return False, f"Confianza IA baja ({confianza})"
         return True, "Validación exitosa"
     
     elif decision == "Sell":
@@ -712,8 +714,8 @@ def validar_setup_ia(decision, razon, df_ltf, df_htf, cierre_sobre_ia, cierre_ba
             return False, f"Sell rechazada: cierre bajo EMA20? {cierre_bajo_valido}, rechazo resistencia? {rechazo_res_valido}"
         if not tendencia_alineada:
             return False, f"Sell rechazada: tendencia HTF real {tendencia_htf_real} no alineada"
-        if confianza_ia < 60:
-            return False, f"Confianza IA baja ({confianza_ia})"
+        if confianza < 60:
+            return False, f"Confianza IA baja ({confianza})"
         return True, "Validación exitosa"
     
     return False, "Decisión no reconocida"
@@ -1198,7 +1200,7 @@ def run_bot():
     set_leverage()
     sync_active_trades_with_bybit()
 
-    telegram_mensaje("🤖 Bot iniciado - Con filtros numéricos, confirmación de vela y trailing stop")
+    telegram_mensaje("🤖 Bot iniciado - Con filtros numéricos, confirmación inteligente y trailing stop")
     logger.info("Bot iniciado")
 
     if PAPER_TRADE:
@@ -1235,16 +1237,15 @@ def run_bot():
             vela_actual_time = df_ltf.index[-1]
             es_vela_nueva = (ultima_vela is None) or (ultima_vela != vela_actual_time)
 
-            # ========== CONFIRMACIÓN DE SEÑAL PENDIENTE ==========
-            if CONFIRMAR_VELA_SIGUIENTE and senal_pendiente is not None:
+            # ========== CONFIRMACIÓN DE SEÑAL PENDIENTE (solo si la IA lo pidió) ==========
+            if senal_pendiente is not None:
                 # Esperamos una vela completa (5 minutos) para confirmar
-                # Verificamos si la vela que generó la señal ya ha sido reemplazada por una nueva vela
                 if ultima_vela is not None and ultima_vela != senal_pendiente['vela_senal']:
-                    # Ahora podemos evaluar la confirmación
+                    # Evaluar confirmación
                     df_confirm = df_ltf.iloc[-2]  # Última vela cerrada (la que sigue a la señal)
                     senal = senal_pendiente
                     if senal['decision'] == 'Buy':
-                        # Confirmación: la nueva vela cerró por encima del máximo de la vela señal (o por encima de EMA20)
+                        # Confirmación: la nueva vela cerró por encima del máximo de la vela señal (o por encima de EMA20 + margen)
                         vela_senal = df_ltf.loc[senal['vela_senal']]
                         confirmado = (df_confirm['close'] > vela_senal['high']) or (df_confirm['close'] > df_confirm['ema20'] * (1 + MIN_CIERRE_EMA_PCT))
                     else:
@@ -1271,21 +1272,21 @@ def run_bot():
                 img_htf = generar_grafico_para_vision(df_htf, "BTC/USDT 1h (HTF)", sop_htf, res_htf, slope_htf, inter_htf, excluir_actual=True)
 
                 if img_ltf and img_htf:
-                    dec, raz, explicacion, entry_ia, sl_ia, tp1_ia, conf, cierre_sobre, cierre_bajo, rech_sop, rech_res, tend_htf = analizar_con_qwen(img_ltf, img_htf)
-                    logger.info(f"🧠 Decisión IA: {dec} - Razón: {raz} - Confianza: {conf}")
+                    dec, raz, explicacion, entry_ia, sl_ia, tp1_ia, conf, cierre_sobre, cierre_bajo, rech_sop, rech_res, tend_htf, confirm_needed = analizar_con_qwen(img_ltf, img_htf)
+                    logger.info(f"🧠 Decisión IA: {dec} - Razón: {raz} - Confianza: {conf} - Confirmación necesaria: {confirm_needed}")
                     if dec != "Hold":
                         # Validación numérica post-IA
-                        valido, mensaje = validar_setup_ia(dec, raz, df_ltf, df_htf, cierre_sobre, cierre_bajo, rech_sop, rech_res, tend_htf)
+                        valido, mensaje = validar_setup_ia(dec, raz, df_ltf, df_htf, cierre_sobre, cierre_bajo, rech_sop, rech_res, tend_htf, conf)
                         if valido:
-                            if CONFIRMAR_VELA_SIGUIENTE:
+                            if confirm_needed:
                                 # Guardar señal pendiente para confirmar en la siguiente vela
                                 senal_pendiente = {
                                     'decision': dec, 'precio_actual': precio_actual, 'razon': raz, 'explicacion': explicacion,
                                     'sl_ia': sl_ia, 'tp1_ia': tp1_ia, 'sop': sop_ltf, 'res': res_ltf, 'slope': slope_ltf,
                                     'inter': inter_ltf, 'vela_senal': vela_actual_time
                                 }
-                                logger.info(f"⏳ Señal {dec} pendiente de confirmación en la siguiente vela.")
-                                telegram_mensaje(f"⏳ Señal {dec} detectada. Esperando confirmación en próxima vela.")
+                                logger.info(f"⏳ Señal {dec} requiere confirmación. Pendiente de siguiente vela.")
+                                telegram_mensaje(f"⏳ Señal {dec} detectada (confianza {conf}). Esperando confirmación en próxima vela.")
                             else:
                                 # Abrir inmediatamente
                                 abrir_posicion_con_ia(dec, precio_actual, raz, explicacion, sl_ia, tp1_ia, df_ltf, sop_ltf, res_ltf, slope_ltf, inter_ltf)
