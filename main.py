@@ -7,7 +7,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from PIL import Image
-import io
+import iogoogle/gemini-2.5-flash-image:free
 import json_repair
 import base64
 from openai import OpenAI
