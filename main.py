@@ -1,4 +1,4 @@
-# BOT TRADING CON GEMINI 2.5 FLASH A TRAVÉS DE OPENROUTER - VERSIÓN RAILWAY
+# BOT TRADING CON GEMINI 2.5 FLASH (OPENROUTER) - SIN RESTRICCIONES
 # ==============================================================================
 import os, time, requests, json, numpy as np, pandas as pd
 from scipy.stats import linregress
@@ -7,7 +7,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from PIL import Image
-import iogoogle/gemini-2.5-flash-image:free
+import io
 import json_repair
 import base64
 from openai import OpenAI
@@ -56,7 +56,7 @@ client = OpenAI(
     base_url=OPENROUTER_BASE_URL,
     api_key=OPENROUTER_API_KEY,
     default_headers={
-        "HTTP-Referer": "https://railway.app",   # Identificador para Railway
+        "HTTP-Referer": "https://railway.app",
         "X-Title": "Trading Bot",
     }
 )
@@ -74,7 +74,6 @@ if not BYBIT_API_KEY or not BYBIT_API_SECRET:
 # =================== MODO PAPER TRADE ===================
 PAPER_TRADE = True   # Cambia a False para operar real
 
-# Estado simulado para paper trading
 paper_balance = 1000.0
 paper_positions = {}
 paper_trade_counter = 0
@@ -96,7 +95,6 @@ GRAFICO_VELAS_LIMIT = 120
 MAX_CONCURRENT_TRADES = 3
 MIN_MARGIN_PER_TRADE = 3.0
 TP1_PERCENT = 0.5
-MIN_CIERRE_EMA_PCT = 0.001
 MIN_SL_DIST_PCT = 0.0005
 MAX_SL_DIST_PCT = 0.01
 
@@ -396,18 +394,26 @@ def parse_json_seguro(raw):
     except:
         return None
 
-# =================== TELEGRAM ===================
+# =================== TELEGRAM (CON DIVISIÓN DE MENSAJES LARGOS) ===================
 def telegram_mensaje_largo(texto):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         logger.warning("Telegram no configurado")
         return
-    partes = [texto[i:i+4000] for i in range(0, len(texto), 4000)]
-    for parte in partes:
+    # Telegram permite hasta 4096 caracteres por mensaje
+    MAX_LEN = 4000
+    if len(texto) <= MAX_LEN:
         try:
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            resp = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": parte}, timeout=10)
-            if resp.status_code != 200:
-                logger.error(f"Error Telegram: {resp.status_code} - {resp.text[:200]}")
+            requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": texto}, timeout=10)
+        except Exception as e:
+            logger.error(f"Excepción telegram: {e}")
+        return
+    # Dividir en partes
+    for i in range(0, len(texto), MAX_LEN):
+        parte = texto[i:i+MAX_LEN]
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": parte}, timeout=10)
         except Exception as e:
             logger.error(f"Excepción telegram: {e}")
 
@@ -571,7 +577,7 @@ def pil_to_base64(img):
     img.save(buffered, format="PNG")
     return f"data:image/png;base64,{base64.b64encode(buffered.getvalue()).decode()}"
 
-# =================== PROMPT PARA GEMINI ===================
+# =================== PROMPT GENERAL PARA GEMINI (SIN RESTRICCIONES) ===================
 def analizar_con_gemini(img_ltf, img_htf):
     global TOKENS_ACUMULADOS
     try:
@@ -579,28 +585,23 @@ def analizar_con_gemini(img_ltf, img_htf):
         img_htf_b64 = pil_to_base64(img_htf)
 
         prompt = """
-Eres un trader profesional de crypto. Analiza SOLO velas CERRADAS (las últimas 5-10 velas completas del gráfico, no la que se está formando).
-Mira los dos gráficos de BTC/USDT: 5 minutos (primera imagen) y 1 hora (segunda imagen).
-
-Decide Buy, Sell o Hold siguiendo estas reglas:
-
-- Para **Buy**: Rechazo claro de soporte (vela larga verde después de tocar soporte), o rompimiento de resistencia confirmado con patrón alcista (martillo, tres soldados, engulfing), o retroceso a EMA20 en tendencia alcista fuerte con vela de rechazo.
-- Para **Sell**: Rechazo claro de resistencia, rompimiento de soporte con patrón bajista, o retroceso a EMA20 en tendencia bajista fuerte con vela de rechazo.
-
-Proporciona precios concretos de entrada, stop loss y take profit 1.
-Devuelve ÚNICAMENTE un JSON en una línea con esta estructura:
-
+Eres un trader profesional de crypto con amplia experiencia en análisis técnico.
+Te voy a mostrar dos gráficos de BTC/USDT: el primero es de 5 minutos (velas recientes), el segundo es de 1 hora (tendencia de mayor plazo).
+Analiza ambos gráficos libremente, fijándote en velas, soportes, resistencias, tendencias, patrones, volumen, etc.
+Decide si en este momento deberías COMPRAR (Buy), VENDER (Sell) o no hacer nada (Hold).
+Si decides comprar o vender, proporciona un precio de entrada (el precio actual o uno ligeramente diferente si esperas un rebote o ruptura), un stop loss razonable y un take profit 1 (objetivo inicial).
+Devuelve ÚNICAMENTE un JSON válido en una línea con esta estructura:
 {
   "decision": "Buy/Sell/Hold",
-  "razon": "frase corta descriptiva (max 150)",
-  "explicacion": "análisis detallado en español",
+  "razon": "explicación breve de por qué tomas esa decisión",
+  "explicacion": "análisis detallado en español, mencionando lo que ves en los gráficos",
   "entry_price": 0.0,
   "sl_price": 0.0,
   "tp1_price": 0.0,
   "confianza": 0-100
 }
-
-Si no hay condiciones claras, decision = Hold y los precios a 0.
+Si la decisión es Hold, los precios deben ser 0.0.
+No añadas texto adicional fuera del JSON.
 """
         response = client.chat.completions.create(
             model=MODELO_VISION,
@@ -614,7 +615,7 @@ Si no hay condiciones claras, decision = Hold y los precios a 0.
                     ]
                 }
             ],
-            temperature=0.2
+            temperature=0.3
         )
         TOKENS_ACUMULADOS += response.usage.total_tokens if response.usage else 0
         contenido = response.choices[0].message.content
@@ -639,47 +640,14 @@ Si no hay condiciones claras, decision = Hold y los precios a 0.
         logger.error(f"Error en IA: {e}")
         return "Hold", "Error API", "", None, None, None, 0
 
-# =================== FILTRO NUMÉRICO POST-IA ===================
+# =================== VALIDACIÓN MÍNIMA ===================
 def validar_setup_ia(decision, razon, df_ltf, df_htf, confianza):
-    if len(df_ltf) < 3 or len(df_htf) < 3:
-        return False, "Datos insuficientes para validar"
-    
-    ultima_cerrada = df_ltf.iloc[-2]
-    precio_cierre = ultima_cerrada['close']
-    ema20 = ultima_cerrada['ema20']
-    soporte_ltf, resistencia_ltf, _, _, _, _ = detectar_zonas_mercado(df_ltf)
-    
-    y_htf = df_htf['close'].values[-30:]
-    slope_htf, _, _, _, _ = linregress(np.arange(len(y_htf)), y_htf)
-    tendencia_fuerte = abs(slope_htf) > 0.05
-    
-    sop_cercano = abs(precio_cierre - soporte_ltf) / soporte_ltf < 0.005
-    res_cercano = abs(resistencia_ltf - precio_cierre) / resistencia_ltf < 0.005
-    vela_alcista = ultima_cerrada['close'] > ultima_cerrada['open']
-    vela_bajista = ultima_cerrada['close'] < ultima_cerrada['open']
-    rechazo_sop_valido = (sop_cercano and vela_alcista and (precio_cierre > ema20))
-    rechazo_res_valido = (res_cercano and vela_bajista and (precio_cierre < ema20))
-    
-    cerca_ema = abs(precio_cierre - ema20) / ema20 < 0.003
-    vela_rechazo_ema = (vela_alcista and ultima_cerrada['low'] <= ema20 * 0.998) or (vela_bajista and ultima_cerrada['high'] >= ema20 * 1.002)
-    
-    if decision == "Buy":
-        cond_valida = (rechazo_sop_valido) or (tendencia_fuerte and cerca_ema and vela_rechazo_ema)
-        if not cond_valida:
-            return False, f"Buy rechazada: sin rechazo de soporte ni retroceso a EMA"
-        if confianza < 50:
-            return False, f"Confianza baja ({confianza})"
-        return True, "Validación exitosa"
-    
-    elif decision == "Sell":
-        cond_valida = (rechazo_res_valido) or (tendencia_fuerte and cerca_ema and vela_rechazo_ema)
-        if not cond_valida:
-            return False, f"Sell rechazada: sin rechazo de resistencia ni retroceso a EMA"
-        if confianza < 50:
-            return False, f"Confianza baja ({confianza})"
-        return True, "Validación exitosa"
-    
-    return False, "Decisión no reconocida"
+    if decision not in ["Buy", "Sell"]:
+        return True, "No aplica"
+    # Solo rechazar si confianza es menor a 30 (puedes ajustar este umbral)
+    if confianza < 30:
+        return False, f"Confianza demasiado baja ({confianza})"
+    return True, "Validación exitosa"
 
 # =================== GESTIÓN DE RIESGO Y APERTURA ===================
 def calcular_riesgo_dinamico(free_margin):
@@ -829,7 +797,8 @@ def abrir_posicion_con_ia(decision, precio_actual, razon, contexto, sl_ia, tp1_i
            f"SL: {sl_ajustado:.2f} (dist {distancia_final:.1f} USD)\n"
            f"TP1: {tp1_ia:.2f}\n"
            f"Razón: {razon}\n"
-           f"Margen requerido: {margen_necesario:.2f} USDT | Libre disponible: {free_margin:.2f} USDT")
+           f"Margen requerido: {margen_necesario:.2f} USDT | Libre disponible: {free_margin:.2f} USDT\n"
+           f"Análisis completo: {contexto}")
     logger.info(msg)
     telegram_mensaje(msg)
 
@@ -1053,7 +1022,7 @@ def run_bot():
     set_leverage()
     sync_active_trades_with_bybit()
 
-    telegram_mensaje("🤖 Bot iniciado - Con Gemini 2.5 Flash a través de OpenRouter")
+    telegram_mensaje("🤖 Bot iniciado - Gemini 2.5 Flash sin restricciones")
     logger.info("Bot iniciado")
 
     if PAPER_TRADE:
