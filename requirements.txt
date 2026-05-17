@@ -1,8 +1,8 @@
 numpy
 pandas
-scipy
 matplotlib
 Pillow
-requests
-json-repair
 openai
+requests
+scipy
+json-repair
