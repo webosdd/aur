@@ -91,11 +91,11 @@ GRAFICO_VELAS_LIMIT = 120
 MAX_CONCURRENT_TRADES = 3
 MIN_MARGIN_PER_TRADE = 3.0
 TP1_PERCENT = 0.5
-TRAILING_PERCENT = 0.005      # 0.5% trailing stop (aumentado desde 0.3%)
-MIN_CIERRE_EMA_PCT = 0.001    # 0.1% por encima de EMA para considerar "cierre válido"
+TRAILING_PERCENT = 0.005      # 0.5% trailing stop (solo tras TP1)
+MIN_CIERRE_EMA_PCT = 0.001    # 0.1% por encima de EMA
 MIN_SL_DIST_PCT = 0.0005
 MAX_SL_DIST_PCT = 0.01
-ATR_MULTIPLIER_SL = 1.5       # Mínimo SL = 1.5 * ATR
+ATR_MULTIPLIER_SL = 1.5       # SL mínimo = 1.5 * ATR
 
 REAL_BALANCE = None
 REAL_ACTIVE_TRADES = {}
@@ -116,9 +116,9 @@ REGLAS_APRENDIDAS = "Aún no hay lecciones."
 TOKENS_ACUMULADOS = 0
 
 # Señales pendientes de confirmación (solo si la IA lo solicita)
-senal_pendiente = None  # dict con todos los datos de la señal
+senal_pendiente = None
 
-# =================== FUNCIONES BYBIT (igual que antes) ===================
+# =================== FUNCIONES BYBIT ===================
 def bybit_request(endpoint, method="GET", params=None, body=None):
     timestamp = str(int(time.time() * 1000))
     recv_window = "5000"
@@ -511,7 +511,6 @@ def generar_grafico_para_vision(df, titulo, soporte=None, resistencia=None, slop
                                 entry_price=None, sl_price=None, tp1_price=None, side=None, excluir_actual=False):
     if df.empty:
         return None
-    # Para la IA, excluir la vela actual si está en formación (solo velas cerradas)
     if excluir_actual and len(df) > 1:
         df_plot = df.iloc[:-1].tail(GRAFICO_VELAS_LIMIT).copy()
     else:
@@ -547,7 +546,6 @@ def generar_grafico_para_vision(df, titulo, soporte=None, resistencia=None, slop
     if tp1_price is not None:
         ax.axhline(tp1_price, color='lime', linestyle='--', linewidth=2, label=f'TP1 {tp1_price:.0f}')
     
-    # Forzar colores claros
     titulo_limpio = sanitize_for_matplotlib(titulo)
     ax.set_title(titulo_limpio, color='white', fontsize=14)
     ax.set_xlabel('Tiempo (velas)', color='white')
@@ -575,7 +573,6 @@ def pil_to_base64(img):
 
 # =================== DETECCIÓN DE PATRONES DE VELAS ===================
 def es_martillo(df, idx):
-    """Martillo: cuerpo pequeño inferior, mecha inferior larga, poca o ninguna mecha superior."""
     vela = df.iloc[idx]
     cuerpo = abs(vela['close'] - vela['open'])
     sombra_inf = min(vela['close'], vela['open']) - vela['low']
@@ -583,7 +580,6 @@ def es_martillo(df, idx):
     return sombra_inf > 2 * cuerpo and sombra_sup < cuerpo * 0.3
 
 def es_estrella_fugaz(df, idx):
-    """Estrella fugaz: cuerpo pequeño superior, mecha superior larga, poca mecha inferior."""
     vela = df.iloc[idx]
     cuerpo = abs(vela['close'] - vela['open'])
     sombra_sup = vela['high'] - max(vela['close'], vela['open'])
@@ -591,7 +587,6 @@ def es_estrella_fugaz(df, idx):
     return sombra_sup > 2 * cuerpo and sombra_inf < cuerpo * 0.3
 
 def es_tres_soldados_blancos(df, idx):
-    """Tres velas alcistas consecutivas con cierres crecientes y cuerpos grandes."""
     if idx < 2:
         return False
     v1 = df.iloc[idx-2]
@@ -604,7 +599,6 @@ def es_tres_soldados_blancos(df, idx):
             (v3['close'] - v3['open']) > 0.002 * v3['close'])
 
 def es_tres_cuervos_negros(df, idx):
-    """Tres velas bajistas consecutivas con cierres decrecientes y cuerpos grandes."""
     if idx < 2:
         return False
     v1 = df.iloc[idx-2]
@@ -617,7 +611,6 @@ def es_tres_cuervos_negros(df, idx):
             (v3['open'] - v3['close']) > 0.002 * v3['close'])
 
 def es_engulfing_alcista(df, idx):
-    """Engulfing alcista: vela actual verde que engulle completamente la vela anterior roja."""
     if idx < 1:
         return False
     v_ant = df.iloc[idx-1]
@@ -626,7 +619,6 @@ def es_engulfing_alcista(df, idx):
             v_act['open'] < v_ant['close'] and v_act['close'] > v_ant['open'])
 
 def es_engulfing_bajista(df, idx):
-    """Engulfing bajista: vela actual roja que engulle completamente la vela anterior verde."""
     if idx < 1:
         return False
     v_ant = df.iloc[idx-1]
@@ -738,7 +730,6 @@ def validar_setup_ia(decision, razon, df_ltf, df_htf, cierre_sobre_ia, cierre_ba
     if len(df_ltf) < 3 or len(df_htf) < 3:
         return False, "Datos insuficientes para validar"
     
-    # Última vela cerrada (índice -2 porque la última puede estar abierta)
     ultima_cerrada = df_ltf.iloc[-2]
     precio_cierre = ultima_cerrada['close']
     ema20 = ultima_cerrada['ema20']
@@ -748,59 +739,50 @@ def validar_setup_ia(decision, razon, df_ltf, df_htf, cierre_sobre_ia, cierre_ba
     y_htf = df_htf['close'].values[-30:]
     slope_htf, _, _, _, _ = linregress(np.arange(len(y_htf)), y_htf)
     tendencia_htf_real = 'alcista' if slope_htf > 0.01 else 'bajista' if slope_htf < -0.01 else 'lateral'
-    tendencia_fuerte = abs(slope_htf) > 0.05  # pendiente fuerte > 0.05% por vela
+    tendencia_fuerte = abs(slope_htf) > 0.05
     
-    # Verificar condiciones numéricas
     cierre_sobre_valido = (precio_cierre > ema20 * (1 + MIN_CIERRE_EMA_PCT))
     cierre_bajo_valido = (precio_cierre < ema20 * (1 - MIN_CIERRE_EMA_PCT))
     
-    # Cercanía a niveles (umbral 0.5% para más flexibilidad)
+    # Cercanía a niveles (umbral 0.5%)
     sop_cercano = abs(precio_cierre - soporte_ltf) / soporte_ltf < 0.005
     res_cercano = abs(resistencia_ltf - precio_cierre) / resistencia_ltf < 0.005
     
-    # Detectar patrones reales en el DataFrame
     vela_alcista = ultima_cerrada['close'] > ultima_cerrada['open']
     vela_bajista = ultima_cerrada['close'] < ultima_cerrada['open']
     
-    # Rechazo de soporte real
     rechazo_sop_valido = (sop_cercano and vela_alcista and (precio_cierre > ema20))
-    # Rechazo de resistencia real
     rechazo_res_valido = (res_cercano and vela_bajista and (precio_cierre < ema20))
     
-    # Rompimientos: precio cruza nivel con patrón de confirmación
+    # Rompimientos con patrón
     idx = -2
     rompimiento_alcista = (precio_cierre > resistencia_ltf and (es_martillo(df_ltf, idx) or es_tres_soldados_blancos(df_ltf, idx) or es_engulfing_alcista(df_ltf, idx)))
     rompimiento_bajista = (precio_cierre < soporte_ltf and (es_estrella_fugaz(df_ltf, idx) or es_tres_cuervos_negros(df_ltf, idx) or es_engulfing_bajista(df_ltf, idx)))
     
-    # Retroceso a EMA con vela de rechazo (pin bar) y tendencia fuerte
+    # Retroceso a EMA
     cerca_ema = abs(precio_cierre - ema20) / ema20 < 0.003
     vela_rechazo_ema = (vela_alcista and ultima_cerrada['low'] <= ema20 * 0.998) or (vela_bajista and ultima_cerrada['high'] >= ema20 * 1.002)
     
-    # Evaluación según decisión y tipo de setup
     if decision == "Buy":
         cond_nivel = rechazo_sop_valido
         cond_rompimiento = rompimiento_alcista and precio_cierre > resistencia_ltf * 1.001
         cond_retroceso = (tendencia_fuerte and cerca_ema and vela_rechazo_ema)
-        
         valido = cond_nivel or cond_rompimiento or cond_retroceso
-        
         if not valido:
-            return False, f"Buy rechazada: no hay rechazo soporte ({rechazo_sop_valido}), rompimiento ({cond_rompimiento}) ni retroceso EMA valido ({cond_retroceso})"
+            return False, f"Buy rechazada: sin nivel, rompimiento o retroceso EMA"
         if confianza < 55:
-            return False, f"Confianza IA baja ({confianza})"
+            return False, f"Confianza baja ({confianza})"
         return True, "Validación exitosa"
     
     elif decision == "Sell":
         cond_nivel = rechazo_res_valido
         cond_rompimiento = rompimiento_bajista and precio_cierre < soporte_ltf * 0.999
         cond_retroceso = (tendencia_fuerte and cerca_ema and vela_rechazo_ema)
-        
         valido = cond_nivel or cond_rompimiento or cond_retroceso
-        
         if not valido:
-            return False, f"Sell rechazada: no hay rechazo resistencia ({rechazo_res_valido}), rompimiento ({cond_rompimiento}) ni retroceso EMA valido ({cond_retroceso})"
+            return False, f"Sell rechazada: sin nivel, rompimiento o retroceso EMA"
         if confianza < 55:
-            return False, f"Confianza IA baja ({confianza})"
+            return False, f"Confianza baja ({confianza})"
         return True, "Validación exitosa"
     
     return False, "Decisión no reconocida"
@@ -856,7 +838,6 @@ def abrir_posicion_con_ia(decision, precio_actual, razon, contexto, sl_ia, tp1_i
         return
 
     entrada = precio_actual
-    # Calcular ATR para ajustar SL mínimo
     atr = df_ltf['atr'].iloc[-1] if 'atr' in df_ltf.columns else entrada * 0.005
     min_sl_dist = atr * ATR_MULTIPLIER_SL
 
@@ -911,7 +892,6 @@ def abrir_posicion_con_ia(decision, precio_actual, razon, contexto, sl_ia, tp1_i
             logger.error("Tras ajuste, margen excedido.")
             return
 
-    # Ejecutar orden market
     if is_paper:
         order_id = f"paper_{paper_trade_counter+1}"
         logger.info(f"📄 PAPER: Orden MARKET {decision} {qty_btc} BTC a {entrada:.2f}")
@@ -920,17 +900,18 @@ def abrir_posicion_con_ia(decision, precio_actual, razon, contexto, sl_ia, tp1_i
         logger.info(f"   Comisión estimada: {comision:.2f} USDT")
         paper_trade_counter += 1
         trade_id = paper_trade_counter
-        # Activar trailing stop desde el inicio
+        # [FIX] trailing_activado = False hasta que se ejecute TP1
         positions[trade_id] = {
             "id": trade_id, "decision": decision, "entrada": entrada,
             "sl_inicial": sl_ajustado, "sl_actual": sl_ajustado,
-            "tp1": tp1_ia, "trailing_logic": "TRAILING",
+            "tp1": tp1_ia,
             "qty_original": qty_btc, "qty_restante": round(qty_btc - qty_btc * TP1_PERCENT, 3),
             "tp1_ejecutado": False, "pnl_parcial": 0.0,
             "razon": razon, "order_id": order_id, "breakeven_activado": False,
             "contexto_pensamiento": contexto,
-            "trailing_activado": True,   # Trailing activo desde el inicio
-            "best_price": entrada, "trailing_stop": entrada * (1 - TRAILING_PERCENT) if decision == "Buy" else entrada * (1 + TRAILING_PERCENT)
+            "trailing_activado": False,
+            "best_price": entrada,
+            "trailing_stop": None
         }
         modo = "📄 PAPER"
     else:
@@ -943,25 +924,25 @@ def abrir_posicion_con_ia(decision, precio_actual, razon, contexto, sl_ia, tp1_i
         positions[trade_id] = {
             "id": trade_id, "decision": decision, "entrada": entrada,
             "sl_inicial": sl_ajustado, "sl_actual": sl_ajustado,
-            "tp1": tp1_ia, "trailing_logic": "TRAILING",
+            "tp1": tp1_ia,
             "qty_original": qty_btc, "qty_restante": round(qty_btc - qty_btc * TP1_PERCENT, 3),
             "tp1_ejecutado": False, "pnl_parcial": 0.0,
             "razon": razon, "order_id": order_id, "breakeven_activado": False,
             "contexto_pensamiento": contexto,
-            "trailing_activado": True,
-            "best_price": entrada, "trailing_stop": entrada * (1 - TRAILING_PERCENT) if decision == "Buy" else entrada * (1 + TRAILING_PERCENT)
+            "trailing_activado": False,
+            "best_price": entrada,
+            "trailing_stop": None
         }
         modo = "💰 REAL"
 
     msg = (f"{modo} [#{trade_id}] {decision} MARKET en {entrada:.2f} | Qty {qty_btc} BTC (riesgo {risk_per_trade} USDT)\n"
            f"🛑 SL: {sl_ajustado:.2f} (dist {distancia_final:.1f} USD)\n"
-           f"🎯 TP1: {tp1_ia:.2f} | Trailing: {TRAILING_PERCENT*100:.1f}%\n"
+           f"🎯 TP1: {tp1_ia:.2f} | Trailing solo tras TP1: {TRAILING_PERCENT*100:.1f}%\n"
            f"📝 Razón: {razon}\n"
            f"💰 Margen requerido: {margen_necesario:.2f} USDT | Libre disponible: {free_margin:.2f} USDT")
     logger.info(msg)
     telegram_mensaje(msg)
 
-    # Gráfico con niveles (excluyendo vela actual para mostrar solo cerradas)
     titulo_grafico = f"Entrada - {modo} #{trade_id}"
     img_completa = generar_grafico_para_vision(df_ltf, titulo_grafico, sop, res, slope, inter,
                                                entry_price=entrada, sl_price=sl_ajustado,
@@ -969,12 +950,12 @@ def abrir_posicion_con_ia(decision, precio_actual, razon, contexto, sl_ia, tp1_i
     if img_completa:
         img_completa.save("/tmp/in_completo.png")
         caption = (f"{modo} #{trade_id} {decision}\n"
-                   f"Entry: {entrada:.2f} | SL: {sl_ajustado:.2f} | TP1: {tp1_ia:.2f} | Trailing: {TRAILING_PERCENT*100:.1f}%")
+                   f"Entry: {entrada:.2f} | SL: {sl_ajustado:.2f} | TP1: {tp1_ia:.2f}")
         telegram_enviar_imagen("/tmp/in_completo.png", caption)
 
     guardar_memoria()
 
-# =================== GESTIÓN DE TRADES ACTIVOS CON TRAILING STOP ===================
+# =================== GESTIÓN DE TRADES ACTIVOS CON TP1 Y TRAILING TRAS TP1 ===================
 def sync_active_trades_with_bybit():
     if PAPER_TRADE:
         return
@@ -1017,7 +998,7 @@ def revisar_sl_tp_simulado(df):
     l = df['low'].iloc[-1]
     cerrar_ids = []
     for tid, t in list(paper_positions.items()):
-        # TP1: cerrar 50% si no se ha hecho y el precio alcanza TP1
+        # TP1: cerrar 50% si no se ha ejecutado y alcanza el precio
         if not t['tp1_ejecutado'] and t['tp1'] is not None and t['tp1'] > 0:
             if (t['decision']=="Buy" and h >= t['tp1']) or (t['decision']=="Sell" and l <= t['tp1']):
                 qty_tp1 = round(t['qty_original'] * TP1_PERCENT, 3)
@@ -1028,15 +1009,18 @@ def revisar_sl_tp_simulado(df):
                     t['pnl_parcial'] += pnl_parcial
                     t['qty_restante'] = round(t['qty_original'] - qty_tp1, 3)
                     t['tp1_ejecutado'] = True
-                    # No mover SL a breakeven, mantener trailing existente
-                    logger.info(f"✅ PAPER: TP1 #{tid} +{pnl_parcial:.2f} USDT")
-                    telegram_mensaje(f"✅ PAPER TP1 #{tid}: +{pnl_parcial:.2f} USDT.")
+                    # [FIX] Activar trailing solo después de TP1
+                    t['trailing_activado'] = True
+                    t['best_price'] = t['entrada']
+                    t['trailing_stop'] = t['entrada'] * (1 - TRAILING_PERCENT) if t['decision']=="Buy" else t['entrada'] * (1 + TRAILING_PERCENT)
+                    logger.info(f"✅ PAPER: TP1 #{tid} +{pnl_parcial:.2f} USDT, trailing activado")
+                    telegram_mensaje(f"✅ PAPER TP1 #{tid}: +{pnl_parcial:.2f} USDT. Trailing stop activado.")
                     if t['qty_restante'] <= 0.0001:
                         cerrar_ids.append(tid)
                 else:
                     cerrar_ids.append(tid)
 
-        # Trailing stop (siempre activo)
+        # Trailing stop (solo si está activado, i.e., después de TP1)
         if t.get('trailing_activado', False) and t['qty_restante'] > 0:
             if t['decision'] == 'Buy':
                 if h > t['best_price']:
@@ -1083,8 +1067,8 @@ def revisar_sl_tp_simulado(df):
                     telegram_mensaje(msg)
                     reporte_estado()
 
-        # Stop loss inicial (solo si no se ha alcanzado TP1 ni trailing)
-        if not t.get('tp1_ejecutado', False) and t['qty_restante'] > 0:
+        # Stop loss inicial (solo si no se ha alcanzado TP1)
+        if not t['tp1_ejecutado'] and t['qty_restante'] > 0:
             cond = (t['decision']=="Buy" and l <= t['sl_actual']) or (t['decision']=="Sell" and h >= t['sl_actual'])
             if cond:
                 qty_restante = t['qty_restante']
@@ -1131,8 +1115,12 @@ def real_revisar_sl_tp(df):
                         t['pnl_parcial']+=pnl_parcial
                         t['qty_restante']=round(t['qty_original']-qty_tp1,3)
                         t['tp1_ejecutado']=True
-                        logger.info(f"✅ TP1 #{tid} +{pnl_parcial:.2f} USDT")
-                        telegram_mensaje(f"✅ TP1 #{tid}: +{pnl_parcial:.2f} USDT.")
+                        # Activar trailing después de TP1
+                        t['trailing_activado'] = True
+                        t['best_price'] = t['entrada']
+                        t['trailing_stop'] = t['entrada'] * (1 - TRAILING_PERCENT) if t['decision']=="Buy" else t['entrada'] * (1 + TRAILING_PERCENT)
+                        logger.info(f"✅ TP1 #{tid} +{pnl_parcial:.2f} USDT, trailing activado")
+                        telegram_mensaje(f"✅ TP1 #{tid}: +{pnl_parcial:.2f} USDT. Trailing activado.")
                         if t['qty_restante']<=0.0001:
                             cerrar_ids.append(tid)
                     else:
@@ -1140,7 +1128,7 @@ def real_revisar_sl_tp(df):
                 else:
                     cerrar_ids.append(tid)
 
-        # Trailing stop
+        # Trailing stop (solo después de TP1)
         if t.get('trailing_activado', False) and t['qty_restante'] > 0:
             if t['decision'] == 'Buy':
                 if h > t['best_price']:
@@ -1191,7 +1179,7 @@ def real_revisar_sl_tp(df):
                     else:
                         logger.error(f"Falló cierre por trailing #{tid}")
 
-        # Stop loss inicial antes de TP1 (solo si no se ha alcanzado TP1)
+        # Stop loss inicial antes de TP1
         if not t['tp1_ejecutado'] and t['qty_restante'] > 0:
             cond = (t['decision']=="Buy" and l<=t['sl_actual']) or (t['decision']=="Sell" and h>=t['sl_actual'])
             if cond:
@@ -1241,7 +1229,6 @@ def aprender_de_trades():
             resumen = f"📚 APRENDIZAJE #{TOTAL_TRADES}\n🏆 Winrate: {winrate:.1f}% | ⚖️ PF: {ULTIMO_PROFIT_FACTOR:.2f}"
         telegram_mensaje(resumen)
 
-        # Prompt más estructurado y en español para evitar basura
         ult_serial = convertir_serializable(ult)
         prompt = f"""Eres un trader experto. Analiza estos últimos 10 trades (formato JSON) y extrae UNA sola lección corta (máximo 200 caracteres) en español, clara y sin caracteres extraños. Enfócate en qué condiciones evitar o buscar para mejorar el winrate.
 
@@ -1255,7 +1242,6 @@ Devuelve SOLO la lección en texto plano, sin comillas, sin saltos de línea adi
             temperature=0.3
         )
         leccion = resp.choices[0].message.content.strip()
-        # Limpiar posibles residuos (comillas, saltos, etc.)
         leccion = re.sub(r'[\n\r"]+', ' ', leccion).strip()
         if len(leccion) > 200:
             leccion = leccion[:197] + "..."
@@ -1294,7 +1280,7 @@ def run_bot():
     set_leverage()
     sync_active_trades_with_bybit()
 
-    telegram_mensaje("🤖 Bot iniciado - Con filtros numéricos, confirmación inteligente y trailing stop")
+    telegram_mensaje("🤖 Bot iniciado - Con filtros numéricos, confirmación inteligente y trailing stop solo tras TP1")
     logger.info("Bot iniciado")
 
     if PAPER_TRADE:
@@ -1331,15 +1317,12 @@ def run_bot():
             vela_actual_time = df_ltf.index[-1]
             es_vela_nueva = (ultima_vela is None) or (ultima_vela != vela_actual_time)
 
-            # ========== CONFIRMACIÓN DE SEÑAL PENDIENTE (solo si la IA lo pidió) ==========
+            # Confirmación de señal pendiente
             if senal_pendiente is not None:
-                # Esperamos una vela completa (5 minutos) para confirmar
                 if ultima_vela is not None and ultima_vela != senal_pendiente['vela_senal']:
-                    # Evaluar confirmación
-                    df_confirm = df_ltf.iloc[-2]  # Última vela cerrada (la que sigue a la señal)
+                    df_confirm = df_ltf.iloc[-2]
                     senal = senal_pendiente
                     if senal['decision'] == 'Buy':
-                        # Confirmación: la nueva vela cerró por encima del máximo de la vela señal (o por encima de EMA20 + margen)
                         vela_senal = df_ltf.loc[senal['vela_senal']]
                         confirmado = (df_confirm['close'] > vela_senal['high']) or (df_confirm['close'] > df_confirm['ema20'] * (1 + MIN_CIERRE_EMA_PCT))
                     else:
@@ -1347,21 +1330,19 @@ def run_bot():
                         confirmado = (df_confirm['close'] < vela_senal['low']) or (df_confirm['close'] < df_confirm['ema20'] * (1 - MIN_CIERRE_EMA_PCT))
                     
                     if confirmado:
-                        logger.info(f"✅ Señal {senal['decision']} confirmada por vela siguiente. Abriendo operación.")
+                        logger.info(f"✅ Señal {senal['decision']} confirmada. Abriendo.")
                         abrir_posicion_con_ia(senal['decision'], senal['precio_actual'], senal['razon'], senal['explicacion'],
                                               senal['sl_ia'], senal['tp1_ia'], df_ltf, senal['sop'], senal['res'], senal['slope'], senal['inter'])
                     else:
-                        logger.info(f"❌ Señal {senal['decision']} no confirmada por vela siguiente. Descartada.")
-                        telegram_mensaje(f"❌ Señal {senal['decision']} descartada por falta de confirmación en vela siguiente.")
+                        logger.info(f"❌ Señal {senal['decision']} no confirmada. Descartada.")
+                        telegram_mensaje(f"❌ Señal {senal['decision']} descartada.")
                     senal_pendiente = None
 
-            # ========== NUEVA SEÑAL DE IA (solo si no hay pendiente) ==========
+            # Nueva señal de IA
             if es_vela_nueva and active_count < max_trades_actual and risk_management_check() and senal_pendiente is None:
-                # Generar gráficos para IA excluyendo la vela actual
                 sop_ltf, res_ltf, slope_ltf, inter_ltf, _, _ = detectar_zonas_mercado(df_ltf)
                 sop_htf, res_htf, slope_htf, inter_htf, _, _ = detectar_zonas_mercado(df_htf)
 
-                # Para la IA, usamos gráficos sin la vela actual (solo velas cerradas)
                 img_ltf = generar_grafico_para_vision(df_ltf, "BTC/USDT 5m (LTF)", sop_ltf, res_ltf, slope_ltf, inter_ltf, excluir_actual=True)
                 img_htf = generar_grafico_para_vision(df_htf, "BTC/USDT 1h (HTF)", sop_htf, res_htf, slope_htf, inter_htf, excluir_actual=True)
 
@@ -1369,23 +1350,20 @@ def run_bot():
                     dec, raz, explicacion, entry_ia, sl_ia, tp1_ia, conf, cierre_sobre, cierre_bajo, rech_sop, rech_res, tend_htf, confirm_needed, tipo_setup = analizar_con_qwen(img_ltf, img_htf)
                     logger.info(f"🧠 Decisión IA: {dec} - Razón: {raz} - Confianza: {conf} - Confirmación necesaria: {confirm_needed} - Tipo setup: {tipo_setup}")
                     if dec != "Hold":
-                        # Validación numérica post-IA
                         valido, mensaje = validar_setup_ia(dec, raz, df_ltf, df_htf, cierre_sobre, cierre_bajo, rech_sop, rech_res, tend_htf, conf, tipo_setup)
                         if valido:
                             if confirm_needed:
-                                # Guardar señal pendiente para confirmar en la siguiente vela
                                 senal_pendiente = {
                                     'decision': dec, 'precio_actual': precio_actual, 'razon': raz, 'explicacion': explicacion,
                                     'sl_ia': sl_ia, 'tp1_ia': tp1_ia, 'sop': sop_ltf, 'res': res_ltf, 'slope': slope_ltf,
                                     'inter': inter_ltf, 'vela_senal': vela_actual_time
                                 }
-                                logger.info(f"⏳ Señal {dec} requiere confirmación. Pendiente de siguiente vela.")
-                                telegram_mensaje(f"⏳ Señal {dec} detectada (confianza {conf}). Esperando confirmación en próxima vela.")
+                                logger.info(f"⏳ Señal {dec} requiere confirmación.")
+                                telegram_mensaje(f"⏳ Señal {dec} detectada (confianza {conf}). Esperando confirmación.")
                             else:
-                                # Abrir inmediatamente
                                 abrir_posicion_con_ia(dec, precio_actual, raz, explicacion, sl_ia, tp1_ia, df_ltf, sop_ltf, res_ltf, slope_ltf, inter_ltf)
                         else:
-                            logger.warning(f"🚫 Señal {dec} rechazada por filtros: {mensaje}")
+                            logger.warning(f"🚫 Señal {dec} rechazada: {mensaje}")
                             telegram_mensaje(f"🚫 Señal {dec} rechazada: {mensaje}")
                     else:
                         logger.info(f"IA decidió HOLD. Razón: {raz[:100]}")
@@ -1394,7 +1372,7 @@ def run_bot():
 
                 ultima_vela = vela_actual_time
 
-            # Gestión de trades activos (siempre)
+            # Gestión de trades activos
             if PAPER_TRADE and paper_positions:
                 revisar_sl_tp_simulado(df_ltf)
             elif not PAPER_TRADE and REAL_ACTIVE_TRADES:
