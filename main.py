@@ -1,4 +1,4 @@
-# BOT TRADING CON GEMINI 2.5 FLASH (OPENROUTER) - SIN RESTRICCIONES
+# BOT TRADING CON GEMINI 2.5 FLASH (OPENROUTER) - CON TIMEOUT Y HEARTBEAT
 # ==============================================================================
 import os, time, requests, json, numpy as np, pandas as pd
 from scipy.stats import linregress
@@ -60,7 +60,7 @@ client = OpenAI(
         "X-Title": "Trading Bot",
     }
 )
-MODELO_VISION = "google/gemini-2.5-flash-image"
+MODELO_VISION = "google/gemini-2.5-flash-image"  # Sin :free
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -116,7 +116,7 @@ ULTIMO_PROFIT_FACTOR = 1.0
 REGLAS_APRENDIDAS = "Aún no hay lecciones."
 TOKENS_ACUMULADOS = 0
 
-# =================== FUNCIONES BYBIT ===================
+# =================== FUNCIONES BYBIT (sin cambios) ===================
 def bybit_request(endpoint, method="GET", params=None, body=None):
     timestamp = str(int(time.time() * 1000))
     recv_window = "5000"
@@ -394,12 +394,11 @@ def parse_json_seguro(raw):
     except:
         return None
 
-# =================== TELEGRAM (CON DIVISIÓN DE MENSAJES LARGOS) ===================
+# =================== TELEGRAM ===================
 def telegram_mensaje_largo(texto):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         logger.warning("Telegram no configurado")
         return
-    # Telegram permite hasta 4096 caracteres por mensaje
     MAX_LEN = 4000
     if len(texto) <= MAX_LEN:
         try:
@@ -408,7 +407,6 @@ def telegram_mensaje_largo(texto):
         except Exception as e:
             logger.error(f"Excepción telegram: {e}")
         return
-    # Dividir en partes
     for i in range(0, len(texto), MAX_LEN):
         parte = texto[i:i+MAX_LEN]
         try:
@@ -577,7 +575,7 @@ def pil_to_base64(img):
     img.save(buffered, format="PNG")
     return f"data:image/png;base64,{base64.b64encode(buffered.getvalue()).decode()}"
 
-# =================== PROMPT GENERAL PARA GEMINI (SIN RESTRICCIONES) ===================
+# =================== PROMPT GENERAL PARA GEMINI (CON TIMEOUT) ===================
 def analizar_con_gemini(img_ltf, img_htf):
     global TOKENS_ACUMULADOS
     try:
@@ -615,7 +613,8 @@ No añadas texto adicional fuera del JSON.
                     ]
                 }
             ],
-            temperature=0.3
+            temperature=0.3,
+            timeout=60  # Timeout de 60 segundos
         )
         TOKENS_ACUMULADOS += response.usage.total_tokens if response.usage else 0
         contenido = response.choices[0].message.content
@@ -638,13 +637,12 @@ No añadas texto adicional fuera del JSON.
         return decision, razon, explicacion, entry_price, sl_price, tp1_price, confianza
     except Exception as e:
         logger.error(f"Error en IA: {e}")
-        return "Hold", "Error API", "", None, None, None, 0
+        return "Hold", f"Error: {str(e)[:50]}", "", None, None, None, 0
 
 # =================== VALIDACIÓN MÍNIMA ===================
 def validar_setup_ia(decision, razon, df_ltf, df_htf, confianza):
     if decision not in ["Buy", "Sell"]:
         return True, "No aplica"
-    # Solo rechazar si confianza es menor a 30 (puedes ajustar este umbral)
     if confianza < 30:
         return False, f"Confianza demasiado baja ({confianza})"
     return True, "Validación exitosa"
@@ -985,7 +983,7 @@ def aprender_de_trades():
         try:
             ult_serial = convertir_serializable(ult)
             prompt = f"Analiza estos 10 trades y da una lección corta (max 200 chars) en español: {json.dumps(ult_serial)}"
-            resp = client.chat.completions.create(model=MODELO_VISION, messages=[{"role":"user","content":prompt}], timeout=10)
+            resp = client.chat.completions.create(model=MODELO_VISION, messages=[{"role":"user","content":prompt}], timeout=30)
             REGLAS_APRENDIDAS = resp.choices[0].message.content
             telegram_mensaje(f"Lección IA: {REGLAS_APRENDIDAS}")
         except:
@@ -1022,7 +1020,7 @@ def run_bot():
     set_leverage()
     sync_active_trades_with_bybit()
 
-    telegram_mensaje("🤖 Bot iniciado - Gemini 2.5 Flash sin restricciones")
+    telegram_mensaje("🤖 Bot iniciado - Gemini 2.5 Flash con timeout y heartbeat")
     logger.info("Bot iniciado")
 
     if PAPER_TRADE:
@@ -1039,6 +1037,10 @@ def run_bot():
     ultima_vela = None
     while True:
         try:
+            # Heartbeat cada 5 minutos (300 segundos)
+            if int(time.time()) % 300 < 5:
+                logger.info("❤️ Bot heartbeat - funcionando correctamente")
+
             df_ltf_raw = obtener_velas(INTERVAL_LTF)
             df_htf_raw = obtener_velas(INTERVAL_HTF)
             if df_ltf_raw.empty or df_htf_raw.empty:
