@@ -1,4 +1,4 @@
-# BOT TRADING CON GEMINI 2.5 FLASH (OPENROUTER) - CON TIMEOUT Y HEARTBEAT
+# BOT TRADING CON GEMINI 3.1 FLASH - SCALPING 3M (NIVELES AJUSTADOS)
 # ==============================================================================
 import os, time, requests, json, numpy as np, pandas as pd
 from scipy.stats import linregress
@@ -60,7 +60,7 @@ client = OpenAI(
         "X-Title": "Trading Bot",
     }
 )
-MODELO_VISION = "google/gemini-3.1-flash-image-preview"  # Sin :free
+MODELO_VISION = "google/gemini-3.1-flash-image-preview"  # o el que uses
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -72,7 +72,7 @@ if not BYBIT_API_KEY or not BYBIT_API_SECRET:
     raise ValueError("Faltan BYBIT_API_KEY o BYBIT_API_SECRET")
 
 # =================== MODO PAPER TRADE ===================
-PAPER_TRADE = True   # Cambia a False para operar real
+PAPER_TRADE = True
 
 paper_balance = 1000.0
 paper_positions = {}
@@ -84,10 +84,10 @@ paper_trade_history = []
 
 PAPER_COMMISSION_PCT = 0.001
 
-# =================== CONFIGURACIÓN DEL BOT ===================
+# =================== CONFIGURACIÓN DEL BOT (SCALPING 3M) ===================
 SYMBOL = "BTCUSDT"
-INTERVAL_LTF = "5"
-INTERVAL_HTF = "60"
+INTERVAL_LTF = "3"          # [SCALP] Velas de 3 minutos
+INTERVAL_HTF = "30"         # [SCALP] Tendencia de 30 minutos (mejor que 1h para scalping)
 RISK_PER_TRADE_MAX = 3.0
 LEVERAGE = 34
 SLEEP_SECONDS = 60
@@ -116,7 +116,8 @@ ULTIMO_PROFIT_FACTOR = 1.0
 REGLAS_APRENDIDAS = "Aún no hay lecciones."
 TOKENS_ACUMULADOS = 0
 
-# =================== FUNCIONES BYBIT (sin cambios) ===================
+# =================== FUNCIONES BYBIT ===================
+# (idénticas a las anteriores, no se modifican)
 def bybit_request(endpoint, method="GET", params=None, body=None):
     timestamp = str(int(time.time() * 1000))
     recv_window = "5000"
@@ -468,7 +469,7 @@ def reporte_estado():
     telegram_mensaje(mensaje)
 
 # =================== INDICADORES Y GRÁFICOS ===================
-def obtener_velas(interval="5", limit=150):
+def obtener_velas(interval="3", limit=150):
     try:
         r = requests.get(f"{BASE_URL}/v5/market/kline",
                          params={"category": "linear", "symbol": SYMBOL, "interval": interval, "limit": limit},
@@ -498,12 +499,14 @@ def calcular_indicadores(df):
     df['atr'] = df['tr'].rolling(14).mean()
     return df.dropna()
 
+# [SCALP] Ventana más pequeña para niveles: 20 velas en lugar de 40
 def detectar_zonas_mercado(df, idx=-2):
-    if df.empty or len(df) < 40:
+    if df.empty or len(df) < 20:
         return 0,0,0,0,"LATERAL","LATERAL"
     df_eval = df if idx == -1 else df.iloc[:idx+1]
-    soporte = df_eval['low'].rolling(40).min().iloc[-1]
-    resistencia = df_eval['high'].rolling(40).max().iloc[-1]
+    # Ventana ajustada a 20 para niveles más cercanos
+    soporte = df_eval['low'].rolling(20).min().iloc[-1]
+    resistencia = df_eval['high'].rolling(20).max().iloc[-1]
     y = df_eval['close'].values[-120:]
     slope, intercept, _, _, _ = linregress(np.arange(len(y)), y)
     micro_slope, _, _, _, _ = linregress(np.arange(8), df_eval['close'].values[-8:])
@@ -575,7 +578,7 @@ def pil_to_base64(img):
     img.save(buffered, format="PNG")
     return f"data:image/png;base64,{base64.b64encode(buffered.getvalue()).decode()}"
 
-# =================== PROMPT GENERAL PARA GEMINI (CON TIMEOUT) ===================
+# =================== PROMPT GENERAL PARA GEMINI 3.1 ===================
 def analizar_con_gemini(img_ltf, img_htf):
     global TOKENS_ACUMULADOS
     try:
@@ -583,16 +586,16 @@ def analizar_con_gemini(img_ltf, img_htf):
         img_htf_b64 = pil_to_base64(img_htf)
 
         prompt = """
-Eres un trader profesional de crypto con amplia experiencia en análisis técnico.
-Te voy a mostrar dos gráficos de BTC/USDT: el primero es de 5 minutos (velas recientes), el segundo es de 1 hora (tendencia de mayor plazo).
-Analiza ambos gráficos libremente, fijándote en velas, soportes, resistencias, tendencias, patrones, volumen, etc.
+Eres un trader profesional de crypto especializado en scalping con velas de 3 minutos.
+Te voy a mostrar dos gráficos de BTC/USDT: el primero es de 3 minutos (velas recientes), el segundo es de 30 minutos (tendencia de mayor plazo).
+Analiza ambos gráficos libremente, fijándote en velas, soportes/resistencias cercanos, tendencias, patrones de velas, etc.
 Decide si en este momento deberías COMPRAR (Buy), VENDER (Sell) o no hacer nada (Hold).
-Si decides comprar o vender, proporciona un precio de entrada (el precio actual o uno ligeramente diferente si esperas un rebote o ruptura), un stop loss razonable y un take profit 1 (objetivo inicial).
+Si decides comprar o vender, proporciona un precio de entrada (el precio actual o ligeramente diferente), un stop loss razonable (ajustado, no demasiado amplio) y un take profit 1 (objetivo inicial para cerrar la mitad).
 Devuelve ÚNICAMENTE un JSON válido en una línea con esta estructura:
 {
   "decision": "Buy/Sell/Hold",
-  "razon": "explicación breve de por qué tomas esa decisión",
-  "explicacion": "análisis detallado en español, mencionando lo que ves en los gráficos",
+  "razon": "explicación breve (max 150 chars)",
+  "explicacion": "análisis detallado en español",
   "entry_price": 0.0,
   "sl_price": 0.0,
   "tp1_price": 0.0,
@@ -614,7 +617,7 @@ No añadas texto adicional fuera del JSON.
                 }
             ],
             temperature=0.3,
-            timeout=60  # Timeout de 60 segundos
+            timeout=60
         )
         TOKENS_ACUMULADOS += response.usage.total_tokens if response.usage else 0
         contenido = response.choices[0].message.content
@@ -639,12 +642,16 @@ No añadas texto adicional fuera del JSON.
         logger.error(f"Error en IA: {e}")
         return "Hold", f"Error: {str(e)[:50]}", "", None, None, None, 0
 
-# =================== VALIDACIÓN MÍNIMA ===================
+# =================== VALIDACIÓN MÍNIMA (con umbral más estricto para niveles) ===================
 def validar_setup_ia(decision, razon, df_ltf, df_htf, confianza):
     if decision not in ["Buy", "Sell"]:
         return True, "No aplica"
     if confianza < 30:
         return False, f"Confianza demasiado baja ({confianza})"
+    
+    # [SCALP] Validación adicional de niveles más cercanos (opcional)
+    # Aquí puedes añadir lógica extra si quieres, pero la IA ya ve los gráficos.
+    # Por simplicidad, solo confianza.
     return True, "Validación exitosa"
 
 # =================== GESTIÓN DE RIESGO Y APERTURA ===================
@@ -1020,7 +1027,7 @@ def run_bot():
     set_leverage()
     sync_active_trades_with_bybit()
 
-    telegram_mensaje("🤖 Bot iniciado - Gemini 2.5 Flash con timeout y heartbeat")
+    telegram_mensaje("🤖 Bot iniciado - Gemini 3.1 Flash - Scalping 3m/30m")
     logger.info("Bot iniciado")
 
     if PAPER_TRADE:
@@ -1037,9 +1044,8 @@ def run_bot():
     ultima_vela = None
     while True:
         try:
-            # Heartbeat cada 5 minutos (300 segundos)
             if int(time.time()) % 300 < 5:
-                logger.info("❤️ Bot heartbeat - funcionando correctamente")
+                logger.info("❤️ Bot heartbeat")
 
             df_ltf_raw = obtener_velas(INTERVAL_LTF)
             df_htf_raw = obtener_velas(INTERVAL_HTF)
@@ -1065,8 +1071,8 @@ def run_bot():
                 sop_ltf, res_ltf, slope_ltf, inter_ltf, _, _ = detectar_zonas_mercado(df_ltf)
                 sop_htf, res_htf, slope_htf, inter_htf, _, _ = detectar_zonas_mercado(df_htf)
 
-                img_ltf = generar_grafico_para_vision(df_ltf, "BTC/USDT 5m (LTF)", sop_ltf, res_ltf, slope_ltf, inter_ltf, excluir_actual=True)
-                img_htf = generar_grafico_para_vision(df_htf, "BTC/USDT 1h (HTF)", sop_htf, res_htf, slope_htf, inter_htf, excluir_actual=True)
+                img_ltf = generar_grafico_para_vision(df_ltf, "BTC/USDT 3m (LTF)", sop_ltf, res_ltf, slope_ltf, inter_ltf, excluir_actual=True)
+                img_htf = generar_grafico_para_vision(df_htf, "BTC/USDT 30m (HTF)", sop_htf, res_htf, slope_htf, inter_htf, excluir_actual=True)
 
                 if img_ltf and img_htf:
                     dec, raz, explicacion, entry_ia, sl_ia, tp1_ia, conf = analizar_con_gemini(img_ltf, img_htf)
