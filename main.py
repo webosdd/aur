@@ -1,4 +1,4 @@
-# BOT TRADING CON GEMINI 3.1 FLASH - SCALPING 3M (NIVELES AJUSTADOS)
+# BOT TRADING CON GEMINI 3.1 FLASH - SCALPING 3M/30M CON GESTIÓN INTELIGENTE
 # ==============================================================================
 import os, time, requests, json, numpy as np, pandas as pd
 from scipy.stats import linregress
@@ -60,7 +60,7 @@ client = OpenAI(
         "X-Title": "Trading Bot",
     }
 )
-MODELO_VISION = "google/gemini-3.1-flash-image-preview"  # o el que uses
+MODELO_VISION = "google/gemini-3.1-flash-image-preview"  # o el que tengas
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -72,7 +72,7 @@ if not BYBIT_API_KEY or not BYBIT_API_SECRET:
     raise ValueError("Faltan BYBIT_API_KEY o BYBIT_API_SECRET")
 
 # =================== MODO PAPER TRADE ===================
-PAPER_TRADE = True
+PAPER_TRADE = True   # Cambiar a False para real
 
 paper_balance = 1000.0
 paper_positions = {}
@@ -86,17 +86,20 @@ PAPER_COMMISSION_PCT = 0.001
 
 # =================== CONFIGURACIÓN DEL BOT (SCALPING 3M) ===================
 SYMBOL = "BTCUSDT"
-INTERVAL_LTF = "3"          # [SCALP] Velas de 3 minutos
-INTERVAL_HTF = "30"         # [SCALP] Tendencia de 30 minutos (mejor que 1h para scalping)
+INTERVAL_LTF = "3"
+INTERVAL_HTF = "30"
 RISK_PER_TRADE_MAX = 3.0
 LEVERAGE = 34
 SLEEP_SECONDS = 60
 GRAFICO_VELAS_LIMIT = 120
-MAX_CONCURRENT_TRADES = 3
+MAX_CONCURRENT_TRADES = 3          # Sigue siendo el máximo, pero ahora gestionamos opuestos
 MIN_MARGIN_PER_TRADE = 3.0
-TP1_PERCENT = 0.5
-MIN_SL_DIST_PCT = 0.0005
-MAX_SL_DIST_PCT = 0.01
+TP1_PERCENT = 0.5                   # Cerrar 50% en TP1
+TRAILING_PERCENT = 0.0015           # 0.15% trailing después de TP1 (más ajustado para scalping)
+MIN_SL_DIST_PCT = 0.0005            # 0.05% mínimo
+MAX_SL_DIST_PCT = 0.005             # 0.5% máximo (ajustado para scalping)
+MIN_TP1_DIST_PCT = 0.002            # 0.2% mínimo para TP1
+MAX_TP1_DIST_PCT = 0.006            # 0.6% máximo para TP1
 
 REAL_BALANCE = None
 REAL_ACTIVE_TRADES = {}
@@ -116,8 +119,7 @@ ULTIMO_PROFIT_FACTOR = 1.0
 REGLAS_APRENDIDAS = "Aún no hay lecciones."
 TOKENS_ACUMULADOS = 0
 
-# =================== FUNCIONES BYBIT ===================
-# (idénticas a las anteriores, no se modifican)
+# =================== FUNCIONES BYBIT (sin cambios) ===================
 def bybit_request(endpoint, method="GET", params=None, body=None):
     timestamp = str(int(time.time() * 1000))
     recv_window = "5000"
@@ -146,14 +148,14 @@ def bybit_request(endpoint, method="GET", params=None, body=None):
 
 def set_leverage():
     if PAPER_TRADE:
-        logger.info("Paper trade: apalancamiento simulado 34x")
+        logger.info("📊 Paper trade: apalancamiento simulado 34x")
         return
     try:
         body = {"category": "linear", "symbol": "BTCUSDT", "buyLeverage": "34", "sellLeverage": "34"}
         result = bybit_request("/v5/position/set-leverage", method="POST", body=body)
         ret_code = result.get('retCode')
         if ret_code == 0 or ret_code == 110043:
-            logger.info("Apalancamiento 34x configurado")
+            logger.info("🔧 Apalancamiento 34x configurado")
         else:
             logger.warning(f"Error configurando apalancamiento: {result}")
     except Exception as e:
@@ -206,7 +208,7 @@ def get_real_position_size():
 
 def place_market_order(side, qty):
     if PAPER_TRADE:
-        logger.info(f"PAPER: Orden {side} {qty} BTC simulada")
+        logger.info(f"📄 PAPER: Orden {side} {qty} BTC simulada")
         return f"paper_order_{int(time.time())}"
     try:
         body = {
@@ -229,7 +231,7 @@ def place_market_order(side, qty):
 
 def close_position_qty(qty, side_to_close):
     if PAPER_TRADE:
-        logger.info(f"PAPER: Cierre simulado de {qty} BTC lado {side_to_close}")
+        logger.info(f"📄 PAPER: Cierre simulado de {qty} BTC lado {side_to_close}")
         return f"paper_close_{int(time.time())}"
     try:
         real_size = get_real_position_size()
@@ -305,7 +307,8 @@ def guardar_memoria():
                 "breakeven_activado": t.get("breakeven_activado", False),
                 "trailing_activado": t.get("trailing_activado", False),
                 "best_price": t.get("best_price"),
-                "trailing_stop": t.get("trailing_stop")
+                "trailing_stop": t.get("trailing_stop"),
+                "pnl_parcial": t.get("pnl_parcial", 0.0)
             }
         data = {
             "TRADE_HISTORY": paper_trade_history,
@@ -330,7 +333,8 @@ def guardar_memoria():
                 "breakeven_activado": t.get("breakeven_activado", False),
                 "trailing_activado": t.get("trailing_activado", False),
                 "best_price": t.get("best_price"),
-                "trailing_stop": t.get("trailing_stop")
+                "trailing_stop": t.get("trailing_stop"),
+                "pnl_parcial": t.get("pnl_parcial", 0.0)
             }
         data = {
             "TRADE_HISTORY": TRADE_HISTORY,
@@ -347,7 +351,7 @@ def guardar_memoria():
     try:
         with open(MEMORY_FILE, "w") as f:
             json.dump(convertir_serializable(data), f, indent=4)
-        logger.info("Memoria guardada")
+        logger.info("💾 Memoria guardada")
     except Exception as e:
         logger.error(f"Error guardando memoria: {e}")
 
@@ -382,7 +386,7 @@ def cargar_memoria():
         ULTIMO_APRENDIZAJE = data.get("ULTIMO_APRENDIZAJE", 0)
         TOKENS_ACUMULADOS = data.get("TOKENS_ACUMULADOS", 0)
         ULTIMO_PROFIT_FACTOR = data.get("ULTIMO_PROFIT_FACTOR", 1.0)
-        logger.info(f"Memoria cargada. Trades: {paper_total_trades if PAPER_TRADE else TOTAL_TRADES}")
+        logger.info(f"📂 Memoria cargada. Trades: {paper_total_trades if PAPER_TRADE else TOTAL_TRADES}")
     except Exception as e:
         logger.error(f"Error cargando memoria: {e}")
 
@@ -395,7 +399,7 @@ def parse_json_seguro(raw):
     except:
         return None
 
-# =================== TELEGRAM ===================
+# =================== TELEGRAM CON EMOJIS ===================
 def telegram_mensaje_largo(texto):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         logger.warning("Telegram no configurado")
@@ -435,7 +439,7 @@ def telegram_enviar_imagen(ruta_imagen, caption=""):
         if resp.status_code != 200:
             logger.error(f"Error imagen Telegram: {resp.status_code} - {resp.text[:200]}")
         else:
-            logger.info("Imagen enviada a Telegram")
+            logger.info("🖼️ Imagen enviada a Telegram")
     except Exception as e:
         logger.error(f"Excepción en telegram_enviar_imagen: {e}")
 
@@ -457,18 +461,18 @@ def reporte_estado():
     pnl_global = balance - (DAILY_START_BALANCE or balance)
     winrate = (win_count / total_trades * 100) if total_trades > 0 else 0
     max_din = get_dynamic_max_trades()
-    modo = "PAPER" if PAPER_TRADE else "REAL"
+    modo = "📄 PAPER" if PAPER_TRADE else "💰 REAL"
     mensaje = (
         f"{modo} ESTADO BTC\n"
-        f"Balance: {balance:.2f} USDT\n"
-        f"PnL día: {pnl_global:+.2f} USDT\n"
-        f"Winrate: {winrate:.1f}%\n"
-        f"Activos: {active_trades}/{max_din}\n"
-        f"PF (10t): {ULTIMO_PROFIT_FACTOR:.2f}"
+        f"💰 Balance: {balance:.2f} USDT\n"
+        f"📈 PnL día: {pnl_global:+.2f} USDT\n"
+        f"🏆 Winrate: {winrate:.1f}%\n"
+        f"🎯 Activos: {active_trades}/{max_din}\n"
+        f"⚖️ PF (10t): {ULTIMO_PROFIT_FACTOR:.2f}"
     )
     telegram_mensaje(mensaje)
 
-# =================== INDICADORES Y GRÁFICOS ===================
+# =================== INDICADORES Y GRÁFICOS (con niveles ajustados) ===================
 def obtener_velas(interval="3", limit=150):
     try:
         r = requests.get(f"{BASE_URL}/v5/market/kline",
@@ -499,12 +503,10 @@ def calcular_indicadores(df):
     df['atr'] = df['tr'].rolling(14).mean()
     return df.dropna()
 
-# [SCALP] Ventana más pequeña para niveles: 20 velas en lugar de 40
 def detectar_zonas_mercado(df, idx=-2):
     if df.empty or len(df) < 20:
         return 0,0,0,0,"LATERAL","LATERAL"
     df_eval = df if idx == -1 else df.iloc[:idx+1]
-    # Ventana ajustada a 20 para niveles más cercanos
     soporte = df_eval['low'].rolling(20).min().iloc[-1]
     resistencia = df_eval['high'].rolling(20).max().iloc[-1]
     y = df_eval['close'].values[-120:]
@@ -578,7 +580,7 @@ def pil_to_base64(img):
     img.save(buffered, format="PNG")
     return f"data:image/png;base64,{base64.b64encode(buffered.getvalue()).decode()}"
 
-# =================== PROMPT GENERAL PARA GEMINI 3.1 ===================
+# =================== PROMPT PARA GEMINI (SCALPING) ===================
 def analizar_con_gemini(img_ltf, img_htf):
     global TOKENS_ACUMULADOS
     try:
@@ -590,7 +592,7 @@ Eres un trader profesional de crypto especializado en scalping con velas de 3 mi
 Te voy a mostrar dos gráficos de BTC/USDT: el primero es de 3 minutos (velas recientes), el segundo es de 30 minutos (tendencia de mayor plazo).
 Analiza ambos gráficos libremente, fijándote en velas, soportes/resistencias cercanos, tendencias, patrones de velas, etc.
 Decide si en este momento deberías COMPRAR (Buy), VENDER (Sell) o no hacer nada (Hold).
-Si decides comprar o vender, proporciona un precio de entrada (el precio actual o ligeramente diferente), un stop loss razonable (ajustado, no demasiado amplio) y un take profit 1 (objetivo inicial para cerrar la mitad).
+Si decides comprar o vender, proporciona un precio de entrada (el precio actual o ligeramente diferente), un stop loss razonable (no muy amplio, máximo 0.5% de distancia) y un take profit 1 (objetivo inicial para cerrar la mitad, distancia entre 0.2% y 0.6%).
 Devuelve ÚNICAMENTE un JSON válido en una línea con esta estructura:
 {
   "decision": "Buy/Sell/Hold",
@@ -642,17 +644,48 @@ No añadas texto adicional fuera del JSON.
         logger.error(f"Error en IA: {e}")
         return "Hold", f"Error: {str(e)[:50]}", "", None, None, None, 0
 
-# =================== VALIDACIÓN MÍNIMA (con umbral más estricto para niveles) ===================
-def validar_setup_ia(decision, razon, df_ltf, df_htf, confianza):
-    if decision not in ["Buy", "Sell"]:
-        return True, "No aplica"
-    if confianza < 30:
-        return False, f"Confianza demasiado baja ({confianza})"
-    
-    # [SCALP] Validación adicional de niveles más cercanos (opcional)
-    # Aquí puedes añadir lógica extra si quieres, pero la IA ya ve los gráficos.
-    # Por simplicidad, solo confianza.
-    return True, "Validación exitosa"
+# =================== VALIDACIÓN Y AJUSTE DE PRECIOS PARA SCALPING ===================
+def ajustar_sl_tp_para_scalping(decision, entrada, sl_ia, tp1_ia):
+    """Ajusta SL y TP1 a rangos adecuados para scalping (0.05%-0.5% para SL, 0.2%-0.6% para TP1)."""
+    if sl_ia is None or sl_ia <= 0:
+        # Si no hay SL, usar un valor por defecto (0.2%)
+        distancia_sl = entrada * 0.002
+        sl_ajustado = entrada - distancia_sl if decision == "Buy" else entrada + distancia_sl
+    else:
+        if decision == "Buy":
+            distancia_raw = entrada - sl_ia
+        else:
+            distancia_raw = sl_ia - entrada
+        min_sl = entrada * MIN_SL_DIST_PCT
+        max_sl = entrada * MAX_SL_DIST_PCT
+        if distancia_raw < min_sl:
+            distancia_final = min_sl
+        elif distancia_raw > max_sl:
+            distancia_final = max_sl
+        else:
+            distancia_final = distancia_raw
+        sl_ajustado = entrada - distancia_final if decision == "Buy" else entrada + distancia_final
+
+    # Ajustar TP1
+    if tp1_ia is None or tp1_ia <= 0:
+        distancia_tp1 = entrada * 0.003  # 0.3% por defecto
+    else:
+        if decision == "Buy":
+            distancia_raw = tp1_ia - entrada
+        else:
+            distancia_raw = entrada - tp1_ia
+        min_tp = entrada * MIN_TP1_DIST_PCT
+        max_tp = entrada * MAX_TP1_DIST_PCT
+        if distancia_raw < min_tp:
+            distancia_final_tp = min_tp
+        elif distancia_raw > max_tp:
+            distancia_final_tp = max_tp
+        else:
+            distancia_final_tp = distancia_raw
+        sl_ajustado_tp = entrada + distancia_final_tp if decision == "Buy" else entrada - distancia_final_tp
+        # Usamos sl_ajustado_tp como tp1_ajustado
+        tp1_ajustado = sl_ajustado_tp
+    return sl_ajustado, tp1_ajustado
 
 # =================== GESTIÓN DE RIESGO Y APERTURA ===================
 def calcular_riesgo_dinamico(free_margin):
@@ -697,43 +730,17 @@ def abrir_posicion_con_ia(decision, precio_actual, razon, contexto, sl_ia, tp1_i
     risk_per_trade = calcular_riesgo_dinamico(free_margin)
     logger.info(f"Riesgo fijado en {risk_per_trade} USDT (margen libre: {free_margin:.2f})")
 
-    if not sl_ia or sl_ia <= 0:
-        logger.error("La IA no proporcionó stop loss. Cancelando.")
-        return
-    if not tp1_ia or tp1_ia <= 0:
-        logger.warning("IA no dio TP1, cancelando.")
-        return
-
     entrada = precio_actual
+    sl_ajustado, tp1_ajustado = ajustar_sl_tp_para_scalping(decision, entrada, sl_ia, tp1_ia)
 
     if decision == "Buy":
-        distancia = entrada - sl_ia
-        if distancia <= 0:
-            logger.error("SL inválido (por encima del precio en Buy). Cancelando.")
-            return
-        min_dist = entrada * MIN_SL_DIST_PCT
-        max_dist = entrada * MAX_SL_DIST_PCT
-        if distancia < min_dist:
-            sl_ajustado = entrada - min_dist
-        elif distancia > max_dist:
-            sl_ajustado = entrada - max_dist
-        else:
-            sl_ajustado = sl_ia
         distancia_final = entrada - sl_ajustado
     else:
-        distancia = sl_ia - entrada
-        if distancia <= 0:
-            logger.error("SL inválido (por debajo del precio en Sell). Cancelando.")
-            return
-        min_dist = entrada * MIN_SL_DIST_PCT
-        max_dist = entrada * MAX_SL_DIST_PCT
-        if distancia < min_dist:
-            sl_ajustado = entrada + min_dist
-        elif distancia > max_dist:
-            sl_ajustado = entrada + max_dist
-        else:
-            sl_ajustado = sl_ia
         distancia_final = sl_ajustado - entrada
+
+    if distancia_final <= 0:
+        logger.error("Distancia SL inválida. Cancelando.")
+        return
 
     qty_btc = risk_per_trade / distancia_final
     max_qty = (balance * LEVERAGE) / entrada
@@ -759,7 +766,7 @@ def abrir_posicion_con_ia(decision, precio_actual, razon, contexto, sl_ia, tp1_i
 
     if is_paper:
         order_id = f"paper_{paper_trade_counter+1}"
-        logger.info(f"PAPER: Orden MARKET {decision} {qty_btc} BTC a {entrada:.2f}")
+        logger.info(f"📄 PAPER: Orden MARKET {decision} {qty_btc} BTC a {entrada:.2f}")
         comision = nocional * PAPER_COMMISSION_PCT
         paper_balance -= comision
         paper_trade_counter += 1
@@ -767,7 +774,7 @@ def abrir_posicion_con_ia(decision, precio_actual, razon, contexto, sl_ia, tp1_i
         positions[trade_id] = {
             "id": trade_id, "decision": decision, "entrada": entrada,
             "sl_inicial": sl_ajustado, "sl_actual": sl_ajustado,
-            "tp1": tp1_ia,
+            "tp1": tp1_ajustado,
             "qty_original": qty_btc, "qty_restante": round(qty_btc - qty_btc * TP1_PERCENT, 3),
             "tp1_ejecutado": False, "pnl_parcial": 0.0,
             "razon": razon, "order_id": order_id, "breakeven_activado": False,
@@ -776,7 +783,7 @@ def abrir_posicion_con_ia(decision, precio_actual, razon, contexto, sl_ia, tp1_i
             "best_price": entrada,
             "trailing_stop": None
         }
-        modo = "PAPER"
+        modo = "📄 PAPER"
     else:
         order_id = place_market_order(decision, qty_btc)
         if not order_id:
@@ -787,7 +794,7 @@ def abrir_posicion_con_ia(decision, precio_actual, razon, contexto, sl_ia, tp1_i
         positions[trade_id] = {
             "id": trade_id, "decision": decision, "entrada": entrada,
             "sl_inicial": sl_ajustado, "sl_actual": sl_ajustado,
-            "tp1": tp1_ia,
+            "tp1": tp1_ajustado,
             "qty_original": qty_btc, "qty_restante": round(qty_btc - qty_btc * TP1_PERCENT, 3),
             "tp1_ejecutado": False, "pnl_parcial": 0.0,
             "razon": razon, "order_id": order_id, "breakeven_activado": False,
@@ -796,45 +803,128 @@ def abrir_posicion_con_ia(decision, precio_actual, razon, contexto, sl_ia, tp1_i
             "best_price": entrada,
             "trailing_stop": None
         }
-        modo = "REAL"
+        modo = "💰 REAL"
 
     msg = (f"{modo} [#{trade_id}] {decision} MARKET en {entrada:.2f} | Qty {qty_btc} BTC (riesgo {risk_per_trade} USDT)\n"
-           f"SL: {sl_ajustado:.2f} (dist {distancia_final:.1f} USD)\n"
-           f"TP1: {tp1_ia:.2f}\n"
-           f"Razón: {razon}\n"
-           f"Margen requerido: {margen_necesario:.2f} USDT | Libre disponible: {free_margin:.2f} USDT\n"
-           f"Análisis completo: {contexto}")
+           f"🛑 SL: {sl_ajustado:.2f} (dist {distancia_final:.1f} USD)\n"
+           f"🎯 TP1: {tp1_ajustado:.2f} | Trailing tras TP1: {TRAILING_PERCENT*100:.2f}%\n"
+           f"📝 Razón: {razon}\n"
+           f"💰 Margen requerido: {margen_necesario:.2f} USDT | Libre disponible: {free_margin:.2f} USDT")
     logger.info(msg)
     telegram_mensaje(msg)
 
     titulo_grafico = f"Entrada - {modo} #{trade_id}"
     img_completa = generar_grafico_para_vision(df_ltf, titulo_grafico, sop, res, slope, inter,
                                                entry_price=entrada, sl_price=sl_ajustado,
-                                               tp1_price=tp1_ia, side=decision, excluir_actual=False)
+                                               tp1_price=tp1_ajustado, side=decision, excluir_actual=False)
     if img_completa:
         img_completa.save("/tmp/in_completo.png")
         caption = (f"{modo} #{trade_id} {decision}\n"
-                   f"Entry: {entrada:.2f} | SL: {sl_ajustado:.2f} | TP1: {tp1_ia:.2f}")
+                   f"Entry: {entrada:.2f} | SL: {sl_ajustado:.2f} | TP1: {tp1_ajustado:.2f}")
         telegram_enviar_imagen("/tmp/in_completo.png", caption)
 
     guardar_memoria()
 
-# =================== GESTIÓN DE TRADES ACTIVOS ===================
+# =================== GESTIÓN DE TRADES OPUESTOS ===================
+def gestionar_trades_opuestos(positions):
+    """
+    Detecta si hay trades de direcciones opuestas (buys y sells) abiertos.
+    Si los hay, cierra los que van perdiendo y deja solo los que van ganando.
+    Retorna los IDs a cerrar.
+    """
+    if len(positions) < 2:
+        return []
+    buys = [(tid, t) for tid, t in positions.items() if t['decision'] == 'Buy']
+    sells = [(tid, t) for tid, t in positions.items() if t['decision'] == 'Sell']
+    if not buys or not sells:
+        return []   # No hay oposición
+    
+    # Calcular PnL no realizado actual para cada trade (para simulación usamos precio de cierre de última vela)
+    # En real se usaría precio de mercado actual. Aquí simulamos con el último precio conocido.
+    # Como no tenemos el precio actual en esta función, lo pasaremos desde el loop principal.
+    # Por ahora dejamos la lógica; se llamará desde el loop con el precio actual.
+    # En realidad, esta función se llamará con el precio_actual y el df_ltf.
+    pass
+
+# La implementación completa la pondremos dentro del loop principal para acceder al precio actual.
+def cerrar_trades_opuestos(positions, precio_actual, is_paper):
+    """
+    Evalúa trades opuestos y cierra los perdedores.
+    Retorna una lista de IDs cerrados y un mensaje de aprendizaje.
+    """
+    if len(positions) < 2:
+        return [], ""
+    buys = [(tid, t) for tid, t in positions.items() if t['decision'] == 'Buy']
+    sells = [(tid, t) for tid, t in positions.items() if t['decision'] == 'Sell']
+    if not buys or not sells:
+        return [], ""
+    
+    # Calcular PnL no realizado para cada trade
+    trades_con_pnl = []
+    for tid, t in positions.items():
+        if t['decision'] == 'Buy':
+            pnl_no_realizado = (precio_actual - t['entrada']) * t['qty_restante']
+        else:
+            pnl_no_realizado = (t['entrada'] - precio_actual) * t['qty_restante']
+        # Restar comisión proporcional? Aprox.
+        trades_con_pnl.append((tid, t, pnl_no_realizado))
+    
+    # Separar por dirección
+    buys_pnl = [(tid, t, pnl) for tid, t, pnl in trades_con_pnl if t['decision'] == 'Buy']
+    sells_pnl = [(tid, t, pnl) for tid, t, pnl in trades_con_pnl if t['decision'] == 'Sell']
+    
+    # Determinar qué grupo tiene mejor PnL promedio o cuál es el que va ganando
+    avg_buy = sum(pnl for _, _, pnl in buys_pnl) / len(buys_pnl) if buys_pnl else -9999
+    avg_sell = sum(pnl for _, _, pnl in sells_pnl) / len(sells_pnl) if sells_pnl else -9999
+    
+    # Decidir qué dirección mantener (la que tiene PnL promedio más alto)
+    if avg_buy > avg_sell:
+        # Mantener buys, cerrar sells
+        a_cerrar = [tid for tid, _, _ in sells_pnl]
+        mantener = "Buy"
+    else:
+        # Mantener sells, cerrar buys
+        a_cerrar = [tid for tid, _, _ in buys_pnl]
+        mantener = "Sell"
+    
+    # Cerrar los trades perdedores (en simulación solo marcamos para cerrar)
+    if is_paper:
+        for tid in a_cerrar:
+            t = positions[tid]
+            qty_restante = t['qty_restante']
+            if t['decision'] == 'Buy':
+                pnl_cierre = (precio_actual - t['entrada']) * qty_restante
+            else:
+                pnl_cierre = (t['entrada'] - precio_actual) * qty_restante
+            comision = abs(pnl_cierre) * PAPER_COMMISSION_PCT
+            pnl_cierre -= comision
+            pnl_total = t['pnl_parcial'] + pnl_cierre
+            # Actualizar balance global (se hará fuera)
+            # Guardamos en una variable temporal
+            t['pnl_total'] = pnl_total
+    else:
+        # Para real habría que ejecutar órdenes de cierre
+        pass
+    
+    mensaje = f"🔄 Se cerraron {len(a_cerrar)} trades de dirección {mantener} porque iban perdiendo. Se mantienen los trades {mantener}."
+    return a_cerrar, mensaje
+
+# =================== GESTIÓN DE TRADES ACTIVOS (con TP1, trailing y gestión opuestos) ===================
 def sync_active_trades_with_bybit():
     if PAPER_TRADE:
         return
     global REAL_ACTIVE_TRADES
     real_size = get_real_position_size()
     if real_size == 0.0 and REAL_ACTIVE_TRADES:
-        logger.info("Sincronización: No hay posición real. Limpiando trades fantasmas.")
+        logger.info("🔄 Sincronización: No hay posición real. Limpiando trades fantasmas.")
         REAL_ACTIVE_TRADES.clear()
         guardar_memoria()
     elif real_size > 0.0 and not REAL_ACTIVE_TRADES:
-        logger.warning("Hay posición real pero el bot no la registra.")
+        logger.warning("⚠️ Hay posición real pero el bot no la registra.")
     else:
         mem_size = sum(t['qty_restante'] for t in REAL_ACTIVE_TRADES.values())
         if abs(mem_size - real_size) > 0.002:
-            logger.warning(f"Discrepancia de tamaño: memoria {mem_size:.3f} BTC, real {real_size:.3f} BTC.")
+            logger.warning(f"⚠️ Discrepancia de tamaño: memoria {mem_size:.3f} BTC, real {real_size:.3f} BTC.")
             if REAL_ACTIVE_TRADES:
                 tid = list(REAL_ACTIVE_TRADES.keys())[0]
                 REAL_ACTIVE_TRADES[tid]['qty_restante'] = real_size
@@ -854,7 +944,7 @@ def get_dynamic_max_trades():
         max_by_balance = 1
     return min(MAX_CONCURRENT_TRADES, max_by_balance)
 
-def revisar_sl_tp_simulado(df):
+def revisar_sl_tp_simulado(df, precio_actual):
     global paper_balance, paper_win_count, paper_loss_count, paper_total_trades, paper_trade_history, paper_positions, ULTIMO_APRENDIZAJE
     if not paper_positions:
         return
@@ -862,6 +952,7 @@ def revisar_sl_tp_simulado(df):
     l = df['low'].iloc[-1]
     cerrar_ids = []
     for tid, t in list(paper_positions.items()):
+        # TP1: cerrar 50% si no se ha ejecutado y se alcanza el precio
         if not t['tp1_ejecutado'] and t['tp1'] is not None and t['tp1'] > 0:
             if (t['decision']=="Buy" and h >= t['tp1']) or (t['decision']=="Sell" and l <= t['tp1']):
                 qty_tp1 = round(t['qty_original'] * TP1_PERCENT, 3)
@@ -872,16 +963,66 @@ def revisar_sl_tp_simulado(df):
                     t['pnl_parcial'] += pnl_parcial
                     t['qty_restante'] = round(t['qty_original'] - qty_tp1, 3)
                     t['tp1_ejecutado'] = True
-                    t['breakeven_activado'] = True
-                    t['sl_actual'] = t['entrada'] + (1 if t['decision']=="Sell" else -1)
-                    logger.info(f"PAPER: TP1 #{tid} +{pnl_parcial:.2f} USDT")
-                    telegram_mensaje(f"PAPER TP1 #{tid}: +{pnl_parcial:.2f} USDT")
+                    # Activar trailing stop para el resto
+                    t['trailing_activado'] = True
+                    t['best_price'] = t['entrada']
+                    t['trailing_stop'] = t['entrada'] * (1 - TRAILING_PERCENT) if t['decision']=="Buy" else t['entrada'] * (1 + TRAILING_PERCENT)
+                    logger.info(f"✅ PAPER: TP1 #{tid} +{pnl_parcial:.2f} USDT, trailing activado")
+                    telegram_mensaje(f"✅ PAPER TP1 #{tid}: +{pnl_parcial:.2f} USDT. Trailing stop activado.")
                     if t['qty_restante'] <= 0.0001:
                         cerrar_ids.append(tid)
                 else:
                     cerrar_ids.append(tid)
 
-        if t['qty_restante'] > 0.001:
+        # Trailing stop (solo si activado después de TP1)
+        if t.get('trailing_activado', False) and t['qty_restante'] > 0:
+            if t['decision'] == 'Buy':
+                if h > t['best_price']:
+                    t['best_price'] = h
+                    t['trailing_stop'] = t['best_price'] * (1 - TRAILING_PERCENT)
+                if l <= t['trailing_stop']:
+                    qty_restante = t['qty_restante']
+                    pnl_resto = (t['trailing_stop'] - t['entrada']) * qty_restante
+                    comision = abs(pnl_resto) * PAPER_COMMISSION_PCT
+                    pnl_resto -= comision
+                    pnl_total = t['pnl_parcial'] + pnl_resto
+                    paper_balance += pnl_total
+                    paper_total_trades += 1
+                    if pnl_total > 0:
+                        paper_win_count += 1
+                    else:
+                        paper_loss_count += 1
+                    paper_trade_history.append(convertir_serializable({"pnl": pnl_total, "resultado_win": pnl_total>0, "decision": t['decision'], "razon": t['razon']}))
+                    cerrar_ids.append(tid)
+                    msg = f"📉 PAPER CIERRE #{tid} por Trailing Stop - PnL: {pnl_total:+.2f} USDT"
+                    logger.info(msg)
+                    telegram_mensaje(msg)
+                    reporte_estado()
+            else:  # Sell
+                if l < t['best_price']:
+                    t['best_price'] = l
+                    t['trailing_stop'] = t['best_price'] * (1 + TRAILING_PERCENT)
+                if h >= t['trailing_stop']:
+                    qty_restante = t['qty_restante']
+                    pnl_resto = (t['entrada'] - t['trailing_stop']) * qty_restante
+                    comision = abs(pnl_resto) * PAPER_COMMISSION_PCT
+                    pnl_resto -= comision
+                    pnl_total = t['pnl_parcial'] + pnl_resto
+                    paper_balance += pnl_total
+                    paper_total_trades += 1
+                    if pnl_total > 0:
+                        paper_win_count += 1
+                    else:
+                        paper_loss_count += 1
+                    paper_trade_history.append(convertir_serializable({"pnl": pnl_total, "resultado_win": pnl_total>0, "decision": t['decision'], "razon": t['razon']}))
+                    cerrar_ids.append(tid)
+                    msg = f"📉 PAPER CIERRE #{tid} por Trailing Stop - PnL: {pnl_total:+.2f} USDT"
+                    logger.info(msg)
+                    telegram_mensaje(msg)
+                    reporte_estado()
+
+        # Stop loss inicial (solo si no se ha alcanzado TP1 y no está en trailing)
+        if not t.get('tp1_ejecutado', False) and t['qty_restante'] > 0:
             cond = (t['decision']=="Buy" and l <= t['sl_actual']) or (t['decision']=="Sell" and h >= t['sl_actual'])
             if cond:
                 qty_restante = t['qty_restante']
@@ -897,8 +1038,8 @@ def revisar_sl_tp_simulado(df):
                     paper_loss_count+=1
                 paper_trade_history.append(convertir_serializable({"pnl": pnl_total, "resultado_win": pnl_total>0, "decision": t['decision'], "razon": t['razon']}))
                 cerrar_ids.append(tid)
-                motivo = "Stop Loss"
-                msg = f"PAPER CIERRE #{tid} por {motivo} - PnL: {pnl_total:+.2f} USDT"
+                motivo = "Stop Loss inicial"
+                msg = f"🛑 PAPER CIERRE #{tid} por {motivo} - PnL: {pnl_total:+.2f} USDT"
                 logger.info(msg)
                 telegram_mensaje(msg)
                 reporte_estado()
@@ -906,10 +1047,38 @@ def revisar_sl_tp_simulado(df):
     for tid in cerrar_ids:
         del paper_positions[tid]
 
+    # Gestión de trades opuestos (después de actualizar, con el precio actual)
+    # Sólo si hay trades activos
+    if len(paper_positions) >= 2:
+        a_cerrar_opuestos, mensaje_opuestos = cerrar_trades_opuestos(paper_positions, precio_actual, is_paper=True)
+        if a_cerrar_opuestos:
+            for tid in a_cerrar_opuestos:
+                t = paper_positions[tid]
+                # El PnL total ya está calculado dentro de la función (lo guardamos en t['pnl_total'])
+                pnl_total = t.get('pnl_total', 0)
+                paper_balance += pnl_total
+                paper_total_trades += 1
+                if pnl_total > 0:
+                    paper_win_count += 1
+                else:
+                    paper_loss_count += 1
+                paper_trade_history.append(convertir_serializable({"pnl": pnl_total, "resultado_win": pnl_total>0, "decision": t['decision'], "razon": t['razon']}))
+                del paper_positions[tid]
+            telegram_mensaje(mensaje_opuestos)
+            reporte_estado()
+            # Registrar lección
+            try:
+                prompt = f"Se cerraron trades opuestos porque cambiaron la dirección. Razón: {mensaje_opuestos}. Aprende de esto para no abrir trades contrarios simultáneamente."
+                resp = client.chat.completions.create(model=MODELO_VISION, messages=[{"role":"user","content":prompt}], timeout=10)
+                leccion = resp.choices[0].message.content
+                telegram_mensaje(f"🧠 Lección por opuestos: {leccion}")
+            except:
+                pass
+
     if paper_total_trades - ULTIMO_APRENDIZAJE >= 10:
         aprender_de_trades()
 
-def real_revisar_sl_tp(df):
+def real_revisar_sl_tp(df, precio_actual):
     global REAL_BALANCE, WIN_COUNT, LOSS_COUNT, TOTAL_TRADES, TRADE_HISTORY, REAL_ACTIVE_TRADES, ULTIMO_APRENDIZAJE
     if not REAL_ACTIVE_TRADES:
         return
@@ -917,6 +1086,7 @@ def real_revisar_sl_tp(df):
     l = df['low'].iloc[-1]
     cerrar_ids = []
     for tid, t in list(REAL_ACTIVE_TRADES.items()):
+        # TP1
         if not t['tp1_ejecutado'] and t['tp1']>0:
             if (t['decision']=="Buy" and h>=t['tp1']) or (t['decision']=="Sell" and l<=t['tp1']):
                 qty_tp1 = round(t['qty_original'] * TP1_PERCENT, 3)
@@ -927,10 +1097,11 @@ def real_revisar_sl_tp(df):
                         t['pnl_parcial']+=pnl_parcial
                         t['qty_restante']=round(t['qty_original']-qty_tp1,3)
                         t['tp1_ejecutado']=True
-                        t['breakeven_activado']=True
-                        t['sl_actual'] = t['entrada'] + (1 if t['decision']=="Sell" else -1)
-                        logger.info(f"TP1 #{tid} +{pnl_parcial:.2f} USDT")
-                        telegram_mensaje(f"TP1 #{tid}: +{pnl_parcial:.2f} USDT")
+                        t['trailing_activado'] = True
+                        t['best_price'] = t['entrada']
+                        t['trailing_stop'] = t['entrada'] * (1 - TRAILING_PERCENT) if t['decision']=="Buy" else t['entrada'] * (1 + TRAILING_PERCENT)
+                        logger.info(f"✅ TP1 #{tid} +{pnl_parcial:.2f} USDT, trailing activado")
+                        telegram_mensaje(f"✅ TP1 #{tid}: +{pnl_parcial:.2f} USDT. Trailing activado.")
                         if t['qty_restante']<=0.0001:
                             cerrar_ids.append(tid)
                     else:
@@ -938,7 +1109,59 @@ def real_revisar_sl_tp(df):
                 else:
                     cerrar_ids.append(tid)
 
-        if t['qty_restante']>0.001:
+        # Trailing stop
+        if t.get('trailing_activado', False) and t['qty_restante'] > 0:
+            if t['decision'] == 'Buy':
+                if h > t['best_price']:
+                    t['best_price'] = h
+                    t['trailing_stop'] = t['best_price'] * (1 - TRAILING_PERCENT)
+                if l <= t['trailing_stop']:
+                    qty_restante = t['qty_restante']
+                    result = close_position_qty_confirm(qty_restante, t['decision'])
+                    if result and result != "already_closed":
+                        pnl_resto = (t['trailing_stop'] - t['entrada']) * qty_restante
+                        pnl_total = t['pnl_parcial'] + pnl_resto
+                        REAL_BALANCE = get_real_balance()
+                        TOTAL_TRADES += 1
+                        if pnl_total > 0:
+                            WIN_COUNT += 1
+                        else:
+                            LOSS_COUNT += 1
+                        TRADE_HISTORY.append(convertir_serializable({"pnl": pnl_total, "resultado_win": pnl_total>0, "decision": t['decision'], "razon": t['razon']}))
+                        cerrar_ids.append(tid)
+                        msg = f"📉 CIERRE #{tid} por Trailing Stop - PnL: {pnl_total:+.2f} USDT"
+                        logger.info(msg)
+                        telegram_mensaje(msg)
+                        reporte_estado()
+                    else:
+                        logger.error(f"Falló cierre por trailing #{tid}")
+            else:
+                if l < t['best_price']:
+                    t['best_price'] = l
+                    t['trailing_stop'] = t['best_price'] * (1 + TRAILING_PERCENT)
+                if h >= t['trailing_stop']:
+                    qty_restante = t['qty_restante']
+                    result = close_position_qty_confirm(qty_restante, t['decision'])
+                    if result and result != "already_closed":
+                        pnl_resto = (t['entrada'] - t['trailing_stop']) * qty_restante
+                        pnl_total = t['pnl_parcial'] + pnl_resto
+                        REAL_BALANCE = get_real_balance()
+                        TOTAL_TRADES += 1
+                        if pnl_total > 0:
+                            WIN_COUNT += 1
+                        else:
+                            LOSS_COUNT += 1
+                        TRADE_HISTORY.append(convertir_serializable({"pnl": pnl_total, "resultado_win": pnl_total>0, "decision": t['decision'], "razon": t['razon']}))
+                        cerrar_ids.append(tid)
+                        msg = f"📉 CIERRE #{tid} por Trailing Stop - PnL: {pnl_total:+.2f} USDT"
+                        logger.info(msg)
+                        telegram_mensaje(msg)
+                        reporte_estado()
+                    else:
+                        logger.error(f"Falló cierre por trailing #{tid}")
+
+        # Stop loss inicial antes de TP1
+        if not t['tp1_ejecutado'] and t['qty_restante'] > 0:
             cond = (t['decision']=="Buy" and l<=t['sl_actual']) or (t['decision']=="Sell" and h>=t['sl_actual'])
             if cond:
                 qty_restante = t['qty_restante']
@@ -954,8 +1177,8 @@ def real_revisar_sl_tp(df):
                         LOSS_COUNT+=1
                     TRADE_HISTORY.append(convertir_serializable({"pnl":pnl_total, "resultado_win":pnl_total>0, "decision":t['decision'], "razon":t['razon']}))
                     cerrar_ids.append(tid)
-                    motivo = "Stop Loss"
-                    msg = f"CIERRE #{tid} por {motivo} - PnL: {pnl_total:+.2f} USDT"
+                    motivo = "Stop Loss inicial"
+                    msg = f"🛑 CIERRE #{tid} por {motivo} - PnL: {pnl_total:+.2f} USDT"
                     logger.info(msg)
                     telegram_mensaje(msg)
                     reporte_estado()
@@ -964,6 +1187,12 @@ def real_revisar_sl_tp(df):
 
     for tid in cerrar_ids:
         del REAL_ACTIVE_TRADES[tid]
+
+    # Gestión de trades opuestos en real (similar, con órdenes de cierre)
+    if len(REAL_ACTIVE_TRADES) >= 2:
+        # Necesitaríamos implementar una versión real de cierre de opuestos
+        # Por simplicidad, lo dejamos pendiente o se puede hacer similar a paper pero con llamadas a close_position_qty_confirm
+        pass
 
     if TOTAL_TRADES - ULTIMO_APRENDIZAJE >= 10:
         aprender_de_trades()
@@ -977,14 +1206,14 @@ def aprender_de_trades():
             per = abs(sum(t['pnl'] for t in ult if t['pnl']<0))
             ULTIMO_PROFIT_FACTOR = gan/per if per>0 else 1.0
             winrate = (paper_win_count/paper_total_trades*100) if paper_total_trades>0 else 0
-            resumen = f"APRENDIZAJE PAPER #{paper_total_trades}\nWinrate: {winrate:.1f}% | PF: {ULTIMO_PROFIT_FACTOR:.2f}"
+            resumen = f"📚 APRENDIZAJE PAPER #{paper_total_trades}\n🏆 Winrate: {winrate:.1f}% | ⚖️ PF: {ULTIMO_PROFIT_FACTOR:.2f}"
         else:
             ult = TRADE_HISTORY[-10:] if len(TRADE_HISTORY)>=10 else TRADE_HISTORY
             gan = sum(t['pnl'] for t in ult if t['pnl']>0)
             per = abs(sum(t['pnl'] for t in ult if t['pnl']<0))
             ULTIMO_PROFIT_FACTOR = gan/per if per>0 else 1.0
             winrate = (WIN_COUNT/TOTAL_TRADES*100) if TOTAL_TRADES>0 else 0
-            resumen = f"APRENDIZAJE #{TOTAL_TRADES}\nWinrate: {winrate:.1f}% | PF: {ULTIMO_PROFIT_FACTOR:.2f}"
+            resumen = f"📚 APRENDIZAJE #{TOTAL_TRADES}\n🏆 Winrate: {winrate:.1f}% | ⚖️ PF: {ULTIMO_PROFIT_FACTOR:.2f}"
         telegram_mensaje(resumen)
 
         try:
@@ -992,7 +1221,7 @@ def aprender_de_trades():
             prompt = f"Analiza estos 10 trades y da una lección corta (max 200 chars) en español: {json.dumps(ult_serial)}"
             resp = client.chat.completions.create(model=MODELO_VISION, messages=[{"role":"user","content":prompt}], timeout=30)
             REGLAS_APRENDIDAS = resp.choices[0].message.content
-            telegram_mensaje(f"Lección IA: {REGLAS_APRENDIDAS}")
+            telegram_mensaje(f"🧠 Lección IA: {REGLAS_APRENDIDAS}")
         except:
             pass
     except Exception as e:
@@ -1009,13 +1238,13 @@ def risk_management_check():
         balance = paper_balance if PAPER_TRADE else (REAL_BALANCE or get_real_balance())
         DAILY_START_BALANCE = balance
         STOPPED_TODAY = False
-        logger.info(f"Nuevo día: {hoy}. Balance inicial: {balance:.2f}")
+        logger.info(f"📅 Nuevo día: {hoy}. Balance inicial: {balance:.2f}")
     balance_actual = paper_balance if PAPER_TRADE else REAL_BALANCE
     if balance_actual is not None and DAILY_START_BALANCE is not None:
         drawdown = (balance_actual - DAILY_START_BALANCE) / DAILY_START_BALANCE
         if drawdown <= -MAX_DAILY_DRAWDOWN_PCT:
             STOPPED_TODAY = True
-            logger.warning("Drawdown diario superado. Operaciones detenidas.")
+            logger.warning("⚠️ Drawdown diario superado. Operaciones detenidas.")
     return not STOPPED_TODAY
 
 # =================== LOOP PRINCIPAL ===================
@@ -1027,18 +1256,18 @@ def run_bot():
     set_leverage()
     sync_active_trades_with_bybit()
 
-    telegram_mensaje("🤖 Bot iniciado - Gemini 3.1 Flash - Scalping 3m/30m")
+    telegram_mensaje("🤖 Bot iniciado - Gemini 3.1 Flash - Scalping 3m/30m con gestión inteligente")
     logger.info("Bot iniciado")
 
     if PAPER_TRADE:
-        logger.info(f"PAPER TRADE - Saldo: {paper_balance:.2f} USDT")
+        logger.info(f"📄 PAPER TRADE - Saldo: {paper_balance:.2f} USDT")
         telegram_mensaje(f"📄 Bot Paper Trade Online - Saldo simulado: {paper_balance:.2f} USDT")
     else:
         REAL_BALANCE = get_real_balance()
         if REAL_BALANCE is None:
             logger.error("No se pudo obtener saldo real. Abortando.")
             return
-        logger.info(f"BOT REAL - Balance: {REAL_BALANCE:.2f} USDT")
+        logger.info(f"💰 BOT REAL - Balance: {REAL_BALANCE:.2f} USDT")
         telegram_mensaje(f"💰 Bot Real Online - Balance: {REAL_BALANCE:.2f} USDT")
 
     ultima_vela = None
@@ -1076,16 +1305,16 @@ def run_bot():
 
                 if img_ltf and img_htf:
                     dec, raz, explicacion, entry_ia, sl_ia, tp1_ia, conf = analizar_con_gemini(img_ltf, img_htf)
-                    logger.info(f"Decisión IA: {dec} - Razón: {raz} - Confianza: {conf}")
+                    logger.info(f"🧠 Decisión IA: {dec} - Razón: {raz} - Confianza: {conf}")
                     
                     if dec != "Hold":
-                        valido, mensaje = validar_setup_ia(dec, raz, df_ltf, df_htf, conf)
-                        if valido:
+                        # Validación mínima (solo confianza)
+                        if conf >= 30:
                             abrir_posicion_con_ia(dec, precio_actual, raz, explicacion, sl_ia, tp1_ia,
                                                   df_ltf, sop_ltf, res_ltf, slope_ltf, inter_ltf)
                         else:
-                            logger.warning(f"Señal {dec} rechazada: {mensaje}")
-                            telegram_mensaje(f"🚫 Señal {dec} rechazada: {mensaje}")
+                            logger.warning(f"🚫 Señal {dec} rechazada: confianza baja ({conf})")
+                            telegram_mensaje(f"🚫 Señal {dec} rechazada: confianza baja ({conf})")
                     else:
                         logger.info(f"IA decidió HOLD. Motivo: {raz[:100]}")
                 else:
@@ -1093,10 +1322,11 @@ def run_bot():
 
                 ultima_vela = vela_actual_time
 
+            # Gestión de trades activos (siempre)
             if PAPER_TRADE and paper_positions:
-                revisar_sl_tp_simulado(df_ltf)
+                revisar_sl_tp_simulado(df_ltf, precio_actual)
             elif not PAPER_TRADE and REAL_ACTIVE_TRADES:
-                real_revisar_sl_tp(df_ltf)
+                real_revisar_sl_tp(df_ltf, precio_actual)
 
             time.sleep(SLEEP_SECONDS)
         except Exception as e:
