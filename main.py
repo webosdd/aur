@@ -60,7 +60,7 @@ client = OpenAI(
         "X-Title": "Trading Bot",
     }
 )
-MODELO_VISION = "google/gemini-2.5-flash-image"  # Sin :free
+MODELO_VISION = "google/gemini-3.1-flash-image-preview"  # Sin :free
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
