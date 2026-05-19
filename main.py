@@ -92,7 +92,7 @@ RISK_PER_TRADE_MAX = 3.0
 LEVERAGE = 34
 SLEEP_SECONDS = 60
 GRAFICO_VELAS_LIMIT = 120
-MAX_CONCURRENT_TRADES = 10          # Cambiado de 3 a 10 (sigue siendo máximo)
+MAX_CONCURRENT_TRADES = 10          # Hasta 10 trades simultáneos sin importar dirección
 MIN_MARGIN_PER_TRADE = 3.0
 TP1_PERCENT = 0.5
 TRAILING_PERCENT = 0.0015
@@ -399,7 +399,7 @@ def parse_json_seguro(raw):
     except:
         return None
 
-# =================== TELEGRAM CON EMOJIS ===================
+# =================== TELEGRAM ===================
 def telegram_mensaje_largo(texto):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         logger.warning("Telegram no configurado")
@@ -472,7 +472,7 @@ def reporte_estado():
     )
     telegram_mensaje(mensaje)
 
-# =================== INDICADORES Y GRÁFICOS (con niveles ajustados) ===================
+# =================== INDICADORES Y GRÁFICOS ===================
 def obtener_velas(interval="3", limit=150):
     try:
         r = requests.get(f"{BASE_URL}/v5/market/kline",
@@ -580,7 +580,7 @@ def pil_to_base64(img):
     img.save(buffered, format="PNG")
     return f"data:image/png;base64,{base64.b64encode(buffered.getvalue()).decode()}"
 
-# =================== PROMPT PARA GEMINI (SCALPING) CON INYECCIÓN DE LECCIONES ===================
+# =================== PROMPT PARA GEMINI CON INYECCIÓN DE LECCIONES ===================
 def analizar_con_gemini(img_ltf, img_htf):
     global TOKENS_ACUMULADOS, REGLAS_APRENDIDAS
     try:
@@ -658,9 +658,8 @@ No añadas texto adicional fuera del JSON.
         logger.error(f"Error en IA: {e}")
         return "Hold", f"Error: {str(e)[:50]}", "", None, None, None, 0
 
-# =================== VALIDACIÓN Y AJUSTE DE PRECIOS PARA SCALPING ===================
+# =================== VALIDACIÓN Y AJUSTE DE PRECIOS ===================
 def ajustar_sl_tp_para_scalping(decision, entrada, sl_ia, tp1_ia):
-    """Ajusta SL y TP1 a rangos adecuados para scalping (0.05%-0.5% para SL, 0.2%-0.6% para TP1)."""
     if sl_ia is None or sl_ia <= 0:
         distancia_sl = entrada * 0.002
         sl_ajustado = entrada - distancia_sl if decision == "Buy" else entrada + distancia_sl
@@ -681,6 +680,7 @@ def ajustar_sl_tp_para_scalping(decision, entrada, sl_ia, tp1_ia):
 
     if tp1_ia is None or tp1_ia <= 0:
         distancia_tp1 = entrada * 0.003
+        tp1_ajustado = entrada + distancia_tp1 if decision == "Buy" else entrada - distancia_tp1
     else:
         if decision == "Buy":
             distancia_raw = tp1_ia - entrada
@@ -694,8 +694,7 @@ def ajustar_sl_tp_para_scalping(decision, entrada, sl_ia, tp1_ia):
             distancia_final_tp = max_tp
         else:
             distancia_final_tp = distancia_raw
-        sl_ajustado_tp = entrada + distancia_final_tp if decision == "Buy" else entrada - distancia_final_tp
-        tp1_ajustado = sl_ajustado_tp
+        tp1_ajustado = entrada + distancia_final_tp if decision == "Buy" else entrada - distancia_final_tp
     return sl_ajustado, tp1_ajustado
 
 # =================== GESTIÓN DE RIESGO Y APERTURA ===================
@@ -836,59 +835,6 @@ def abrir_posicion_con_ia(decision, precio_actual, razon, contexto, sl_ia, tp1_i
 
     guardar_memoria()
 
-# =================== GESTIÓN DE TRADES OPUESTOS ===================
-def cerrar_trades_opuestos(positions, precio_actual, is_paper):
-    """
-    Evalúa trades opuestos y cierra los perdedores.
-    Retorna una lista de IDs cerrados y un mensaje de aprendizaje.
-    """
-    if len(positions) < 2:
-        return [], ""
-    buys = [(tid, t) for tid, t in positions.items() if t['decision'] == 'Buy']
-    sells = [(tid, t) for tid, t in positions.items() if t['decision'] == 'Sell']
-    if not buys or not sells:
-        return [], ""
-    
-    trades_con_pnl = []
-    for tid, t in positions.items():
-        if t['decision'] == 'Buy':
-            pnl_no_realizado = (precio_actual - t['entrada']) * t['qty_restante']
-        else:
-            pnl_no_realizado = (t['entrada'] - precio_actual) * t['qty_restante']
-        trades_con_pnl.append((tid, t, pnl_no_realizado))
-    
-    buys_pnl = [(tid, t, pnl) for tid, t, pnl in trades_con_pnl if t['decision'] == 'Buy']
-    sells_pnl = [(tid, t, pnl) for tid, t, pnl in trades_con_pnl if t['decision'] == 'Sell']
-    
-    avg_buy = sum(pnl for _, _, pnl in buys_pnl) / len(buys_pnl) if buys_pnl else -9999
-    avg_sell = sum(pnl for _, _, pnl in sells_pnl) / len(sells_pnl) if sells_pnl else -9999
-    
-    if avg_buy > avg_sell:
-        a_cerrar = [tid for tid, _, _ in sells_pnl]
-        mantener = "Buy"
-    else:
-        a_cerrar = [tid for tid, _, _ in buys_pnl]
-        mantener = "Sell"
-    
-    if is_paper:
-        for tid in a_cerrar:
-            t = positions[tid]
-            qty_restante = t['qty_restante']
-            if t['decision'] == 'Buy':
-                pnl_cierre = (precio_actual - t['entrada']) * qty_restante
-            else:
-                pnl_cierre = (t['entrada'] - precio_actual) * qty_restante
-            comision = abs(pnl_cierre) * PAPER_COMMISSION_PCT
-            pnl_cierre -= comision
-            pnl_total = t['pnl_parcial'] + pnl_cierre
-            t['pnl_total'] = pnl_total
-    else:
-        # Para real se ejecutarían órdenes de cierre (implementación pendiente)
-        pass
-    
-    mensaje = f"🔄 Se cerraron {len(a_cerrar)} trades de dirección {mantener} porque iban perdiendo. Se mantienen los trades {mantener}."
-    return a_cerrar, mensaje
-
 def get_dynamic_max_trades():
     if PAPER_TRADE:
         balance = paper_balance
@@ -901,7 +847,6 @@ def get_dynamic_max_trades():
         max_by_balance = 1
     return min(MAX_CONCURRENT_TRADES, max_by_balance)
 
-# =================== GESTIÓN DE TRADES ACTIVOS (con TP1, trailing y gestión opuestos) ===================
 def sync_active_trades_with_bybit():
     if PAPER_TRADE:
         return
@@ -924,6 +869,7 @@ def sync_active_trades_with_bybit():
                     del REAL_ACTIVE_TRADES[other]
                 guardar_memoria()
 
+# =================== GESTIÓN DE TRADES ACTIVOS (sin cierre de opuestos) ===================
 def revisar_sl_tp_simulado(df, precio_actual):
     global paper_balance, paper_win_count, paper_loss_count, paper_total_trades, paper_trade_history, paper_positions, ULTIMO_APRENDIZAJE
     if not paper_positions:
@@ -1026,30 +972,7 @@ def revisar_sl_tp_simulado(df, precio_actual):
     for tid in cerrar_ids:
         del paper_positions[tid]
 
-    # Gestión de trades opuestos (después de actualizar, con el precio actual)
-    if len(paper_positions) >= 2:
-        a_cerrar_opuestos, mensaje_opuestos = cerrar_trades_opuestos(paper_positions, precio_actual, is_paper=True)
-        if a_cerrar_opuestos:
-            for tid in a_cerrar_opuestos:
-                t = paper_positions[tid]
-                pnl_total = t.get('pnl_total', 0)
-                paper_balance += pnl_total
-                paper_total_trades += 1
-                if pnl_total > 0:
-                    paper_win_count += 1
-                else:
-                    paper_loss_count += 1
-                paper_trade_history.append(convertir_serializable({"pnl": pnl_total, "resultado_win": pnl_total>0, "decision": t['decision'], "razon": t['razon']}))
-                del paper_positions[tid]
-            telegram_mensaje(mensaje_opuestos)
-            reporte_estado()
-            try:
-                prompt = f"Se cerraron trades opuestos porque cambiaron la dirección. Razón: {mensaje_opuestos}. Aprende de esto para no abrir trades contrarios simultáneamente."
-                resp = client.chat.completions.create(model=MODELO_VISION, messages=[{"role":"user","content":prompt}], timeout=10)
-                leccion = resp.choices[0].message.content
-                telegram_mensaje(f"🧠 Lección por opuestos: {leccion}")
-            except:
-                pass
+    # Ya no hay gestión de trades opuestos. Se permiten buys y sells simultáneos.
 
     if paper_total_trades - ULTIMO_APRENDIZAJE >= 10:
         aprender_de_trades()
@@ -1164,10 +1087,7 @@ def real_revisar_sl_tp(df, precio_actual):
     for tid in cerrar_ids:
         del REAL_ACTIVE_TRADES[tid]
 
-    # Gestión de trades opuestos en real (similar, con órdenes de cierre) - pendiente implementación completa
-    if len(REAL_ACTIVE_TRADES) >= 2:
-        # Por simplicidad, no se implementa ahora
-        pass
+    # No se cierran trades opuestos en real tampoco
 
     if TOTAL_TRADES - ULTIMO_APRENDIZAJE >= 10:
         aprender_de_trades()
@@ -1191,7 +1111,6 @@ def aprender_de_trades():
             resumen = f"📚 APRENDIZAJE #{TOTAL_TRADES}\n🏆 Winrate: {winrate:.1f}% | ⚖️ PF: {ULTIMO_PROFIT_FACTOR:.2f}"
         telegram_mensaje(resumen)
 
-        # Lección detallada SIN límite de caracteres, con ejemplos de trades exitosos
         ejemplos_exitosos = """
         Ejemplos de trades que funcionaron muy bien (en Paper):
         - Sell en 76730: tendencia bajista en ambos marcos, rechazo de EMA20 en 3m.
@@ -1219,8 +1138,7 @@ def aprender_de_trades():
                 timeout=45
             )
             REGLAS_APRENDIDAS = resp.choices[0].message.content
-            telegram_mensaje(f"🧠 Nueva lección IA:\n{REGLAS_APRENDIDAS[:500]}...")  # Enviamos solo los primeros 500 chars para no saturar Telegram
-            # Guardar lección completa en archivo
+            telegram_mensaje(f"🧠 Nueva lección IA:\n{REGLAS_APRENDIDAS[:500]}...")
             with open("lecciones_aprendidas.txt", "a", encoding="utf-8") as f:
                 f.write(f"\n\n--- Trade #{ULTIMO_APRENDIZAJE+1} ---\n{REGLAS_APRENDIDAS}\n")
         except Exception as e:
@@ -1309,9 +1227,8 @@ def run_bot():
                     dec, raz, explicacion, entry_ia, sl_ia, tp1_ia, conf = analizar_con_gemini(img_ltf, img_htf)
                     logger.info(f"🧠 Decisión IA: {dec} - Razón: {raz} - Confianza: {conf}")
 
-                    # --- FILTRO ADICIONAL: SOLO ABRIR SI PRECIO CERCA DE SOPORTE/RESISTENCIA ---
+                    # Filtro por niveles (soporte/resistencia) con la última vela actual
                     if dec != "Hold":
-                        # Obtener soportes y resistencias actuales incluyendo la última vela
                         sop_ltf_actual, res_ltf_actual, _, _, _, _ = detectar_zonas_mercado(df_ltf, idx=-1)
                         sop_htf_actual, res_htf_actual, _, _, _, _ = detectar_zonas_mercado(df_htf, idx=-1)
                         umbral_distancia = 0.0025  # 0.25%
@@ -1338,7 +1255,7 @@ def run_bot():
                                 dec = "Hold"
                     
                     if dec != "Hold":
-                        if conf >= 30:  # mantiene el umbral original, puedes ajustarlo a 50 si deseas
+                        if conf >= 30:
                             abrir_posicion_con_ia(dec, precio_actual, raz, explicacion, sl_ia, tp1_ia,
                                                   df_ltf, sop_ltf, res_ltf, slope_ltf, inter_ltf)
                         else:
