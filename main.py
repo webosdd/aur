@@ -1,4 +1,4 @@
-# BOT TRADING CON GEMINI 3.1 FLASH - SCALPING 3M/30M CON GESTIÓN INTELIGENTE
+# BOT TRADING CON GEMINI 3.1 FLASH - SCALPING 3M/30M (SIN AUTOAPRENDIZAJE)
 # ==============================================================================
 import os, time, requests, json, numpy as np, pandas as pd
 from scipy.stats import linregress
@@ -15,6 +15,8 @@ import hashlib
 import hmac
 import logging
 import re
+import signal
+import sys
 
 # Configurar logging
 logging.basicConfig(
@@ -92,7 +94,7 @@ RISK_PER_TRADE_MAX = 3.0
 LEVERAGE = 34
 SLEEP_SECONDS = 60
 GRAFICO_VELAS_LIMIT = 120
-MAX_CONCURRENT_TRADES = 3          # Hasta 3 trades simultáneos sin importar dirección
+MAX_CONCURRENT_TRADES = 3
 MIN_MARGIN_PER_TRADE = 3.0
 TP1_PERCENT = 0.5
 TRAILING_PERCENT = 0.0015
@@ -114,12 +116,124 @@ DAILY_START_BALANCE = None
 STOPPED_TODAY = False
 CURRENT_DAY = None
 
-ULTIMO_APRENDIZAJE = 0
-ULTIMO_PROFIT_FACTOR = 1.0
-REGLAS_APRENDIDAS = "Aún no hay lecciones."
-TOKENS_ACUMULADOS = 0
+# Variables para reporte cada 10 trades (sin aprendizaje)
+ULTIMO_REPORTE = 0   # cuántos trades había en el último reporte
 
-# =================== FUNCIONES BYBIT (sin cambios) ===================
+# =================== MEMORIA PERSISTENTE (sin aprendizaje) ===================
+MEMORY_FILE = "memoria_bot_paper.json" if PAPER_TRADE else "memoria_bot_real.json"
+
+def convertir_serializable(obj):
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, dict):
+        return {k: convertir_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [convertir_serializable(item) for item in obj]
+    return obj
+
+def guardar_memoria():
+    if PAPER_TRADE:
+        active_trades_meta = {}
+        for tid, t in paper_positions.items():
+            active_trades_meta[tid] = {
+                "id": t["id"], "decision": t["decision"], "entrada": t["entrada"],
+                "razon": t.get("razon", ""), "tp1_ejecutado": t["tp1_ejecutado"],
+                "sl_actual": t.get("sl_actual"),
+                "qty_original": t.get("qty_original"), "qty_restante": t.get("qty_restante"),
+                "breakeven_activado": t.get("breakeven_activado", False),
+                "trailing_activado": t.get("trailing_activado", False),
+                "best_price": t.get("best_price"),
+                "trailing_stop": t.get("trailing_stop"),
+                "pnl_parcial": t.get("pnl_parcial", 0.0)
+            }
+        data = {
+            "TRADE_HISTORY": paper_trade_history,
+            "REAL_BALANCE": paper_balance,
+            "WIN_COUNT": paper_win_count,
+            "LOSS_COUNT": paper_loss_count,
+            "TOTAL_TRADES": paper_total_trades,
+            "ACTIVE_TRADES_META": active_trades_meta,
+        }
+    else:
+        active_trades_meta = {}
+        for tid, t in REAL_ACTIVE_TRADES.items():
+            active_trades_meta[tid] = {
+                "id": t["id"], "decision": t["decision"], "entrada": t["entrada"],
+                "razon": t.get("razon", ""), "tp1_ejecutado": t["tp1_ejecutado"],
+                "sl_actual": t.get("sl_actual"),
+                "qty_original": t.get("qty_original"), "qty_restante": t.get("qty_restante"),
+                "breakeven_activado": t.get("breakeven_activado", False),
+                "trailing_activado": t.get("trailing_activado", False),
+                "best_price": t.get("best_price"),
+                "trailing_stop": t.get("trailing_stop"),
+                "pnl_parcial": t.get("pnl_parcial", 0.0)
+            }
+        data = {
+            "TRADE_HISTORY": TRADE_HISTORY,
+            "REAL_BALANCE": REAL_BALANCE,
+            "WIN_COUNT": WIN_COUNT,
+            "LOSS_COUNT": LOSS_COUNT,
+            "TOTAL_TRADES": TOTAL_TRADES,
+            "ACTIVE_TRADES_META": active_trades_meta,
+        }
+    try:
+        # Escritura atómica para evitar corrupción
+        tmp_file = MEMORY_FILE + ".tmp"
+        with open(tmp_file, "w") as f:
+            json.dump(convertir_serializable(data), f, indent=4)
+        os.replace(tmp_file, MEMORY_FILE)  # atómico en sistemas Unix
+        logger.info("💾 Memoria guardada (escritura atómica)")
+    except Exception as e:
+        logger.error(f"Error guardando memoria: {e}")
+
+def cargar_memoria():
+    global TRADE_HISTORY, REAL_BALANCE, WIN_COUNT, LOSS_COUNT, TOTAL_TRADES, REAL_ACTIVE_TRADES
+    global paper_balance, paper_win_count, paper_loss_count, paper_total_trades, paper_trade_history, paper_positions
+    if not os.path.exists(MEMORY_FILE):
+        return
+    try:
+        with open(MEMORY_FILE, "r") as f:
+            data = json.load(f)
+        if PAPER_TRADE:
+            paper_trade_history = data.get("TRADE_HISTORY", [])
+            paper_balance = data.get("REAL_BALANCE", 1000.0)
+            paper_win_count = data.get("WIN_COUNT", 0)
+            paper_loss_count = data.get("LOSS_COUNT", 0)
+            paper_total_trades = data.get("TOTAL_TRADES", 0)
+            active_meta = data.get("ACTIVE_TRADES_META", {})
+            for tid, meta in active_meta.items():
+                paper_positions[int(tid)] = meta
+        else:
+            TRADE_HISTORY = data.get("TRADE_HISTORY", [])
+            REAL_BALANCE = data.get("REAL_BALANCE", None)
+            WIN_COUNT = data.get("WIN_COUNT", 0)
+            LOSS_COUNT = data.get("LOSS_COUNT", 0)
+            TOTAL_TRADES = data.get("TOTAL_TRADES", 0)
+            active_meta = data.get("ACTIVE_TRADES_META", {})
+            for tid, meta in active_meta.items():
+                REAL_ACTIVE_TRADES[int(tid)] = meta
+        logger.info(f"📂 Memoria cargada. Trades: {paper_total_trades if PAPER_TRADE else TOTAL_TRADES}")
+    except Exception as e:
+        logger.error(f"Error cargando memoria: {e}")
+
+# =================== GUARDADO PERIÓDICO Y SEÑAL ===================
+ULTIMO_GUARDADO = 0
+
+def guardado_periodico():
+    global ULTIMO_GUARDADO
+    ahora = time.time()
+    if ahora - ULTIMO_GUARDADO > 300:  # cada 5 minutos
+        guardar_memoria()
+        ULTIMO_GUARDADO = ahora
+
+def guardar_y_salir(signum, frame):
+    logger.info("Señal SIGTERM recibida. Guardando memoria antes de salir...")
+    guardar_memoria()
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, guardar_y_salir)
+
+# =================== FUNCIONES BYBIT ===================
 def bybit_request(endpoint, method="GET", params=None, body=None):
     timestamp = str(int(time.time() * 1000))
     recv_window = "5000"
@@ -282,123 +396,6 @@ def close_position_qty_confirm(qty, side_to_close, max_wait=5):
     logger.error(f"No se confirmó reducción tras {max_wait}s")
     return None
 
-# ====== MEMORIA PERSISTENTE ======
-MEMORY_FILE = "memoria_bot_paper.json" if PAPER_TRADE else "memoria_bot_real.json"
-
-def convertir_serializable(obj):
-    if isinstance(obj, np.generic):
-        return obj.item()
-    if isinstance(obj, dict):
-        return {k: convertir_serializable(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [convertir_serializable(item) for item in obj]
-    return obj
-
-def guardar_memoria():
-    global ULTIMO_APRENDIZAJE, TOKENS_ACUMULADOS
-    if PAPER_TRADE:
-        active_trades_meta = {}
-        for tid, t in paper_positions.items():
-            active_trades_meta[tid] = {
-                "id": t["id"], "decision": t["decision"], "entrada": t["entrada"],
-                "razon": t.get("razon", ""), "tp1_ejecutado": t["tp1_ejecutado"],
-                "sl_actual": t.get("sl_actual"),
-                "qty_original": t.get("qty_original"), "qty_restante": t.get("qty_restante"),
-                "breakeven_activado": t.get("breakeven_activado", False),
-                "trailing_activado": t.get("trailing_activado", False),
-                "best_price": t.get("best_price"),
-                "trailing_stop": t.get("trailing_stop"),
-                "pnl_parcial": t.get("pnl_parcial", 0.0)
-            }
-        data = {
-            "TRADE_HISTORY": paper_trade_history,
-            "REGLAS_APRENDIDAS": REGLAS_APRENDIDAS,
-            "REAL_BALANCE": paper_balance,
-            "WIN_COUNT": paper_win_count,
-            "LOSS_COUNT": paper_loss_count,
-            "TOTAL_TRADES": paper_total_trades,
-            "ULTIMO_APRENDIZAJE": ULTIMO_APRENDIZAJE,
-            "TOKENS_ACUMULADOS": TOKENS_ACUMULADOS,
-            "ACTIVE_TRADES_META": active_trades_meta,
-            "ULTIMO_PROFIT_FACTOR": ULTIMO_PROFIT_FACTOR
-        }
-    else:
-        active_trades_meta = {}
-        for tid, t in REAL_ACTIVE_TRADES.items():
-            active_trades_meta[tid] = {
-                "id": t["id"], "decision": t["decision"], "entrada": t["entrada"],
-                "razon": t.get("razon", ""), "tp1_ejecutado": t["tp1_ejecutado"],
-                "sl_actual": t.get("sl_actual"),
-                "qty_original": t.get("qty_original"), "qty_restante": t.get("qty_restante"),
-                "breakeven_activado": t.get("breakeven_activado", False),
-                "trailing_activado": t.get("trailing_activado", False),
-                "best_price": t.get("best_price"),
-                "trailing_stop": t.get("trailing_stop"),
-                "pnl_parcial": t.get("pnl_parcial", 0.0)
-            }
-        data = {
-            "TRADE_HISTORY": TRADE_HISTORY,
-            "REGLAS_APRENDIDAS": REGLAS_APRENDIDAS,
-            "REAL_BALANCE": REAL_BALANCE,
-            "WIN_COUNT": WIN_COUNT,
-            "LOSS_COUNT": LOSS_COUNT,
-            "TOTAL_TRADES": TOTAL_TRADES,
-            "ULTIMO_APRENDIZAJE": ULTIMO_APRENDIZAJE,
-            "TOKENS_ACUMULADOS": TOKENS_ACUMULADOS,
-            "ACTIVE_TRADES_META": active_trades_meta,
-            "ULTIMO_PROFIT_FACTOR": ULTIMO_PROFIT_FACTOR
-        }
-    try:
-        with open(MEMORY_FILE, "w") as f:
-            json.dump(convertir_serializable(data), f, indent=4)
-        logger.info("💾 Memoria guardada")
-    except Exception as e:
-        logger.error(f"Error guardando memoria: {e}")
-
-def cargar_memoria():
-    global TRADE_HISTORY, REGLAS_APRENDIDAS, REAL_BALANCE, WIN_COUNT, LOSS_COUNT
-    global TOTAL_TRADES, ULTIMO_APRENDIZAJE, TOKENS_ACUMULADOS, ULTIMO_PROFIT_FACTOR, REAL_ACTIVE_TRADES
-    global paper_balance, paper_win_count, paper_loss_count, paper_total_trades, paper_trade_history, paper_positions
-    if not os.path.exists(MEMORY_FILE):
-        return
-    try:
-        with open(MEMORY_FILE, "r") as f:
-            data = json.load(f)
-        if PAPER_TRADE:
-            paper_trade_history = data.get("TRADE_HISTORY", [])
-            paper_balance = data.get("REAL_BALANCE", 1000.0)
-            paper_win_count = data.get("WIN_COUNT", 0)
-            paper_loss_count = data.get("LOSS_COUNT", 0)
-            paper_total_trades = data.get("TOTAL_TRADES", 0)
-            active_meta = data.get("ACTIVE_TRADES_META", {})
-            for tid, meta in active_meta.items():
-                paper_positions[int(tid)] = meta
-        else:
-            TRADE_HISTORY = data.get("TRADE_HISTORY", [])
-            REAL_BALANCE = data.get("REAL_BALANCE", None)
-            WIN_COUNT = data.get("WIN_COUNT", 0)
-            LOSS_COUNT = data.get("LOSS_COUNT", 0)
-            TOTAL_TRADES = data.get("TOTAL_TRADES", 0)
-            active_meta = data.get("ACTIVE_TRADES_META", {})
-            for tid, meta in active_meta.items():
-                REAL_ACTIVE_TRADES[int(tid)] = meta
-        REGLAS_APRENDIDAS = data.get("REGLAS_APRENDIDAS", REGLAS_APRENDIDAS)
-        ULTIMO_APRENDIZAJE = data.get("ULTIMO_APRENDIZAJE", 0)
-        TOKENS_ACUMULADOS = data.get("TOKENS_ACUMULADOS", 0)
-        ULTIMO_PROFIT_FACTOR = data.get("ULTIMO_PROFIT_FACTOR", 1.0)
-        logger.info(f"📂 Memoria cargada. Trades: {paper_total_trades if PAPER_TRADE else TOTAL_TRADES}")
-    except Exception as e:
-        logger.error(f"Error cargando memoria: {e}")
-
-def parse_json_seguro(raw):
-    if not raw or raw.strip() == "":
-        return None
-    try:
-        repaired = json_repair.repair_json(raw)
-        return json.loads(repaired)
-    except:
-        return None
-
 # =================== TELEGRAM ===================
 def telegram_mensaje_largo(texto):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -467,8 +464,7 @@ def reporte_estado():
         f"💰 Balance: {balance:.2f} USDT\n"
         f"📈 PnL día: {pnl_global:+.2f} USDT\n"
         f"🏆 Winrate: {winrate:.1f}%\n"
-        f"🎯 Activos: {active_trades}/{max_din}\n"
-        f"⚖️ PF (10t): {ULTIMO_PROFIT_FACTOR:.2f}"
+        f"🎯 Activos: {active_trades}/{max_din}"
     )
     telegram_mensaje(mensaje)
 
@@ -572,7 +568,8 @@ def generar_grafico_para_vision(df, titulo, soporte=None, resistencia=None, slop
     plt.savefig(buf, format='png', dpi=100)
     buf.seek(0)
     img = Image.open(buf)
-    plt.close()
+    plt.close(fig)
+    plt.close('all')  # Liberar memoria
     return img
 
 def pil_to_base64(img):
@@ -580,20 +577,23 @@ def pil_to_base64(img):
     img.save(buffered, format="PNG")
     return f"data:image/png;base64,{base64.b64encode(buffered.getvalue()).decode()}"
 
-# =================== PROMPT PARA GEMINI CON INYECCIÓN DE LECCIONES ===================
+def parse_json_seguro(raw):
+    if not raw or raw.strip() == "":
+        return None
+    try:
+        repaired = json_repair.repair_json(raw)
+        return json.loads(repaired)
+    except:
+        return None
+
+# =================== PROMPT PARA GEMINI (SIN LECCIONES) ===================
 def analizar_con_gemini(img_ltf, img_htf):
-    global TOKENS_ACUMULADOS, REGLAS_APRENDIDAS
     try:
         img_ltf_b64 = pil_to_base64(img_ltf)
         img_htf_b64 = pil_to_base64(img_htf)
 
-        lecciones = REGLAS_APRENDIDAS if REGLAS_APRENDIDAS != "Aún no hay lecciones." else "Aún sin lecciones previas. Prioriza operar cerca de niveles de soporte/resistencia."
-        
         prompt = f"""
 Eres un trader profesional de crypto especializado en scalping con velas de 3 minutos.
-IMPORTANTE: Basa tu decisión en las siguientes lecciones aprendidas de operaciones anteriores exitosas:
-{lecciones}
-
 Te voy a mostrar dos gráficos de BTC/USDT: el primero es de 3 minutos (velas recientes), el segundo es de 30 minutos (tendencia de mayor plazo).
 Analiza ambos gráficos libremente, fijándote en:
 - Niveles de SOPORTE y RESISTENCIA claros (preferiblemente que el precio esté muy cerca, menos del 0.3%).
@@ -635,7 +635,6 @@ No añadas texto adicional fuera del JSON.
             temperature=0.3,
             timeout=60
         )
-        TOKENS_ACUMULADOS += response.usage.total_tokens if response.usage else 0
         contenido = response.choices[0].message.content
         json_match = re.search(r'\{.*\}(?=\s*$)', contenido, re.DOTALL)
         if json_match:
@@ -708,6 +707,7 @@ def calcular_riesgo_dinamico(free_margin):
 
 def abrir_posicion_con_ia(decision, precio_actual, razon, contexto, sl_ia, tp1_ia, df_ltf, sop, res, slope, inter):
     global paper_balance, paper_positions, paper_trade_counter, REAL_BALANCE, TRADE_COUNTER, REAL_ACTIVE_TRADES
+    global paper_total_trades, TOTAL_TRADES
 
     if decision not in ["Buy", "Sell"]:
         logger.info(f"Decisión {decision} no es operativa. Ignorando.")
@@ -869,16 +869,50 @@ def sync_active_trades_with_bybit():
                     del REAL_ACTIVE_TRADES[other]
                 guardar_memoria()
 
-# =================== GESTIÓN DE TRADES ACTIVOS (sin cierre de opuestos) ===================
+# =================== REPORTE CADA 10 TRADES (SIN APRENDIZAJE) ===================
+def enviar_reporte_cada_10_trades():
+    global ULTIMO_REPORTE
+    if PAPER_TRADE:
+        total = paper_total_trades
+        win = paper_win_count
+        loss = paper_loss_count
+        balance = paper_balance
+        history = paper_trade_history
+    else:
+        total = TOTAL_TRADES
+        win = WIN_COUNT
+        loss = LOSS_COUNT
+        balance = REAL_BALANCE
+        history = TRADE_HISTORY
+
+    if total - ULTIMO_REPORTE >= 10 and total > 0:
+        # Calcular winrate y profit factor de los últimos 10 trades
+        ultimos = history[-10:] if len(history) >= 10 else history
+        ganancias = sum(t['pnl'] for t in ultimos if t['pnl'] > 0)
+        perdidas = abs(sum(t['pnl'] for t in ultimos if t['pnl'] < 0))
+        pf = ganancias / perdidas if perdidas > 0 else 0.0
+        winrate_10 = (sum(1 for t in ultimos if t['pnl'] > 0) / len(ultimos)) * 100 if ultimos else 0
+        modo = "📄 PAPER" if PAPER_TRADE else "💰 REAL"
+        msg = (f"{modo} - REPORTE CADA 10 TRADES\n"
+               f"📊 Trades totales: {total}\n"
+               f"🏆 Winrate últimos 10: {winrate_10:.1f}%\n"
+               f"⚖️ Profit Factor últimos 10: {pf:.2f}\n"
+               f"💰 Balance actual: {balance:.2f} USDT\n"
+               f"📈 Winrate global: {(win/(win+loss)*100) if (win+loss)>0 else 0:.1f}%")
+        telegram_mensaje(msg)
+        logger.info(msg)
+        ULTIMO_REPORTE = total
+
+# =================== GESTIÓN DE TRADES ACTIVOS ===================
 def revisar_sl_tp_simulado(df, precio_actual):
-    global paper_balance, paper_win_count, paper_loss_count, paper_total_trades, paper_trade_history, paper_positions, ULTIMO_APRENDIZAJE
+    global paper_balance, paper_win_count, paper_loss_count, paper_total_trades, paper_trade_history, paper_positions
     if not paper_positions:
         return
     h = df['high'].iloc[-1]
     l = df['low'].iloc[-1]
     cerrar_ids = []
     for tid, t in list(paper_positions.items()):
-        # TP1: cerrar 50% si no se ha ejecutado y se alcanza el precio
+        # TP1: cerrar 50% si no se ha ejecutado
         if not t['tp1_ejecutado'] and t['tp1'] is not None and t['tp1'] > 0:
             if (t['decision']=="Buy" and h >= t['tp1']) or (t['decision']=="Sell" and l <= t['tp1']):
                 qty_tp1 = round(t['qty_original'] * TP1_PERCENT, 3)
@@ -899,7 +933,7 @@ def revisar_sl_tp_simulado(df, precio_actual):
                 else:
                     cerrar_ids.append(tid)
 
-        # Trailing stop (solo si activado después de TP1)
+        # Trailing stop
         if t.get('trailing_activado', False) and t['qty_restante'] > 0:
             if t['decision'] == 'Buy':
                 if h > t['best_price']:
@@ -923,7 +957,8 @@ def revisar_sl_tp_simulado(df, precio_actual):
                     logger.info(msg)
                     telegram_mensaje(msg)
                     reporte_estado()
-            else:  # Sell
+                    enviar_reporte_cada_10_trades()
+            else:
                 if l < t['best_price']:
                     t['best_price'] = l
                     t['trailing_stop'] = t['best_price'] * (1 + TRAILING_PERCENT)
@@ -945,8 +980,9 @@ def revisar_sl_tp_simulado(df, precio_actual):
                     logger.info(msg)
                     telegram_mensaje(msg)
                     reporte_estado()
+                    enviar_reporte_cada_10_trades()
 
-        # Stop loss inicial (solo si no se ha alcanzado TP1 y no está en trailing)
+        # Stop loss inicial
         if not t.get('tp1_ejecutado', False) and t['qty_restante'] > 0:
             cond = (t['decision']=="Buy" and l <= t['sl_actual']) or (t['decision']=="Sell" and h >= t['sl_actual'])
             if cond:
@@ -968,24 +1004,21 @@ def revisar_sl_tp_simulado(df, precio_actual):
                 logger.info(msg)
                 telegram_mensaje(msg)
                 reporte_estado()
+                enviar_reporte_cada_10_trades()
 
     for tid in cerrar_ids:
         del paper_positions[tid]
 
-    # Ya no hay gestión de trades opuestos. Se permiten buys y sells simultáneos.
-
-    if paper_total_trades - ULTIMO_APRENDIZAJE >= 10:
-        aprender_de_trades()
+    # No hay cierre de opuestos
 
 def real_revisar_sl_tp(df, precio_actual):
-    global REAL_BALANCE, WIN_COUNT, LOSS_COUNT, TOTAL_TRADES, TRADE_HISTORY, REAL_ACTIVE_TRADES, ULTIMO_APRENDIZAJE
+    global REAL_BALANCE, WIN_COUNT, LOSS_COUNT, TOTAL_TRADES, TRADE_HISTORY, REAL_ACTIVE_TRADES
     if not REAL_ACTIVE_TRADES:
         return
     h = df['high'].iloc[-1]
     l = df['low'].iloc[-1]
     cerrar_ids = []
     for tid, t in list(REAL_ACTIVE_TRADES.items()):
-        # TP1
         if not t['tp1_ejecutado'] and t['tp1']>0:
             if (t['decision']=="Buy" and h>=t['tp1']) or (t['decision']=="Sell" and l<=t['tp1']):
                 qty_tp1 = round(t['qty_original'] * TP1_PERCENT, 3)
@@ -1008,7 +1041,6 @@ def real_revisar_sl_tp(df, precio_actual):
                 else:
                     cerrar_ids.append(tid)
 
-        # Trailing stop
         if t.get('trailing_activado', False) and t['qty_restante'] > 0:
             if t['decision'] == 'Buy':
                 if h > t['best_price']:
@@ -1032,6 +1064,7 @@ def real_revisar_sl_tp(df, precio_actual):
                         logger.info(msg)
                         telegram_mensaje(msg)
                         reporte_estado()
+                        enviar_reporte_cada_10_trades()
                     else:
                         logger.error(f"Falló cierre por trailing #{tid}")
             else:
@@ -1056,10 +1089,10 @@ def real_revisar_sl_tp(df, precio_actual):
                         logger.info(msg)
                         telegram_mensaje(msg)
                         reporte_estado()
+                        enviar_reporte_cada_10_trades()
                     else:
                         logger.error(f"Falló cierre por trailing #{tid}")
 
-        # Stop loss inicial antes de TP1
         if not t['tp1_ejecutado'] and t['qty_restante'] > 0:
             cond = (t['decision']=="Buy" and l<=t['sl_actual']) or (t['decision']=="Sell" and h>=t['sl_actual'])
             if cond:
@@ -1081,74 +1114,12 @@ def real_revisar_sl_tp(df, precio_actual):
                     logger.info(msg)
                     telegram_mensaje(msg)
                     reporte_estado()
+                    enviar_reporte_cada_10_trades()
                 else:
                     logger.error(f"Falló cierre por stop #{tid}")
 
     for tid in cerrar_ids:
         del REAL_ACTIVE_TRADES[tid]
-
-    # No se cierran trades opuestos en real tampoco
-
-    if TOTAL_TRADES - ULTIMO_APRENDIZAJE >= 10:
-        aprender_de_trades()
-
-def aprender_de_trades():
-    global REGLAS_APRENDIDAS, ULTIMO_APRENDIZAJE, ULTIMO_PROFIT_FACTOR
-    try:
-        if PAPER_TRADE:
-            ult = paper_trade_history[-10:] if len(paper_trade_history)>=10 else paper_trade_history
-            gan = sum(t['pnl'] for t in ult if t['pnl']>0)
-            per = abs(sum(t['pnl'] for t in ult if t['pnl']<0))
-            ULTIMO_PROFIT_FACTOR = gan/per if per>0 else 1.0
-            winrate = (paper_win_count/paper_total_trades*100) if paper_total_trades>0 else 0
-            resumen = f"📚 APRENDIZAJE PAPER #{paper_total_trades}\n🏆 Winrate: {winrate:.1f}% | ⚖️ PF: {ULTIMO_PROFIT_FACTOR:.2f}"
-        else:
-            ult = TRADE_HISTORY[-10:] if len(TRADE_HISTORY)>=10 else TRADE_HISTORY
-            gan = sum(t['pnl'] for t in ult if t['pnl']>0)
-            per = abs(sum(t['pnl'] for t in ult if t['pnl']<0))
-            ULTIMO_PROFIT_FACTOR = gan/per if per>0 else 1.0
-            winrate = (WIN_COUNT/TOTAL_TRADES*100) if TOTAL_TRADES>0 else 0
-            resumen = f"📚 APRENDIZAJE #{TOTAL_TRADES}\n🏆 Winrate: {winrate:.1f}% | ⚖️ PF: {ULTIMO_PROFIT_FACTOR:.2f}"
-        telegram_mensaje(resumen)
-
-        ejemplos_exitosos = """
-        Ejemplos de trades que funcionaron muy bien (en Paper):
-        - Sell en 76730: tendencia bajista en ambos marcos, rechazo de EMA20 en 3m.
-        - Buy en 76189: rebote en soporte clave de 3m y 30m.
-        - Sell en 77745: rechazo en resistencia HTF 77500 y LTF 77700.
-        - Buy en 76257, 76056, 76068: rebotes en soporte mayor 76000 con patrón de reversión.
-        Patrón común: operar solo cuando el precio está muy cerca (menos del 0.25%) de un nivel claro de soporte o resistencia.
-        """
-
-        try:
-            ult_serial = convertir_serializable(ult)
-            prompt = f"""Analiza estos últimos 10 trades y, basándote también en los ejemplos exitosos proporcionados, 
-            extrae una lección detallada (sin límite de palabras) en español sobre QUÉ TIPO DE SETUPS funcionan mejor 
-            y cuáles se deben evitar. La lección debe ser práctica, con condiciones concretas (ej: "solo comprar cuando el precio esté a menos de 0.2% de un soporte identificado en HTF").
-            
-            Ejemplos exitosos:
-            {ejemplos_exitosos}
-            
-            Historial reciente (últimos 10 trades):
-            {json.dumps(ult_serial, indent=2)}
-            """
-            resp = client.chat.completions.create(
-                model=MODELO_VISION, 
-                messages=[{"role":"user","content":prompt}], 
-                timeout=45
-            )
-            REGLAS_APRENDIDAS = resp.choices[0].message.content
-            telegram_mensaje(f"🧠 Nueva lección IA:\n{REGLAS_APRENDIDAS[:500]}...")
-            with open("lecciones_aprendidas.txt", "a", encoding="utf-8") as f:
-                f.write(f"\n\n--- Trade #{ULTIMO_APRENDIZAJE+1} ---\n{REGLAS_APRENDIDAS}\n")
-        except Exception as e:
-            logger.error(f"Error en aprendizaje detallado: {e}")
-            REGLAS_APRENDIDAS = "Aún no hay lección detallada."
-    except Exception as e:
-        logger.error(f"Error aprendizaje: {e}")
-    finally:
-        ULTIMO_APRENDIZAJE = paper_total_trades if PAPER_TRADE else TOTAL_TRADES
-        guardar_memoria()
 
 def risk_management_check():
     global DAILY_START_BALANCE, STOPPED_TODAY, CURRENT_DAY
@@ -1169,14 +1140,21 @@ def risk_management_check():
 
 # =================== LOOP PRINCIPAL ===================
 def run_bot():
-    global REAL_BALANCE, ULTIMO_APRENDIZAJE, TOKENS_ACUMULADOS, ULTIMO_PROFIT_FACTOR, TRADE_HISTORY, REAL_ACTIVE_TRADES
+    global REAL_BALANCE, TRADE_HISTORY, REAL_ACTIVE_TRADES
     global paper_balance, paper_trade_counter, paper_win_count, paper_loss_count, paper_total_trades, paper_trade_history, paper_positions, ultima_vela
+    global ULTIMO_REPORTE
 
     cargar_memoria()
     set_leverage()
     sync_active_trades_with_bybit()
 
-    telegram_mensaje("🤖 Bot iniciado - Gemini 3.1 Flash - Scalping 3m/30m con gestión inteligente")
+    # Inicializar contador de reporte
+    if PAPER_TRADE:
+        ULTIMO_REPORTE = paper_total_trades
+    else:
+        ULTIMO_REPORTE = TOTAL_TRADES
+
+    telegram_mensaje("🤖 Bot iniciado - Gemini 3.1 Flash - Scalping 3m/30m (sin autoaprendizaje)")
     logger.info("Bot iniciado")
 
     if PAPER_TRADE:
@@ -1193,6 +1171,8 @@ def run_bot():
     ultima_vela = None
     while True:
         try:
+            guardado_periodico()  # Guardar cada 5 min
+
             if int(time.time()) % 300 < 5:
                 logger.info("❤️ Bot heartbeat")
 
@@ -1227,7 +1207,7 @@ def run_bot():
                     dec, raz, explicacion, entry_ia, sl_ia, tp1_ia, conf = analizar_con_gemini(img_ltf, img_htf)
                     logger.info(f"🧠 Decisión IA: {dec} - Razón: {raz} - Confianza: {conf}")
 
-                    # Filtro por niveles (soporte/resistencia) con la última vela actual
+                    # Filtro por niveles (opcional, se mantiene como estaba)
                     if dec != "Hold":
                         sop_ltf_actual, res_ltf_actual, _, _, _, _ = detectar_zonas_mercado(df_ltf, idx=-1)
                         sop_htf_actual, res_htf_actual, _, _, _, _ = detectar_zonas_mercado(df_htf, idx=-1)
@@ -1268,7 +1248,7 @@ def run_bot():
 
                 ultima_vela = vela_actual_time
 
-            # Gestión de trades activos (siempre)
+            # Gestión de trades activos
             if PAPER_TRADE and paper_positions:
                 revisar_sl_tp_simulado(df_ltf, precio_actual)
             elif not PAPER_TRADE and REAL_ACTIVE_TRADES:
