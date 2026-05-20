@@ -1,4 +1,4 @@
-# BOT TRADING CON GEMINI 3.1 FLASH + TA-Lib (61 patrones de velas)
+# BOT TRADING CON GEMINI 3.1 FLASH + TA-Lib (patrones de velas) - SIN AUTOAPRENDIZAJE
 # ==============================================================================
 import os, time, requests, json, numpy as np, pandas as pd
 from scipy.stats import linregress
@@ -29,18 +29,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# =================== TA-LIB (patrones de velas) ===================
+# =================== TA-Lib (patrones de velas) ===================
 try:
     import talib
     TA_LIB_AVAILABLE = True
-    logger.info("✅ TA-Lib cargado correctamente. 61 patrones de velas disponibles.")
+    logger.info("✅ TA-Lib cargado correctamente.")
 except ImportError:
     TA_LIB_AVAILABLE = False
     logger.warning("⚠️ TA-Lib no instalado. Se omitirá la detección de patrones.")
     # Definimos stub para evitar errores
     class talib:
-        @staticmethod
-        def CDLDOJI(*args): return np.array([0])
+        pass
 
 # =================== SANITIZAR EMOJIS ===================
 def sanitize_for_matplotlib(text):
@@ -629,9 +628,8 @@ def parse_json_seguro(raw):
     except:
         return None
 
-# =================== DETECCIÓN DE PATRONES CON TA-Lib (61 patrones) ===================
-
-    def obtener_todos_patrones_talib(df: pd.DataFrame) -> dict:
+# =================== DETECCIÓN DE PATRONES CON TA-Lib ===================
+def obtener_todos_patrones_talib(df: pd.DataFrame) -> dict:
     """
     Ejecuta todas las funciones de patrones de TA-Lib sobre el DataFrame.
     Retorna un diccionario con {nombre_patron: señal (100/-100/0)} para la última vela.
@@ -639,15 +637,13 @@ def parse_json_seguro(raw):
     if not TA_LIB_AVAILABLE or df.empty or len(df) < 5:
         return {}
     
-    # Asegurar nombres de columnas en minúsculas (pero TA-Lib espera arrays)
-    # Convertimos a arrays de float
+    # Asegurar arrays de floats
     open_ = df['open'].values.astype(float)
     high = df['high'].values.astype(float)
     low = df['low'].values.astype(float)
     close = df['close'].values.astype(float)
     
-    # Lista completa de funciones de reconocimiento de patrones de TA-Lib (61)
-    # Basada en la documentación oficial: https://github.com/TA-Lib/ta-lib-python/blob/main/docs/funcs.md#pattern-recognition
+    # Lista de nombres de funciones de patrones (las que realmente existen en TA-Lib 0.4.0)
     pattern_names = [
         'CDL2CROWS', 'CDL3BLACKCROWS', 'CDL3INSIDE', 'CDL3LINESTRIKE', 'CDL3OUTSIDE',
         'CDL3STARSINSOUTH', 'CDL3WHITESOLDIERS', 'CDLABANDONEDBABY', 'CDLADVANCEBLOCK',
@@ -672,12 +668,11 @@ def parse_json_seguro(raw):
                 continue
             result_array = func(open_, high, low, close)
             if len(result_array) > 0:
-                signal = result_array[-1]  # última vela
+                signal = result_array[-1]
                 if signal != 0:
                     resultados[name] = int(signal)
-        except Exception as e:
-            # Si falla, lo ignoramos y seguimos
-            # (puede ser por arrays muy cortos o por patrón que requiere más velas)
+        except Exception:
+            # Si falla, omitimos este patrón
             continue
     return resultados
 
@@ -1287,8 +1282,8 @@ def run_bot():
     else:
         ULTIMO_REPORTE = TOTAL_TRADES
 
-    telegram_mensaje("🤖 Bot iniciado - Gemini 3.1 Flash + TA-Lib (61 patrones) - Scalping 3m/30m")
-    logger.info("Bot iniciado con detección de 61 patrones de velas (TA-Lib)")
+    telegram_mensaje("🤖 Bot iniciado - Gemini 3.1 Flash + TA-Lib (patrones) - Scalping 3m/30m")
+    logger.info("Bot iniciado con detección de patrones de velas (TA-Lib)")
 
     if PAPER_TRADE:
         logger.info(f"📄 PAPER TRADE - Saldo: {paper_balance:.2f} USDT")
@@ -1333,13 +1328,15 @@ def run_bot():
                 sop_ltf, res_ltf, slope_ltf, inter_ltf, _, _ = detectar_zonas_mercado(df_ltf)
                 sop_htf, res_htf, slope_htf, inter_htf, _, _ = detectar_zonas_mercado(df_htf)
 
-                # === DETECCIÓN DE PATRONES CON TA-Lib ===
+                # Detectar patrones con TA-Lib
                 patrones_ltf = obtener_todos_patrones_talib(df_ltf)
                 patrones_htf = obtener_todos_patrones_talib(df_htf)
                 patrones_ltf_texto = resumen_patrones_texto(patrones_ltf)
                 patrones_htf_texto = resumen_patrones_texto(patrones_htf)
-                logger.debug(f"Patrones LTF: {patrones_ltf_texto}")
-                logger.debug(f"Patrones HTF: {patrones_htf_texto}")
+                if patrones_ltf:
+                    logger.info(f"📊 Patrones LTF: {patrones_ltf_texto[:200]}")
+                if patrones_htf:
+                    logger.info(f"📊 Patrones HTF: {patrones_htf_texto[:200]}")
 
                 img_ltf = generar_grafico_para_vision(df_ltf, "BTC/USDT 3m (LTF)", sop_ltf, res_ltf, slope_ltf, inter_ltf, excluir_actual=True)
                 img_htf = generar_grafico_para_vision(df_htf, "BTC/USDT 30m (HTF)", sop_htf, res_htf, slope_htf, inter_htf, excluir_actual=True)
@@ -1376,9 +1373,8 @@ def run_bot():
                                 telegram_mensaje("🚫 Sell rechazado por falta de resistencia cercana")
                                 dec = "Hold"
 
-                    # Validación extra de consistencia entre patrón y decisión (opcional)
+                    # Filtro de consistencia con patrones
                     if dec != "Hold":
-                        # Verificar que al menos haya un patrón que coincida con la dirección
                         patrones_coinciden = False
                         if dec == "Buy":
                             if any(v > 0 for v in patrones_ltf.values()) or any(v > 0 for v in patrones_htf.values()):
@@ -1387,7 +1383,6 @@ def run_bot():
                             if any(v < 0 for v in patrones_ltf.values()) or any(v < 0 for v in patrones_htf.values()):
                                 patrones_coinciden = True
                         if not patrones_coinciden:
-                            # Si no hay patrón que respalde, reducimos confianza pero no cancelamos si los niveles son buenos
                             logger.info(f"⚠️ Decisión {dec} sin patrón de confirmación. Confianza reducida.")
                             conf = max(conf - 15, 0)
                             if conf < 20:
