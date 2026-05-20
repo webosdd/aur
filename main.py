@@ -116,10 +116,10 @@ DAILY_START_BALANCE = None
 STOPPED_TODAY = False
 CURRENT_DAY = None
 
-# Variables para reporte cada 10 trades (sin aprendizaje)
-ULTIMO_REPORTE = 0   # cuántos trades había en el último reporte
+# Variables para reporte cada 10 trades
+ULTIMO_REPORTE = 0
 
-# =================== MEMORIA PERSISTENTE (sin aprendizaje) ===================
+# =================== MEMORIA PERSISTENTE ===================
 MEMORY_FILE = "memoria_bot_paper.json" if PAPER_TRADE else "memoria_bot_real.json"
 
 def convertir_serializable(obj):
@@ -130,6 +130,30 @@ def convertir_serializable(obj):
     if isinstance(obj, (list, tuple)):
         return [convertir_serializable(item) for item in obj]
     return obj
+
+def normalizar_trade_activo(trade):
+    """Asegura que un trade activo tenga todas las claves necesarias con valores por defecto"""
+    defaults = {
+        'tp1': 0.0,
+        'tp1_ejecutado': False,
+        'trailing_activado': False,
+        'best_price': trade.get('entrada', 0.0),
+        'trailing_stop': None,
+        'pnl_parcial': 0.0,
+        'qty_restante': trade.get('qty_original', 0.0),
+        'sl_actual': trade.get('sl_inicial', 0.0),
+        'razon': '',
+        'decision': 'Hold',
+        'entrada': 0.0,
+        'qty_original': 0.0,
+        'order_id': None,
+        'breakeven_activado': False,
+        'contexto_pensamiento': ''
+    }
+    for key, val in defaults.items():
+        if key not in trade:
+            trade[key] = val
+    return trade
 
 def guardar_memoria():
     if PAPER_TRADE:
@@ -144,7 +168,10 @@ def guardar_memoria():
                 "trailing_activado": t.get("trailing_activado", False),
                 "best_price": t.get("best_price"),
                 "trailing_stop": t.get("trailing_stop"),
-                "pnl_parcial": t.get("pnl_parcial", 0.0)
+                "pnl_parcial": t.get("pnl_parcial", 0.0),
+                "tp1": t.get("tp1", 0.0),
+                "sl_inicial": t.get("sl_inicial", 0.0),
+                "order_id": t.get("order_id")
             }
         data = {
             "TRADE_HISTORY": paper_trade_history,
@@ -166,7 +193,10 @@ def guardar_memoria():
                 "trailing_activado": t.get("trailing_activado", False),
                 "best_price": t.get("best_price"),
                 "trailing_stop": t.get("trailing_stop"),
-                "pnl_parcial": t.get("pnl_parcial", 0.0)
+                "pnl_parcial": t.get("pnl_parcial", 0.0),
+                "tp1": t.get("tp1", 0.0),
+                "sl_inicial": t.get("sl_inicial", 0.0),
+                "order_id": t.get("order_id")
             }
         data = {
             "TRADE_HISTORY": TRADE_HISTORY,
@@ -177,11 +207,10 @@ def guardar_memoria():
             "ACTIVE_TRADES_META": active_trades_meta,
         }
     try:
-        # Escritura atómica para evitar corrupción
         tmp_file = MEMORY_FILE + ".tmp"
         with open(tmp_file, "w") as f:
             json.dump(convertir_serializable(data), f, indent=4)
-        os.replace(tmp_file, MEMORY_FILE)  # atómico en sistemas Unix
+        os.replace(tmp_file, MEMORY_FILE)
         logger.info("💾 Memoria guardada (escritura atómica)")
     except Exception as e:
         logger.error(f"Error guardando memoria: {e}")
@@ -201,8 +230,11 @@ def cargar_memoria():
             paper_loss_count = data.get("LOSS_COUNT", 0)
             paper_total_trades = data.get("TOTAL_TRADES", 0)
             active_meta = data.get("ACTIVE_TRADES_META", {})
+            paper_positions = {}
             for tid, meta in active_meta.items():
-                paper_positions[int(tid)] = meta
+                # Normalizar el trade para que tenga todas las claves
+                trade = normalizar_trade_activo(meta)
+                paper_positions[int(tid)] = trade
         else:
             TRADE_HISTORY = data.get("TRADE_HISTORY", [])
             REAL_BALANCE = data.get("REAL_BALANCE", None)
@@ -210,8 +242,10 @@ def cargar_memoria():
             LOSS_COUNT = data.get("LOSS_COUNT", 0)
             TOTAL_TRADES = data.get("TOTAL_TRADES", 0)
             active_meta = data.get("ACTIVE_TRADES_META", {})
+            REAL_ACTIVE_TRADES = {}
             for tid, meta in active_meta.items():
-                REAL_ACTIVE_TRADES[int(tid)] = meta
+                trade = normalizar_trade_activo(meta)
+                REAL_ACTIVE_TRADES[int(tid)] = trade
         logger.info(f"📂 Memoria cargada. Trades: {paper_total_trades if PAPER_TRADE else TOTAL_TRADES}")
     except Exception as e:
         logger.error(f"Error cargando memoria: {e}")
@@ -222,7 +256,7 @@ ULTIMO_GUARDADO = 0
 def guardado_periodico():
     global ULTIMO_GUARDADO
     ahora = time.time()
-    if ahora - ULTIMO_GUARDADO > 300:  # cada 5 minutos
+    if ahora - ULTIMO_GUARDADO > 300:
         guardar_memoria()
         ULTIMO_GUARDADO = ahora
 
@@ -233,7 +267,7 @@ def guardar_y_salir(signum, frame):
 
 signal.signal(signal.SIGTERM, guardar_y_salir)
 
-# =================== FUNCIONES BYBIT ===================
+# =================== FUNCIONES BYBIT (sin cambios) ===================
 def bybit_request(endpoint, method="GET", params=None, body=None):
     timestamp = str(int(time.time() * 1000))
     recv_window = "5000"
@@ -569,7 +603,7 @@ def generar_grafico_para_vision(df, titulo, soporte=None, resistencia=None, slop
     buf.seek(0)
     img = Image.open(buf)
     plt.close(fig)
-    plt.close('all')  # Liberar memoria
+    plt.close('all')
     return img
 
 def pil_to_base64(img):
@@ -781,7 +815,7 @@ def abrir_posicion_con_ia(decision, precio_actual, razon, contexto, sl_ia, tp1_i
         paper_balance -= comision
         paper_trade_counter += 1
         trade_id = paper_trade_counter
-        positions[trade_id] = {
+        positions[trade_id] = normalizar_trade_activo({
             "id": trade_id, "decision": decision, "entrada": entrada,
             "sl_inicial": sl_ajustado, "sl_actual": sl_ajustado,
             "tp1": tp1_ajustado,
@@ -792,7 +826,7 @@ def abrir_posicion_con_ia(decision, precio_actual, razon, contexto, sl_ia, tp1_i
             "trailing_activado": False,
             "best_price": entrada,
             "trailing_stop": None
-        }
+        })
         modo = "📄 PAPER"
     else:
         order_id = place_market_order(decision, qty_btc)
@@ -801,7 +835,7 @@ def abrir_posicion_con_ia(decision, precio_actual, razon, contexto, sl_ia, tp1_i
             return
         TRADE_COUNTER += 1
         trade_id = TRADE_COUNTER
-        positions[trade_id] = {
+        positions[trade_id] = normalizar_trade_activo({
             "id": trade_id, "decision": decision, "entrada": entrada,
             "sl_inicial": sl_ajustado, "sl_actual": sl_ajustado,
             "tp1": tp1_ajustado,
@@ -812,7 +846,7 @@ def abrir_posicion_con_ia(decision, precio_actual, razon, contexto, sl_ia, tp1_i
             "trailing_activado": False,
             "best_price": entrada,
             "trailing_stop": None
-        }
+        })
         modo = "💰 REAL"
 
     msg = (f"{modo} [#{trade_id}] {decision} MARKET en {entrada:.2f} | Qty {qty_btc} BTC (riesgo {risk_per_trade} USDT)\n"
@@ -869,7 +903,7 @@ def sync_active_trades_with_bybit():
                     del REAL_ACTIVE_TRADES[other]
                 guardar_memoria()
 
-# =================== REPORTE CADA 10 TRADES (SIN APRENDIZAJE) ===================
+# =================== REPORTE CADA 10 TRADES ===================
 def enviar_reporte_cada_10_trades():
     global ULTIMO_REPORTE
     if PAPER_TRADE:
@@ -886,7 +920,6 @@ def enviar_reporte_cada_10_trades():
         history = TRADE_HISTORY
 
     if total - ULTIMO_REPORTE >= 10 and total > 0:
-        # Calcular winrate y profit factor de los últimos 10 trades
         ultimos = history[-10:] if len(history) >= 10 else history
         ganancias = sum(t['pnl'] for t in ultimos if t['pnl'] > 0)
         perdidas = abs(sum(t['pnl'] for t in ultimos if t['pnl'] < 0))
@@ -903,7 +936,7 @@ def enviar_reporte_cada_10_trades():
         logger.info(msg)
         ULTIMO_REPORTE = total
 
-# =================== GESTIÓN DE TRADES ACTIVOS ===================
+# =================== GESTIÓN DE TRADES ACTIVOS (con .get() seguro) ===================
 def revisar_sl_tp_simulado(df, precio_actual):
     global paper_balance, paper_win_count, paper_loss_count, paper_total_trades, paper_trade_history, paper_positions
     if not paper_positions:
@@ -912,20 +945,34 @@ def revisar_sl_tp_simulado(df, precio_actual):
     l = df['low'].iloc[-1]
     cerrar_ids = []
     for tid, t in list(paper_positions.items()):
+        # Asegurar que t tenga tp1 y tp1_ejecutado
+        tp1 = t.get('tp1', 0.0)
+        tp1_ejecutado = t.get('tp1_ejecutado', False)
+        qty_restante = t.get('qty_restante', 0.0)
+        decision = t.get('decision', 'Hold')
+        entrada = t.get('entrada', 0.0)
+        sl_actual = t.get('sl_actual', 0.0)
+        pnl_parcial = t.get('pnl_parcial', 0.0)
+        qty_original = t.get('qty_original', 0.0)
+        razon = t.get('razon', '')
+        trailing_activado = t.get('trailing_activado', False)
+        best_price = t.get('best_price', entrada)
+        trailing_stop = t.get('trailing_stop')
+
         # TP1: cerrar 50% si no se ha ejecutado
-        if not t['tp1_ejecutado'] and t['tp1'] is not None and t['tp1'] > 0:
-            if (t['decision']=="Buy" and h >= t['tp1']) or (t['decision']=="Sell" and l <= t['tp1']):
-                qty_tp1 = round(t['qty_original'] * TP1_PERCENT, 3)
-                if qty_tp1 >= 0.001 and t['qty_restante'] > 0:
-                    pnl_parcial = (t['tp1'] - t['entrada']) * qty_tp1 if t['decision']=="Buy" else (t['entrada'] - t['tp1']) * qty_tp1
+        if not tp1_ejecutado and tp1 > 0:
+            if (decision == "Buy" and h >= tp1) or (decision == "Sell" and l <= tp1):
+                qty_tp1 = round(qty_original * TP1_PERCENT, 3)
+                if qty_tp1 >= 0.001 and qty_restante > 0:
+                    pnl_parcial = (tp1 - entrada) * qty_tp1 if decision == "Buy" else (entrada - tp1) * qty_tp1
                     comision = abs(pnl_parcial) * PAPER_COMMISSION_PCT
                     pnl_parcial -= comision
-                    t['pnl_parcial'] += pnl_parcial
-                    t['qty_restante'] = round(t['qty_original'] - qty_tp1, 3)
+                    t['pnl_parcial'] = t.get('pnl_parcial', 0.0) + pnl_parcial
+                    t['qty_restante'] = round(qty_original - qty_tp1, 3)
                     t['tp1_ejecutado'] = True
                     t['trailing_activado'] = True
-                    t['best_price'] = t['entrada']
-                    t['trailing_stop'] = t['entrada'] * (1 - TRAILING_PERCENT) if t['decision']=="Buy" else t['entrada'] * (1 + TRAILING_PERCENT)
+                    t['best_price'] = entrada
+                    t['trailing_stop'] = entrada * (1 - TRAILING_PERCENT) if decision == "Buy" else entrada * (1 + TRAILING_PERCENT)
                     logger.info(f"✅ PAPER: TP1 #{tid} +{pnl_parcial:.2f} USDT, trailing activado")
                     telegram_mensaje(f"✅ PAPER TP1 #{tid}: +{pnl_parcial:.2f} USDT. Trailing stop activado.")
                     if t['qty_restante'] <= 0.0001:
@@ -935,46 +982,46 @@ def revisar_sl_tp_simulado(df, precio_actual):
 
         # Trailing stop
         if t.get('trailing_activado', False) and t['qty_restante'] > 0:
-            if t['decision'] == 'Buy':
-                if h > t['best_price']:
+            if decision == 'Buy':
+                if h > best_price:
                     t['best_price'] = h
-                    t['trailing_stop'] = t['best_price'] * (1 - TRAILING_PERCENT)
+                    t['trailing_stop'] = h * (1 - TRAILING_PERCENT)
                 if l <= t['trailing_stop']:
                     qty_restante = t['qty_restante']
-                    pnl_resto = (t['trailing_stop'] - t['entrada']) * qty_restante
+                    pnl_resto = (t['trailing_stop'] - entrada) * qty_restante
                     comision = abs(pnl_resto) * PAPER_COMMISSION_PCT
                     pnl_resto -= comision
-                    pnl_total = t['pnl_parcial'] + pnl_resto
+                    pnl_total = t.get('pnl_parcial', 0.0) + pnl_resto
                     paper_balance += pnl_total
                     paper_total_trades += 1
                     if pnl_total > 0:
                         paper_win_count += 1
                     else:
                         paper_loss_count += 1
-                    paper_trade_history.append(convertir_serializable({"pnl": pnl_total, "resultado_win": pnl_total>0, "decision": t['decision'], "razon": t['razon']}))
+                    paper_trade_history.append(convertir_serializable({"pnl": pnl_total, "resultado_win": pnl_total>0, "decision": decision, "razon": razon}))
                     cerrar_ids.append(tid)
                     msg = f"📉 PAPER CIERRE #{tid} por Trailing Stop - PnL: {pnl_total:+.2f} USDT"
                     logger.info(msg)
                     telegram_mensaje(msg)
                     reporte_estado()
                     enviar_reporte_cada_10_trades()
-            else:
-                if l < t['best_price']:
+            else:  # Sell
+                if l < best_price:
                     t['best_price'] = l
-                    t['trailing_stop'] = t['best_price'] * (1 + TRAILING_PERCENT)
+                    t['trailing_stop'] = l * (1 + TRAILING_PERCENT)
                 if h >= t['trailing_stop']:
                     qty_restante = t['qty_restante']
-                    pnl_resto = (t['entrada'] - t['trailing_stop']) * qty_restante
+                    pnl_resto = (entrada - t['trailing_stop']) * qty_restante
                     comision = abs(pnl_resto) * PAPER_COMMISSION_PCT
                     pnl_resto -= comision
-                    pnl_total = t['pnl_parcial'] + pnl_resto
+                    pnl_total = t.get('pnl_parcial', 0.0) + pnl_resto
                     paper_balance += pnl_total
                     paper_total_trades += 1
                     if pnl_total > 0:
                         paper_win_count += 1
                     else:
                         paper_loss_count += 1
-                    paper_trade_history.append(convertir_serializable({"pnl": pnl_total, "resultado_win": pnl_total>0, "decision": t['decision'], "razon": t['razon']}))
+                    paper_trade_history.append(convertir_serializable({"pnl": pnl_total, "resultado_win": pnl_total>0, "decision": decision, "razon": razon}))
                     cerrar_ids.append(tid)
                     msg = f"📉 PAPER CIERRE #{tid} por Trailing Stop - PnL: {pnl_total:+.2f} USDT"
                     logger.info(msg)
@@ -984,20 +1031,20 @@ def revisar_sl_tp_simulado(df, precio_actual):
 
         # Stop loss inicial
         if not t.get('tp1_ejecutado', False) and t['qty_restante'] > 0:
-            cond = (t['decision']=="Buy" and l <= t['sl_actual']) or (t['decision']=="Sell" and h >= t['sl_actual'])
+            cond = (decision == "Buy" and l <= sl_actual) or (decision == "Sell" and h >= sl_actual)
             if cond:
                 qty_restante = t['qty_restante']
-                pnl_resto = (t['sl_actual'] - t['entrada']) * qty_restante if t['decision']=="Buy" else (t['entrada'] - t['sl_actual']) * qty_restante
+                pnl_resto = (sl_actual - entrada) * qty_restante if decision == "Buy" else (entrada - sl_actual) * qty_restante
                 comision = abs(pnl_resto) * PAPER_COMMISSION_PCT
                 pnl_resto -= comision
-                pnl_total = t['pnl_parcial'] + pnl_resto
+                pnl_total = t.get('pnl_parcial', 0.0) + pnl_resto
                 paper_balance += pnl_total
                 paper_total_trades += 1
                 if pnl_total>0:
                     paper_win_count+=1
                 else:
                     paper_loss_count+=1
-                paper_trade_history.append(convertir_serializable({"pnl": pnl_total, "resultado_win": pnl_total>0, "decision": t['decision'], "razon": t['razon']}))
+                paper_trade_history.append(convertir_serializable({"pnl": pnl_total, "resultado_win": pnl_total>0, "decision": decision, "razon": razon}))
                 cerrar_ids.append(tid)
                 motivo = "Stop Loss inicial"
                 msg = f"🛑 PAPER CIERRE #{tid} por {motivo} - PnL: {pnl_total:+.2f} USDT"
@@ -1009,8 +1056,6 @@ def revisar_sl_tp_simulado(df, precio_actual):
     for tid in cerrar_ids:
         del paper_positions[tid]
 
-    # No hay cierre de opuestos
-
 def real_revisar_sl_tp(df, precio_actual):
     global REAL_BALANCE, WIN_COUNT, LOSS_COUNT, TOTAL_TRADES, TRADE_HISTORY, REAL_ACTIVE_TRADES
     if not REAL_ACTIVE_TRADES:
@@ -1019,46 +1064,59 @@ def real_revisar_sl_tp(df, precio_actual):
     l = df['low'].iloc[-1]
     cerrar_ids = []
     for tid, t in list(REAL_ACTIVE_TRADES.items()):
-        if not t['tp1_ejecutado'] and t['tp1']>0:
-            if (t['decision']=="Buy" and h>=t['tp1']) or (t['decision']=="Sell" and l<=t['tp1']):
-                qty_tp1 = round(t['qty_original'] * TP1_PERCENT, 3)
-                if qty_tp1>=0.001 and t['qty_restante']>0:
-                    result = close_position_qty_confirm(qty_tp1, t['decision'])
-                    if result and result!="already_closed":
-                        pnl_parcial = (t['tp1']-t['entrada'])*qty_tp1 if t['decision']=="Buy" else (t['entrada']-t['tp1'])*qty_tp1
-                        t['pnl_parcial']+=pnl_parcial
-                        t['qty_restante']=round(t['qty_original']-qty_tp1,3)
-                        t['tp1_ejecutado']=True
+        tp1 = t.get('tp1', 0.0)
+        tp1_ejecutado = t.get('tp1_ejecutado', False)
+        decision = t.get('decision', 'Hold')
+        entrada = t.get('entrada', 0.0)
+        sl_actual = t.get('sl_actual', 0.0)
+        qty_original = t.get('qty_original', 0.0)
+        qty_restante = t.get('qty_restante', 0.0)
+        razon = t.get('razon', '')
+        trailing_activado = t.get('trailing_activado', False)
+        best_price = t.get('best_price', entrada)
+        
+        # TP1
+        if not tp1_ejecutado and tp1 > 0:
+            if (decision == "Buy" and h >= tp1) or (decision == "Sell" and l <= tp1):
+                qty_tp1 = round(qty_original * TP1_PERCENT, 3)
+                if qty_tp1 >= 0.001 and qty_restante > 0:
+                    result = close_position_qty_confirm(qty_tp1, decision)
+                    if result and result != "already_closed":
+                        pnl_parcial = (tp1 - entrada) * qty_tp1 if decision == "Buy" else (entrada - tp1) * qty_tp1
+                        t['pnl_parcial'] = t.get('pnl_parcial', 0.0) + pnl_parcial
+                        t['qty_restante'] = round(qty_original - qty_tp1, 3)
+                        t['tp1_ejecutado'] = True
                         t['trailing_activado'] = True
-                        t['best_price'] = t['entrada']
-                        t['trailing_stop'] = t['entrada'] * (1 - TRAILING_PERCENT) if t['decision']=="Buy" else t['entrada'] * (1 + TRAILING_PERCENT)
+                        t['best_price'] = entrada
+                        t['trailing_stop'] = entrada * (1 - TRAILING_PERCENT) if decision == "Buy" else entrada * (1 + TRAILING_PERCENT)
                         logger.info(f"✅ TP1 #{tid} +{pnl_parcial:.2f} USDT, trailing activado")
                         telegram_mensaje(f"✅ TP1 #{tid}: +{pnl_parcial:.2f} USDT. Trailing activado.")
-                        if t['qty_restante']<=0.0001:
+                        if t['qty_restante'] <= 0.0001:
                             cerrar_ids.append(tid)
                     else:
                         logger.warning(f"TP1 no confirmado #{tid}")
                 else:
                     cerrar_ids.append(tid)
 
+        # Trailing stop
         if t.get('trailing_activado', False) and t['qty_restante'] > 0:
-            if t['decision'] == 'Buy':
-                if h > t['best_price']:
+            if decision == 'Buy':
+                if h > best_price:
                     t['best_price'] = h
-                    t['trailing_stop'] = t['best_price'] * (1 - TRAILING_PERCENT)
+                    t['trailing_stop'] = h * (1 - TRAILING_PERCENT)
                 if l <= t['trailing_stop']:
                     qty_restante = t['qty_restante']
-                    result = close_position_qty_confirm(qty_restante, t['decision'])
+                    result = close_position_qty_confirm(qty_restante, decision)
                     if result and result != "already_closed":
-                        pnl_resto = (t['trailing_stop'] - t['entrada']) * qty_restante
-                        pnl_total = t['pnl_parcial'] + pnl_resto
+                        pnl_resto = (t['trailing_stop'] - entrada) * qty_restante
+                        pnl_total = t.get('pnl_parcial', 0.0) + pnl_resto
                         REAL_BALANCE = get_real_balance()
                         TOTAL_TRADES += 1
                         if pnl_total > 0:
                             WIN_COUNT += 1
                         else:
                             LOSS_COUNT += 1
-                        TRADE_HISTORY.append(convertir_serializable({"pnl": pnl_total, "resultado_win": pnl_total>0, "decision": t['decision'], "razon": t['razon']}))
+                        TRADE_HISTORY.append(convertir_serializable({"pnl": pnl_total, "resultado_win": pnl_total>0, "decision": decision, "razon": razon}))
                         cerrar_ids.append(tid)
                         msg = f"📉 CIERRE #{tid} por Trailing Stop - PnL: {pnl_total:+.2f} USDT"
                         logger.info(msg)
@@ -1068,22 +1126,22 @@ def real_revisar_sl_tp(df, precio_actual):
                     else:
                         logger.error(f"Falló cierre por trailing #{tid}")
             else:
-                if l < t['best_price']:
+                if l < best_price:
                     t['best_price'] = l
-                    t['trailing_stop'] = t['best_price'] * (1 + TRAILING_PERCENT)
+                    t['trailing_stop'] = l * (1 + TRAILING_PERCENT)
                 if h >= t['trailing_stop']:
                     qty_restante = t['qty_restante']
-                    result = close_position_qty_confirm(qty_restante, t['decision'])
+                    result = close_position_qty_confirm(qty_restante, decision)
                     if result and result != "already_closed":
-                        pnl_resto = (t['entrada'] - t['trailing_stop']) * qty_restante
-                        pnl_total = t['pnl_parcial'] + pnl_resto
+                        pnl_resto = (entrada - t['trailing_stop']) * qty_restante
+                        pnl_total = t.get('pnl_parcial', 0.0) + pnl_resto
                         REAL_BALANCE = get_real_balance()
                         TOTAL_TRADES += 1
                         if pnl_total > 0:
                             WIN_COUNT += 1
                         else:
                             LOSS_COUNT += 1
-                        TRADE_HISTORY.append(convertir_serializable({"pnl": pnl_total, "resultado_win": pnl_total>0, "decision": t['decision'], "razon": t['razon']}))
+                        TRADE_HISTORY.append(convertir_serializable({"pnl": pnl_total, "resultado_win": pnl_total>0, "decision": decision, "razon": razon}))
                         cerrar_ids.append(tid)
                         msg = f"📉 CIERRE #{tid} por Trailing Stop - PnL: {pnl_total:+.2f} USDT"
                         logger.info(msg)
@@ -1093,21 +1151,22 @@ def real_revisar_sl_tp(df, precio_actual):
                     else:
                         logger.error(f"Falló cierre por trailing #{tid}")
 
-        if not t['tp1_ejecutado'] and t['qty_restante'] > 0:
-            cond = (t['decision']=="Buy" and l<=t['sl_actual']) or (t['decision']=="Sell" and h>=t['sl_actual'])
+        # Stop loss inicial
+        if not t.get('tp1_ejecutado', False) and t['qty_restante'] > 0:
+            cond = (decision == "Buy" and l <= sl_actual) or (decision == "Sell" and h >= sl_actual)
             if cond:
                 qty_restante = t['qty_restante']
-                result = close_position_qty_confirm(qty_restante, t['decision'])
-                if result and result!="already_closed":
-                    pnl_resto = (t['sl_actual']-t['entrada'])*qty_restante if t['decision']=="Buy" else (t['entrada']-t['sl_actual'])*qty_restante
-                    pnl_total = t['pnl_parcial']+pnl_resto
+                result = close_position_qty_confirm(qty_restante, decision)
+                if result and result != "already_closed":
+                    pnl_resto = (sl_actual - entrada) * qty_restante if decision == "Buy" else (entrada - sl_actual) * qty_restante
+                    pnl_total = t.get('pnl_parcial', 0.0) + pnl_resto
                     REAL_BALANCE = get_real_balance()
-                    TOTAL_TRADES+=1
-                    if pnl_total>0:
-                        WIN_COUNT+=1
+                    TOTAL_TRADES += 1
+                    if pnl_total > 0:
+                        WIN_COUNT += 1
                     else:
-                        LOSS_COUNT+=1
-                    TRADE_HISTORY.append(convertir_serializable({"pnl":pnl_total, "resultado_win":pnl_total>0, "decision":t['decision'], "razon":t['razon']}))
+                        LOSS_COUNT += 1
+                    TRADE_HISTORY.append(convertir_serializable({"pnl": pnl_total, "resultado_win": pnl_total>0, "decision": decision, "razon": razon}))
                     cerrar_ids.append(tid)
                     motivo = "Stop Loss inicial"
                     msg = f"🛑 CIERRE #{tid} por {motivo} - PnL: {pnl_total:+.2f} USDT"
@@ -1148,7 +1207,6 @@ def run_bot():
     set_leverage()
     sync_active_trades_with_bybit()
 
-    # Inicializar contador de reporte
     if PAPER_TRADE:
         ULTIMO_REPORTE = paper_total_trades
     else:
@@ -1171,7 +1229,7 @@ def run_bot():
     ultima_vela = None
     while True:
         try:
-            guardado_periodico()  # Guardar cada 5 min
+            guardado_periodico()
 
             if int(time.time()) % 300 < 5:
                 logger.info("❤️ Bot heartbeat")
@@ -1207,12 +1265,11 @@ def run_bot():
                     dec, raz, explicacion, entry_ia, sl_ia, tp1_ia, conf = analizar_con_gemini(img_ltf, img_htf)
                     logger.info(f"🧠 Decisión IA: {dec} - Razón: {raz} - Confianza: {conf}")
 
-                    # Filtro por niveles (opcional, se mantiene como estaba)
+                    # Filtro por niveles (opcional)
                     if dec != "Hold":
                         sop_ltf_actual, res_ltf_actual, _, _, _, _ = detectar_zonas_mercado(df_ltf, idx=-1)
                         sop_htf_actual, res_htf_actual, _, _, _, _ = detectar_zonas_mercado(df_htf, idx=-1)
-                        umbral_distancia = 0.0025  # 0.25%
-                        
+                        umbral_distancia = 0.0025
                         if dec == "Buy":
                             cerca_soporte = False
                             if sop_ltf_actual and abs(precio_actual - sop_ltf_actual) / precio_actual < umbral_distancia:
@@ -1220,8 +1277,8 @@ def run_bot():
                             if sop_htf_actual and abs(precio_actual - sop_htf_actual) / precio_actual < umbral_distancia:
                                 cerca_soporte = True
                             if not cerca_soporte:
-                                logger.warning(f"🚫 Señal Buy rechazada: precio {precio_actual} no está cerca de soporte (LTF: {sop_ltf_actual}, HTF: {sop_htf_actual})")
-                                telegram_mensaje(f"🚫 Buy rechazado por falta de soporte cercano (dist > 0.25%)")
+                                logger.warning(f"🚫 Señal Buy rechazada: precio {precio_actual} no está cerca de soporte")
+                                telegram_mensaje("🚫 Buy rechazado por falta de soporte cercano")
                                 dec = "Hold"
                         elif dec == "Sell":
                             cerca_resistencia = False
@@ -1230,10 +1287,10 @@ def run_bot():
                             if res_htf_actual and abs(res_htf_actual - precio_actual) / precio_actual < umbral_distancia:
                                 cerca_resistencia = True
                             if not cerca_resistencia:
-                                logger.warning(f"🚫 Señal Sell rechazada: precio {precio_actual} no está cerca de resistencia (LTF: {res_ltf_actual}, HTF: {res_htf_actual})")
-                                telegram_mensaje(f"🚫 Sell rechazado por falta de resistencia cercana (dist > 0.25%)")
+                                logger.warning(f"🚫 Señal Sell rechazada: precio {precio_actual} no está cerca de resistencia")
+                                telegram_mensaje("🚫 Sell rechazado por falta de resistencia cercana")
                                 dec = "Hold"
-                    
+
                     if dec != "Hold":
                         if conf >= 30:
                             abrir_posicion_con_ia(dec, precio_actual, raz, explicacion, sl_ia, tp1_ia,
@@ -1248,7 +1305,6 @@ def run_bot():
 
                 ultima_vela = vela_actual_time
 
-            # Gestión de trades activos
             if PAPER_TRADE and paper_positions:
                 revisar_sl_tp_simulado(df_ltf, precio_actual)
             elif not PAPER_TRADE and REAL_ACTIVE_TRADES:
