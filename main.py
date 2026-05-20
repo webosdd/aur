@@ -630,7 +630,8 @@ def parse_json_seguro(raw):
         return None
 
 # =================== DETECCIÓN DE PATRONES CON TA-Lib (61 patrones) ===================
-def obtener_todos_patrones_talib(df: pd.DataFrame) -> dict:
+
+    def obtener_todos_patrones_talib(df: pd.DataFrame) -> dict:
     """
     Ejecuta todas las funciones de patrones de TA-Lib sobre el DataFrame.
     Retorna un diccionario con {nombre_patron: señal (100/-100/0)} para la última vela.
@@ -643,87 +644,38 @@ def obtener_todos_patrones_talib(df: pd.DataFrame) -> dict:
     high = df['high'].values.astype(float)
     low = df['low'].values.astype(float)
     close = df['close'].values.astype(float)
-    volume = df['volume'].values.astype(float) if 'volume' in df else None
     
-    # Lista de todas las funciones de patrones (61 según documentación)
-    patrones = {
-        # 1. Doji
-        'CDLDOJI': talib.CDLDOJI,
-        'CDLDOJISTAR': talib.CDLDOJISTAR,
-        'CDLDRAGONFLYDOJI': talib.CDLDRAGONFLYDOJI,
-        'CDLGRAVESTONEDOJI': talib.CDLGRAVESTONEDOJI,
-        'CDLLONGLEGGEDDOJI': talib.CDLLONGLEGGEDDOJI,
-        'CDLRICKSHAWMAN': talib.CDLRICKSHAWMAN,
-        # 2. Patrones de una vela
-        'CDLHAMMER': talib.CDLHAMMER,
-        'CDLSHOOTINGSTAR': talib.CDLSHOOTINGSTAR,
-        'CDLHANGINGMAN': talib.CDLHANGINGMAN,
-        'CDLINVERTEDHAMMER': talib.CDLINVERTEDHAMMER,
-        'CDLMARUBOZU': talib.CDLMARUBOZU,
-        'CDLBELTHOLD': talib.CDLBELTHOLD,
-        'CDLTAKURI': talib.CDLTAKURI,
-        'CDLSPINNINGTOP': talib.CDLSPINNINGTOP,
-        # 3. Patrones de dos velas
-        'CDLENGULFING': talib.CDLENGULFING,
-        'CDLHARAMI': talib.CDLHARAMI,
-        'CDLHARAMICROSS': talib.CDLHARAMICROSS,
-        'CDLPIERCING': talib.CDLPIERCING,
-        'CDLDARKCLOUDCOVER': talib.CDLDARKCLOUDCOVER,
-        'CDLTAKURI': talib.CDLTAKURI,  # repetido pero se ejecuta
-        'CDLKICKING': talib.CDLKICKING,
-        'CDLKICKINGBYLENGTH': talib.CDLKICKINGBYLENGTH,
-        'CDL2CROWS': talib.CDL2CROWS,
-        'CDL3WHITESOLDIERS': talib.CDL3WHITESOLDIERS,
-        'CDL3BLACKCROWS': talib.CDL3BLACKCROWS,
-        'CDLEVENINGSTAR': talib.CDLEVENINGSTAR,
-        'CDLMORNINGSTAR': talib.CDLMORNINGSTAR,
-        'CDLEVENINGDOJISTAR': talib.CDLEVENINGDOJISTAR,
-        'CDLMORNINGDOJISTAR': talib.CDLMORNINGDOJISTAR,
-        'CDL3INSIDE': talib.CDL3INSIDE,
-        'CDL3OUTSIDE': talib.CDL3OUTSIDE,
-        'CDL3LINESTRIKE': talib.CDL3LINESTRIKE,
-        'CDLABANDONEDBABY': talib.CDLABANDONEDBABY,
-        'CDLIDENTICAL3CROWS': talib.CDLIDENTICAL3CROWS,
-        'CDLUPSIDEGAP2CROWS': talib.CDLUPSIDEGAP2CROWS,
-        'CDLUNIQUE3RIVER': talib.CDLUNIQUE3RIVER,
-        'CDLLADDERBOTTOM': talib.CDLLADDERBOTTOM,
-        'CDLCONCEALBABYSWALL': talib.CDLCONCEALBABYSWALL,
-        'CDLBREAKAWAY': talib.CDLBREAKAWAY,
-        'CDLMATHOLD': talib.CDLMATHOLD,
-        'CDLHIKKAKE': talib.CDLHIKKAKE,
-        'CDLHIKKAKEMOD': talib.CDLHIKKAKEMOD,
-        'CDLHIGHWAVE': talib.CDLHIGHWAVE,
-        'CDLTHRUSTING': talib.CDLTHRUSTING,
-        'CDLCLOSINGMARUBOZU': talib.CDLCLOSINGMARUBOZU,
-        'CDLSTALLEDPATTERN': talib.CDLSTALLEDPATTERN,
-        'CDLTASUKIGAP': talib.CDLTASUKIGAP,
-        'CDLINNECK': talib.CDLINNECK,
-        'CDLNECK': talib.CDLNECK,
-        'CDLONNECK': talib.CDLONNECK,
-        'CDLRISEFALL3METHODS': talib.CDLRISEFALL3METHODS,
-        'CDLSEPARATINGLINES': talib.CDLSEPARATINGLINES,
-        'CDLPIERCING': talib.CDLPIERCING,  # ya estaba
-        'CDLLONGLINE': talib.CDLLONGLINE,
-        'CDLSHORTLINE': talib.CDLSHORTLINE,
-        'CDLSTICKSANDWICH': talib.CDLSTICKSANDWICH,
-        'CDLKEEPINGLINE': talib.CDLKEEPINGLINE,
-        'CDLKANNA': talib.CDLKANNA,
-        'CDLRIFFMAN': talib.CDLRIFFMAN
-    }
+    # Lista oficial de funciones de patrones de TA-Lib (versión 0.4.0)
+    # Basada en la documentación: https://github.com/TA-Lib/ta-lib-python/blob/main/docs/funcs.md#pattern-recognition
+    nombres_patrones = [
+        'CDL2CROWS', 'CDL3BLACKCROWS', 'CDL3INSIDE', 'CDL3LINESTRIKE', 'CDL3OUTSIDE',
+        'CDL3STARSINSOUTH', 'CDL3WHITESOLDIERS', 'CDLABANDONEDBABY', 'CDLADVANCEBLOCK',
+        'CDLBELTHOLD', 'CDLBREAKAWAY', 'CDLCLOSINGMARUBOZU', 'CDLCONCEALBABYSWALL',
+        'CDLCOUNTERATTACK', 'CDLDARKCLOUDCOVER', 'CDLDOJI', 'CDLDOJISTAR', 'CDLDRAGONFLYDOJI',
+        'CDLENGULFING', 'CDLEVENINGDOJISTAR', 'CDLEVENINGSTAR', 'CDLGAPSIDESIDEWHITE',
+        'CDLGRAVESTONEDOJI', 'CDLHAMMER', 'CDLHANGINGMAN', 'CDLHARAMI', 'CDLHARAMICROSS',
+        'CDLHIGHWAVE', 'CDLHIKKAKE', 'CDLHIKKAKEMOD', 'CDLHOMINGPIGEON', 'CDLIDENTICAL3CROWS',
+        'CDLINNECK', 'CDLINVERTEDHAMMER', 'CDLKICKING', 'CDLKICKINGBYLENGTH', 'CDLLADDERBOTTOM',
+        'CDLLONGLEGGEDDOJI', 'CDLLONGLINE', 'CDLMARUBOZU', 'CDLMATCHINGLOW', 'CDLMATHOLD',
+        'CDLMORNINGDOJISTAR', 'CDLMORNINGSTAR', 'CDLONNECK', 'CDLPIERCING', 'CDLRICKSHAWMAN',
+        'CDLRISEFALL3METHODS', 'CDLSEPARATINGLINES', 'CDLSHOOTINGSTAR', 'CDLSHORTLINE',
+        'CDLSPINNINGTOP', 'CDLSTALLEDPATTERN', 'CDLSTICKSANDWICH', 'CDLTAKURI', 'CDLTASUKIGAP',
+        'CDLTHRUSTING', 'CDLTRISTAR', 'CDLUNIQUE3RIVER', 'CDLUPSIDEGAP2CROWS', 'CDLXSIDEGAP3METHODS'
+    ]
     
     resultados = {}
-    for nombre, func in patrones.items():
+    for nombre in nombres_patrones:
         try:
-            # Llamar a la función correspondiente
-            if volume is not None and nombre in ['CDLDOJI', 'CDLHAMMER']:  # algunas no usan volumen
-                señal_array = func(open_, high, low, close)
-            else:
-                señal_array = func(open_, high, low, close)
+            func = getattr(talib, nombre, None)
+            if func is None:
+                continue
+            señal_array = func(open_, high, low, close)
             if len(señal_array) > 0:
                 señal = señal_array[-1]  # última vela
                 if señal != 0:
-                    resultados[nombre] = int(señal)  # 100, -100, o 200/ -200 en algunos
+                    resultados[nombre] = int(señal)
         except Exception as e:
+            # Si falla un patrón, no detenemos el resto
             logger.debug(f"Error en patrón {nombre}: {e}")
             continue
     return resultados
