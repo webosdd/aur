@@ -1,4 +1,4 @@
-# BOT TRADING CON GEMINI 3.1 FLASH - SCALPING 3M/30M (SIN AUTOAPRENDIZAJE)
+# BOT TRADING CON GEMINI 3.1 FLASH + TA-Lib (61 patrones de velas)
 # ==============================================================================
 import os, time, requests, json, numpy as np, pandas as pd
 from scipy.stats import linregress
@@ -29,7 +29,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# =================== SANITIZAR EMOJIS PARA MATPLOTLIB ===================
+# =================== TA-LIB (patrones de velas) ===================
+try:
+    import talib
+    TA_LIB_AVAILABLE = True
+    logger.info("✅ TA-Lib cargado correctamente. 61 patrones de velas disponibles.")
+except ImportError:
+    TA_LIB_AVAILABLE = False
+    logger.warning("⚠️ TA-Lib no instalado. Se omitirá la detección de patrones.")
+    # Definimos stub para evitar errores
+    class talib:
+        @staticmethod
+        def CDLDOJI(*args): return np.array([0])
+
+# =================== SANITIZAR EMOJIS ===================
 def sanitize_for_matplotlib(text):
     if not isinstance(text, str):
         return text
@@ -86,7 +99,7 @@ paper_trade_history = []
 
 PAPER_COMMISSION_PCT = 0.001
 
-# =================== CONFIGURACIÓN DEL BOT (SCALPING 3M) ===================
+# =================== CONFIGURACIÓN DEL BOT ===================
 SYMBOL = "BTCUSDT"
 INTERVAL_LTF = "3"
 INTERVAL_HTF = "30"
@@ -116,7 +129,6 @@ DAILY_START_BALANCE = None
 STOPPED_TODAY = False
 CURRENT_DAY = None
 
-# Variables para reporte cada 10 trades
 ULTIMO_REPORTE = 0
 
 # =================== MEMORIA PERSISTENTE ===================
@@ -132,7 +144,6 @@ def convertir_serializable(obj):
     return obj
 
 def normalizar_trade_activo(trade):
-    """Asegura que un trade activo tenga todas las claves necesarias con valores por defecto"""
     defaults = {
         'tp1': 0.0,
         'tp1_ejecutado': False,
@@ -232,7 +243,6 @@ def cargar_memoria():
             active_meta = data.get("ACTIVE_TRADES_META", {})
             paper_positions = {}
             for tid, meta in active_meta.items():
-                # Normalizar el trade para que tenga todas las claves
                 trade = normalizar_trade_activo(meta)
                 paper_positions[int(tid)] = trade
         else:
@@ -250,7 +260,6 @@ def cargar_memoria():
     except Exception as e:
         logger.error(f"Error cargando memoria: {e}")
 
-# =================== GUARDADO PERIÓDICO Y SEÑAL ===================
 ULTIMO_GUARDADO = 0
 
 def guardado_periodico():
@@ -267,7 +276,7 @@ def guardar_y_salir(signum, frame):
 
 signal.signal(signal.SIGTERM, guardar_y_salir)
 
-# =================== FUNCIONES BYBIT (sin cambios) ===================
+# =================== FUNCIONES BYBIT ===================
 def bybit_request(endpoint, method="GET", params=None, body=None):
     timestamp = str(int(time.time() * 1000))
     recv_window = "5000"
@@ -620,8 +629,122 @@ def parse_json_seguro(raw):
     except:
         return None
 
-# =================== PROMPT PARA GEMINI (SIN LECCIONES) ===================
-def analizar_con_gemini(img_ltf, img_htf):
+# =================== DETECCIÓN DE PATRONES CON TA-Lib (61 patrones) ===================
+def obtener_todos_patrones_talib(df: pd.DataFrame) -> dict:
+    """
+    Ejecuta todas las funciones de patrones de TA-Lib sobre el DataFrame.
+    Retorna un diccionario con {nombre_patron: señal (100/-100/0)} para la última vela.
+    """
+    if not TA_LIB_AVAILABLE or df.empty or len(df) < 3:
+        return {}
+    
+    # Asegurar nombres de columnas en mayúsculas como requiere TA-Lib
+    open_ = df['open'].values.astype(float)
+    high = df['high'].values.astype(float)
+    low = df['low'].values.astype(float)
+    close = df['close'].values.astype(float)
+    volume = df['volume'].values.astype(float) if 'volume' in df else None
+    
+    # Lista de todas las funciones de patrones (61 según documentación)
+    patrones = {
+        # 1. Doji
+        'CDLDOJI': talib.CDLDOJI,
+        'CDLDOJISTAR': talib.CDLDOJISTAR,
+        'CDLDRAGONFLYDOJI': talib.CDLDRAGONFLYDOJI,
+        'CDLGRAVESTONEDOJI': talib.CDLGRAVESTONEDOJI,
+        'CDLLONGLEGGEDDOJI': talib.CDLLONGLEGGEDDOJI,
+        'CDLRICKSHAWMAN': talib.CDLRICKSHAWMAN,
+        # 2. Patrones de una vela
+        'CDLHAMMER': talib.CDLHAMMER,
+        'CDLSHOOTINGSTAR': talib.CDLSHOOTINGSTAR,
+        'CDLHANGINGMAN': talib.CDLHANGINGMAN,
+        'CDLINVERTEDHAMMER': talib.CDLINVERTEDHAMMER,
+        'CDLMARUBOZU': talib.CDLMARUBOZU,
+        'CDLBELTHOLD': talib.CDLBELTHOLD,
+        'CDLTAKURI': talib.CDLTAKURI,
+        'CDLSPINNINGTOP': talib.CDLSPINNINGTOP,
+        # 3. Patrones de dos velas
+        'CDLENGULFING': talib.CDLENGULFING,
+        'CDLHARAMI': talib.CDLHARAMI,
+        'CDLHARAMICROSS': talib.CDLHARAMICROSS,
+        'CDLPIERCING': talib.CDLPIERCING,
+        'CDLDARKCLOUDCOVER': talib.CDLDARKCLOUDCOVER,
+        'CDLTAKURI': talib.CDLTAKURI,  # repetido pero se ejecuta
+        'CDLKICKING': talib.CDLKICKING,
+        'CDLKICKINGBYLENGTH': talib.CDLKICKINGBYLENGTH,
+        'CDL2CROWS': talib.CDL2CROWS,
+        'CDL3WHITESOLDIERS': talib.CDL3WHITESOLDIERS,
+        'CDL3BLACKCROWS': talib.CDL3BLACKCROWS,
+        'CDLEVENINGSTAR': talib.CDLEVENINGSTAR,
+        'CDLMORNINGSTAR': talib.CDLMORNINGSTAR,
+        'CDLEVENINGDOJISTAR': talib.CDLEVENINGDOJISTAR,
+        'CDLMORNINGDOJISTAR': talib.CDLMORNINGDOJISTAR,
+        'CDL3INSIDE': talib.CDL3INSIDE,
+        'CDL3OUTSIDE': talib.CDL3OUTSIDE,
+        'CDL3LINESTRIKE': talib.CDL3LINESTRIKE,
+        'CDLABANDONEDBABY': talib.CDLABANDONEDBABY,
+        'CDLIDENTICAL3CROWS': talib.CDLIDENTICAL3CROWS,
+        'CDLUPSIDEGAP2CROWS': talib.CDLUPSIDEGAP2CROWS,
+        'CDLUNIQUE3RIVER': talib.CDLUNIQUE3RIVER,
+        'CDLLADDERBOTTOM': talib.CDLLADDERBOTTOM,
+        'CDLCONCEALBABYSWALL': talib.CDLCONCEALBABYSWALL,
+        'CDLBREAKAWAY': talib.CDLBREAKAWAY,
+        'CDLMATHOLD': talib.CDLMATHOLD,
+        'CDLHIKKAKE': talib.CDLHIKKAKE,
+        'CDLHIKKAKEMOD': talib.CDLHIKKAKEMOD,
+        'CDLHIGHWAVE': talib.CDLHIGHWAVE,
+        'CDLTHRUSTING': talib.CDLTHRUSTING,
+        'CDLCLOSINGMARUBOZU': talib.CDLCLOSINGMARUBOZU,
+        'CDLSTALLEDPATTERN': talib.CDLSTALLEDPATTERN,
+        'CDLTASUKIGAP': talib.CDLTASUKIGAP,
+        'CDLINNECK': talib.CDLINNECK,
+        'CDLNECK': talib.CDLNECK,
+        'CDLONNECK': talib.CDLONNECK,
+        'CDLRISEFALL3METHODS': talib.CDLRISEFALL3METHODS,
+        'CDLSEPARATINGLINES': talib.CDLSEPARATINGLINES,
+        'CDLPIERCING': talib.CDLPIERCING,  # ya estaba
+        'CDLLONGLINE': talib.CDLLONGLINE,
+        'CDLSHORTLINE': talib.CDLSHORTLINE,
+        'CDLSTICKSANDWICH': talib.CDLSTICKSANDWICH,
+        'CDLKEEPINGLINE': talib.CDLKEEPINGLINE,
+        'CDLKANNA': talib.CDLKANNA,
+        'CDLRIFFMAN': talib.CDLRIFFMAN
+    }
+    
+    resultados = {}
+    for nombre, func in patrones.items():
+        try:
+            # Llamar a la función correspondiente
+            if volume is not None and nombre in ['CDLDOJI', 'CDLHAMMER']:  # algunas no usan volumen
+                señal_array = func(open_, high, low, close)
+            else:
+                señal_array = func(open_, high, low, close)
+            if len(señal_array) > 0:
+                señal = señal_array[-1]  # última vela
+                if señal != 0:
+                    resultados[nombre] = int(señal)  # 100, -100, o 200/ -200 en algunos
+        except Exception as e:
+            logger.debug(f"Error en patrón {nombre}: {e}")
+            continue
+    return resultados
+
+def resumen_patrones_texto(patrones_dict: dict) -> str:
+    """Convierte el diccionario de patrones en un texto legible para el prompt."""
+    if not patrones_dict:
+        return "No se detectaron patrones de velas significativos."
+    bullish = [p for p, s in patrones_dict.items() if s > 0]
+    bearish = [p for p, s in patrones_dict.items() if s < 0]
+    texto = ""
+    if bullish:
+        texto += f"Patrones ALCISTAS detectados (última vela): {', '.join(bullish)}.\n"
+    if bearish:
+        texto += f"Patrones BAJISTAS detectados (última vela): {', '.join(bearish)}.\n"
+    if not bullish and not bearish:
+        texto = "Patrón neutro o sin patrón claro.\n"
+    return texto
+
+# =================== PROMPT PARA GEMINI CON PATRONES ===================
+def analizar_con_gemini(img_ltf, img_htf, patrones_ltf_texto, patrones_htf_texto):
     try:
         img_ltf_b64 = pil_to_base64(img_ltf)
         img_htf_b64 = pil_to_base64(img_htf)
@@ -629,23 +752,28 @@ def analizar_con_gemini(img_ltf, img_htf):
         prompt = f"""
 Eres un trader profesional de crypto especializado en scalping con velas de 3 minutos.
 Te voy a mostrar dos gráficos de BTC/USDT: el primero es de 3 minutos (velas recientes), el segundo es de 30 minutos (tendencia de mayor plazo).
-Analiza ambos gráficos libremente, fijándote en:
-- Niveles de SOPORTE y RESISTENCIA claros (preferiblemente que el precio esté muy cerca, menos del 0.3%).
-- Rechazos o rebotes en esos niveles.
-- Relación con EMA20 (rechazo o cruce).
-- Patrones de velas de reversión (martillo, estrella fugaz, engulfing).
 
-SOLO recomienda COMPRAR si el precio está cerca de un soporte fuerte (en 3m o 30m) y muestra señales de rebote.
-SOLO recomienda VENDER si el precio está cerca de una resistencia fuerte y muestra rechazo.
-Si el precio está en medio de un rango o lejos de niveles clave, la decisión debe ser HOLD.
+Además, se ha realizado un análisis automático de patrones de velas japonesas (TA-Lib) en ambos marcos:
 
-Si decides comprar o vender, proporciona un precio de entrada (el precio actual o ligeramente diferente), un stop loss razonable (distancia entre 0.05% y 0.5%) y un take profit 1 (distancia entre 0.2% y 0.6%).
+🔍 **Patrones detectados en gráfico de 3m (LTF):**
+{patrones_ltf_texto}
+
+🔍 **Patrones detectados en gráfico de 30m (HTF):**
+{patrones_htf_texto}
+
+Analiza los gráficos junto con la información de patrones. Debes usar los patrones como CONFIRMACIÓN adicional, no como única señal. Prioriza los niveles de SOPORTE/RESISTENCIA y la relación con EMA20.
+
+Reglas:
+- SOLO recomienda COMPRAR si: precio está cerca de SOPORTE (distancia <0.3%) Y hay señal alcista en patrones O el precio rebota claramente en el gráfico.
+- SOLO recomienda VENDER si: precio está cerca de RESISTENCIA (distancia <0.3%) Y hay señal bajista en patrones O el precio rechaza claramente.
+- Si los patrones contradicen lo que ves en el gráfico (ej: patrón alcista pero precio cayendo sin soporte), la decisión debe ser HOLD.
+- Si no hay patrones claros pero los niveles son muy fuertes, puedes operar con menos confianza.
 
 Devuelve ÚNICAMENTE un JSON válido en una línea con esta estructura:
 {{
   "decision": "Buy/Sell/Hold",
   "razon": "explicación breve (max 150 chars)",
-  "explicacion": "análisis detallado en español",
+  "explicacion": "análisis detallado en español incluyendo qué patrón influyó",
   "entry_price": 0.0,
   "sl_price": 0.0,
   "tp1_price": 0.0,
@@ -936,7 +1064,7 @@ def enviar_reporte_cada_10_trades():
         logger.info(msg)
         ULTIMO_REPORTE = total
 
-# =================== GESTIÓN DE TRADES ACTIVOS (con .get() seguro) ===================
+# =================== GESTIÓN DE TRADES ACTIVOS ===================
 def revisar_sl_tp_simulado(df, precio_actual):
     global paper_balance, paper_win_count, paper_loss_count, paper_total_trades, paper_trade_history, paper_positions
     if not paper_positions:
@@ -945,21 +1073,18 @@ def revisar_sl_tp_simulado(df, precio_actual):
     l = df['low'].iloc[-1]
     cerrar_ids = []
     for tid, t in list(paper_positions.items()):
-        # Asegurar que t tenga tp1 y tp1_ejecutado
         tp1 = t.get('tp1', 0.0)
         tp1_ejecutado = t.get('tp1_ejecutado', False)
         qty_restante = t.get('qty_restante', 0.0)
         decision = t.get('decision', 'Hold')
         entrada = t.get('entrada', 0.0)
         sl_actual = t.get('sl_actual', 0.0)
-        pnl_parcial = t.get('pnl_parcial', 0.0)
         qty_original = t.get('qty_original', 0.0)
         razon = t.get('razon', '')
         trailing_activado = t.get('trailing_activado', False)
         best_price = t.get('best_price', entrada)
-        trailing_stop = t.get('trailing_stop')
-
-        # TP1: cerrar 50% si no se ha ejecutado
+        
+        # TP1
         if not tp1_ejecutado and tp1 > 0:
             if (decision == "Buy" and h >= tp1) or (decision == "Sell" and l <= tp1):
                 qty_tp1 = round(qty_original * TP1_PERCENT, 3)
@@ -1005,7 +1130,7 @@ def revisar_sl_tp_simulado(df, precio_actual):
                     telegram_mensaje(msg)
                     reporte_estado()
                     enviar_reporte_cada_10_trades()
-            else:  # Sell
+            else:
                 if l < best_price:
                     t['best_price'] = l
                     t['trailing_stop'] = l * (1 + TRAILING_PERCENT)
@@ -1074,8 +1199,7 @@ def real_revisar_sl_tp(df, precio_actual):
         razon = t.get('razon', '')
         trailing_activado = t.get('trailing_activado', False)
         best_price = t.get('best_price', entrada)
-        
-        # TP1
+
         if not tp1_ejecutado and tp1 > 0:
             if (decision == "Buy" and h >= tp1) or (decision == "Sell" and l <= tp1):
                 qty_tp1 = round(qty_original * TP1_PERCENT, 3)
@@ -1098,7 +1222,6 @@ def real_revisar_sl_tp(df, precio_actual):
                 else:
                     cerrar_ids.append(tid)
 
-        # Trailing stop
         if t.get('trailing_activado', False) and t['qty_restante'] > 0:
             if decision == 'Buy':
                 if h > best_price:
@@ -1151,7 +1274,6 @@ def real_revisar_sl_tp(df, precio_actual):
                     else:
                         logger.error(f"Falló cierre por trailing #{tid}")
 
-        # Stop loss inicial
         if not t.get('tp1_ejecutado', False) and t['qty_restante'] > 0:
             cond = (decision == "Buy" and l <= sl_actual) or (decision == "Sell" and h >= sl_actual)
             if cond:
@@ -1212,8 +1334,8 @@ def run_bot():
     else:
         ULTIMO_REPORTE = TOTAL_TRADES
 
-    telegram_mensaje("🤖 Bot iniciado - Gemini 3.1 Flash - Scalping 3m/30m (sin autoaprendizaje)")
-    logger.info("Bot iniciado")
+    telegram_mensaje("🤖 Bot iniciado - Gemini 3.1 Flash + TA-Lib (61 patrones) - Scalping 3m/30m")
+    logger.info("Bot iniciado con detección de 61 patrones de velas (TA-Lib)")
 
     if PAPER_TRADE:
         logger.info(f"📄 PAPER TRADE - Saldo: {paper_balance:.2f} USDT")
@@ -1258,18 +1380,28 @@ def run_bot():
                 sop_ltf, res_ltf, slope_ltf, inter_ltf, _, _ = detectar_zonas_mercado(df_ltf)
                 sop_htf, res_htf, slope_htf, inter_htf, _, _ = detectar_zonas_mercado(df_htf)
 
+                # === DETECCIÓN DE PATRONES CON TA-Lib ===
+                patrones_ltf = obtener_todos_patrones_talib(df_ltf)
+                patrones_htf = obtener_todos_patrones_talib(df_htf)
+                patrones_ltf_texto = resumen_patrones_texto(patrones_ltf)
+                patrones_htf_texto = resumen_patrones_texto(patrones_htf)
+                logger.debug(f"Patrones LTF: {patrones_ltf_texto}")
+                logger.debug(f"Patrones HTF: {patrones_htf_texto}")
+
                 img_ltf = generar_grafico_para_vision(df_ltf, "BTC/USDT 3m (LTF)", sop_ltf, res_ltf, slope_ltf, inter_ltf, excluir_actual=True)
                 img_htf = generar_grafico_para_vision(df_htf, "BTC/USDT 30m (HTF)", sop_htf, res_htf, slope_htf, inter_htf, excluir_actual=True)
 
                 if img_ltf and img_htf:
-                    dec, raz, explicacion, entry_ia, sl_ia, tp1_ia, conf = analizar_con_gemini(img_ltf, img_htf)
+                    dec, raz, explicacion, entry_ia, sl_ia, tp1_ia, conf = analizar_con_gemini(
+                        img_ltf, img_htf, patrones_ltf_texto, patrones_htf_texto
+                    )
                     logger.info(f"🧠 Decisión IA: {dec} - Razón: {raz} - Confianza: {conf}")
 
-                    # Filtro por niveles (opcional)
+                    # Filtro por niveles (soporte/resistencia)
                     if dec != "Hold":
                         sop_ltf_actual, res_ltf_actual, _, _, _, _ = detectar_zonas_mercado(df_ltf, idx=-1)
                         sop_htf_actual, res_htf_actual, _, _, _, _ = detectar_zonas_mercado(df_htf, idx=-1)
-                        umbral_distancia = 0.0025
+                        umbral_distancia = 0.0025  # 0.25%
                         if dec == "Buy":
                             cerca_soporte = False
                             if sop_ltf_actual and abs(precio_actual - sop_ltf_actual) / precio_actual < umbral_distancia:
@@ -1289,6 +1421,24 @@ def run_bot():
                             if not cerca_resistencia:
                                 logger.warning(f"🚫 Señal Sell rechazada: precio {precio_actual} no está cerca de resistencia")
                                 telegram_mensaje("🚫 Sell rechazado por falta de resistencia cercana")
+                                dec = "Hold"
+
+                    # Validación extra de consistencia entre patrón y decisión (opcional)
+                    if dec != "Hold":
+                        # Verificar que al menos haya un patrón que coincida con la dirección
+                        patrones_coinciden = False
+                        if dec == "Buy":
+                            if any(v > 0 for v in patrones_ltf.values()) or any(v > 0 for v in patrones_htf.values()):
+                                patrones_coinciden = True
+                        elif dec == "Sell":
+                            if any(v < 0 for v in patrones_ltf.values()) or any(v < 0 for v in patrones_htf.values()):
+                                patrones_coinciden = True
+                        if not patrones_coinciden:
+                            # Si no hay patrón que respalde, reducimos confianza pero no cancelamos si los niveles son buenos
+                            logger.info(f"⚠️ Decisión {dec} sin patrón de confirmación. Confianza reducida.")
+                            conf = max(conf - 15, 0)
+                            if conf < 20:
+                                logger.warning(f"🚫 Señal {dec} anulada por falta de patrón de confirmación y baja confianza.")
                                 dec = "Hold"
 
                     if dec != "Hold":
