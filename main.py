@@ -636,18 +636,19 @@ def parse_json_seguro(raw):
     Ejecuta todas las funciones de patrones de TA-Lib sobre el DataFrame.
     Retorna un diccionario con {nombre_patron: señal (100/-100/0)} para la última vela.
     """
-    if not TA_LIB_AVAILABLE or df.empty or len(df) < 3:
+    if not TA_LIB_AVAILABLE or df.empty or len(df) < 5:
         return {}
     
-    # Asegurar nombres de columnas en mayúsculas como requiere TA-Lib
+    # Asegurar nombres de columnas en minúsculas (pero TA-Lib espera arrays)
+    # Convertimos a arrays de float
     open_ = df['open'].values.astype(float)
     high = df['high'].values.astype(float)
     low = df['low'].values.astype(float)
     close = df['close'].values.astype(float)
     
-    # Lista oficial de funciones de patrones de TA-Lib (versión 0.4.0)
-    # Basada en la documentación: https://github.com/TA-Lib/ta-lib-python/blob/main/docs/funcs.md#pattern-recognition
-    nombres_patrones = [
+    # Lista completa de funciones de reconocimiento de patrones de TA-Lib (61)
+    # Basada en la documentación oficial: https://github.com/TA-Lib/ta-lib-python/blob/main/docs/funcs.md#pattern-recognition
+    pattern_names = [
         'CDL2CROWS', 'CDL3BLACKCROWS', 'CDL3INSIDE', 'CDL3LINESTRIKE', 'CDL3OUTSIDE',
         'CDL3STARSINSOUTH', 'CDL3WHITESOLDIERS', 'CDLABANDONEDBABY', 'CDLADVANCEBLOCK',
         'CDLBELTHOLD', 'CDLBREAKAWAY', 'CDLCLOSINGMARUBOZU', 'CDLCONCEALBABYSWALL',
@@ -664,19 +665,19 @@ def parse_json_seguro(raw):
     ]
     
     resultados = {}
-    for nombre in nombres_patrones:
+    for name in pattern_names:
         try:
-            func = getattr(talib, nombre, None)
+            func = getattr(talib, name, None)
             if func is None:
                 continue
-            señal_array = func(open_, high, low, close)
-            if len(señal_array) > 0:
-                señal = señal_array[-1]  # última vela
-                if señal != 0:
-                    resultados[nombre] = int(señal)
+            result_array = func(open_, high, low, close)
+            if len(result_array) > 0:
+                signal = result_array[-1]  # última vela
+                if signal != 0:
+                    resultados[name] = int(signal)
         except Exception as e:
-            # Si falla un patrón, no detenemos el resto
-            logger.debug(f"Error en patrón {nombre}: {e}")
+            # Si falla, lo ignoramos y seguimos
+            # (puede ser por arrays muy cortos o por patrón que requiere más velas)
             continue
     return resultados
 
