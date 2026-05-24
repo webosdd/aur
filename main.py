@@ -19,14 +19,16 @@ class Config:
     TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
     TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-    # IDs correctos para plan gratuito (UCL no funciona, lo quitamos)
+    # IDs correctos para plan gratuito (sin UCL)
     DEFAULT_LEAGUES = ["NFL", "NBA", "MLB", "NHL", "NCAAF", "NCAAB", "MLS"]
     SPORTS_LEAGUES = os.environ.get("SPORTS_LEAGUES", ",".join(DEFAULT_LEAGUES)).split(",")
 
+    # Cambio al modelo con búsqueda web
     AI_MODEL = "perplexity/sonar-pro-search"
     MAX_PREDICTIONS = int(os.environ.get("MAX_PREDICTIONS", "10"))
-    CONFIDENCE_THRESHOLD = float(os.environ.get("CONFIDENCE_THRESHOLD", "0.65"))
-    ANALYSIS_INTERVAL_SECONDS = int(os.environ.get("ANALYSIS_INTERVAL_SECONDS", "3600"))
+    CONFIDENCE_THRESHOLD = float(os.environ.get("CONFIDENCE_THRESHOLD", "0.40"))  # más bajo para empezar
+    ANALYSIS_INTERVAL_SECONDS = int(os.environ.get("ANALYSIS_INTERVAL_SECONDS", "10800"))  # 3 horas
+    MAX_EVENTS_PER_CYCLE = int(os.environ.get("MAX_EVENTS_PER_CYCLE", "20"))
 
     OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
     OPENROUTER_SITE_URL = os.environ.get("OPENROUTER_SITE_URL", "https://railway.app")
@@ -48,14 +50,14 @@ class Config:
             raise ValueError(f"Faltan variables: {', '.join(missing)}")
         return True
 
-# ==================== CLIENTE API CON RATE LIMIT ====================
+# ==================== CLIENTE API DE CUOTAS ====================
 class OddsAPIClient:
     def __init__(self):
         self.base_url = "https://api.sportsgameodds.com/v2"
         self.api_key = Config.SPORTS_ODDS_API_KEY
         self.league_ids = Config.SPORTS_LEAGUES
         self.headers = {"x-api-key": self.api_key, "Content-Type": "application/json"}
-        self.request_delay = 1.5  # segundos entre peticiones
+        self.request_delay = 1.5
 
     async def _request_with_retry(self, url: str, params: dict, max_retries: int = 3) -> Optional[Dict]:
         for attempt in range(max_retries):
@@ -64,7 +66,7 @@ class OddsAPIClient:
                     if resp.status == 200:
                         return await resp.json()
                     elif resp.status == 429:
-                        wait = 2 ** attempt  # 1, 2, 4 segundos
+                        wait = 2 ** attempt
                         print(f"⚠️ Rate limit. Reintentando en {wait}s...")
                         await asyncio.sleep(wait)
                     else:
@@ -107,12 +109,6 @@ class OddsAPIClient:
         events = await self.fetch_all_events("events?status=upcoming")
         return [self._normalize_event(e) for e in events]
 
-    async def get_event_details(self, event_id: str) -> Optional[Dict]:
-        return None
-
-    async def verify_result(self, event_id: str) -> Optional[Dict]:
-        return None
-
     def _normalize_event(self, event: Dict) -> Dict:
         teams = event.get("teams", {})
         home_data = teams.get("home", {})
@@ -128,8 +124,9 @@ class OddsAPIClient:
         league_id = event.get("leagueID")
         sport = Config.LEAGUE_TO_SPORT.get(league_id, "deporte")
         status_info = event.get("status", {})
-        odds_info = event.get("odds", {})
 
+        # Extraer cuotas simplificadas (puedes mejorarlo si tienes más datos)
+        odds_info = event.get("odds", {})
         home_odds = away_odds = draw_odds = "N/A"
         for odd_id, odd_val in odds_info.items():
             if "moneyline" in odd_id.lower() or "h2h" in odd_id.lower():
@@ -152,13 +149,13 @@ class OddsAPIClient:
             "score": {}
         }
 
-# ==================== ANALIZADOR IA ====================
+# ==================== ANALIZADOR IA CON PERPLEXITY SONAR PRO SEARCH ====================
 class AIAnalyzer:
     def __init__(self):
         self.client = AsyncOpenAI(
             base_url=Config.OPENROUTER_BASE_URL,
             api_key=Config.OPENROUTER_API_KEY,
-            timeout=30
+            timeout=60  # más tiempo para búsqueda web
         )
         self.model = Config.AI_MODEL
         self.threshold = Config.CONFIDENCE_THRESHOLD
@@ -170,15 +167,17 @@ class AIAnalyzer:
             response = await self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": "Eres analista deportivo. Responde SOLO con JSON válido."},
+                    {"role": "system", "content": "Eres un analista deportivo profesional. Buscas información actualizada en internet y respondes ÚNICAMENTE con un objeto JSON válido, sin texto adicional antes o después."},
                     {"role": "user", "content": prompt}
                 ],
-                response_format={"type": "json_object"},
-                temperature=0.3,
+                # NO usar response_format, no compatible
+                temperature=0.2,
                 max_tokens=4000,
                 extra_headers=self.headers
             )
-            return self._parse(response.choices[0].message.content, event)
+            raw = response.choices[0].message.content
+            # Intentar extraer JSON del texto (por si el modelo añade comentarios)
+            return self._parse(raw, event)
         except Exception as e:
             print(f"❌ Error IA: {e}")
             return None
@@ -194,14 +193,27 @@ class AIAnalyzer:
         sport = event.get("sport", "deporte")
         odds = event.get("odds", {})
         return f"""
-Analiza este evento deportivo y genera predicciones detalladas en JSON.
+Activa la búsqueda en internet para obtener información en tiempo real.
+
+Analiza el siguiente evento deportivo y genera predicciones detalladas en formato JSON.
+Primero busca en internet datos actualizados sobre:
+- Lesiones recientes de jugadores clave.
+- Forma reciente (últimos 5 partidos) de ambos equipos.
+- Historial de enfrentamientos directos.
+- Noticias de última hora que puedan influir (cambios de entrenador, clima, etc.).
+
+Luego, basándote en la información encontrada + las cuotas proporcionadas, haz una predicción.
 
 DEPORTE: {sport}
 LIGA: {league}
 PARTIDO: {home} vs {away}
-CUOTAS: Local {odds.get('home_win','N/A')} Empate {odds.get('draw','N/A')} Visitante {odds.get('away_win','N/A')}
+CUOTAS (aproximadas):
+- Victoria local: {odds.get('home_win', 'N/A')}
+- Empate: {odds.get('draw', 'N/A')}
+- Victoria visitante: {odds.get('away_win', 'N/A')}
 
-RESPUESTA JSON:
+RESPONDE ÚNICAMENTE CON UN JSON VÁLIDO (sin texto de markdown, sin explicaciones extra) con esta estructura exacta:
+
 {{
     "event_id": "{event.get('id')}",
     "home_team": "{home}",
@@ -216,17 +228,24 @@ RESPUESTA JSON:
         "cards": {{"total_cards": 0, "yellow_cards": 0, "red_cards": 0}},
         "fouls": {{"total_fouls": 0}},
         "recommended_bet": {{"type": "winner", "selection": "home", "value": ""}},
-        "confidence_breakdown": {{"data_quality": 0.0, "market_consistency": 0.0, "historical_accuracy": 0.0, "overall_confidence": 0.0}}
+        "confidence_breakdown": {{
+            "data_quality": 0.0,
+            "market_consistency": 0.0,
+            "historical_accuracy": 0.0,
+            "overall_confidence": 0.0
+        }}
     }},
     "analysis_summary": {{
         "key_factors": ["factor1", "factor2"],
-        "match_narrative": "breve análisis en español",
-        "value_opportunity": "mejor apuesta"
+        "match_narrative": "análisis basado en búsqueda web",
+        "value_opportunity": "explicación del mejor valor encontrado"
     }}
-}}"""
+}}
+"""
 
     def _parse(self, text: str, original: Dict) -> Optional[Dict]:
         try:
+            # Limpiar posibles bloque de código markdown
             cleaned = text.strip()
             if cleaned.startswith("```json"):
                 cleaned = cleaned[7:]
@@ -235,10 +254,13 @@ RESPUESTA JSON:
             if cleaned.endswith("```"):
                 cleaned = cleaned[:-3]
             data = json.loads(cleaned)
+            # Extraer la confianza global
             conf = data.get("predictions", {}).get("confidence_breakdown", {}).get("overall_confidence", 0.65)
             data["confidence"] = conf
             return data
-        except:
+        except json.JSONDecodeError as e:
+            print(f"⚠️ Error parseando JSON: {e}")
+            print(f"Respuesta recibida: {text[:300]}...")
             return None
 
 # ==================== TELEGRAM BOT ====================
@@ -271,7 +293,7 @@ class TelegramBot:
         print("✅ Telegram bot ready")
 
     async def _start(self, update, context):
-        await update.message.reply_text("🤖 Bot de predicciones IA activo.\nUsa /status para ver configuración.", parse_mode="Markdown")
+        await update.message.reply_text("🤖 Bot de predicciones IA (Perplexity Sonar Pro Search)\nUsa /status para ver configuración.", parse_mode="Markdown")
 
     async def _status(self, update, context):
         msg = f"""
@@ -280,6 +302,7 @@ class TelegramBot:
 - Confianza mínima: {Config.CONFIDENCE_THRESHOLD*100}%
 - Máx predicciones: {Config.MAX_PREDICTIONS}
 - Ligas: {', '.join(Config.SPORTS_LEAGUES)}
+- Intervalo: {Config.ANALYSIS_INTERVAL_SECONDS//3600}h
         """
         await update.message.reply_text(msg, parse_mode="Markdown")
 
@@ -377,9 +400,9 @@ class PredictionBot:
 
     async def start(self):
         Config.validate()
-        print("🚀 Bot iniciando en Railway...")
+        print("🚀 Bot iniciando en Railway con Perplexity Sonar Pro Search...")
         await self.telegram.init()
-        await asyncio.sleep(10)  # Estabilizar Telegram
+        await asyncio.sleep(10)
         signal.signal(signal.SIGINT, self._stop)
         signal.signal(signal.SIGTERM, self._stop)
         await self._analysis_loop()
@@ -398,7 +421,7 @@ class PredictionBot:
                     continue
 
                 predictions = []
-                for ev in all_events[:20]:
+                for ev in all_events[:Config.MAX_EVENTS_PER_CYCLE]:
                     print(f"🤖 Analizando {ev.get('home_team')} vs {ev.get('away_team')}")
                     pred = await self.ai.analyze(ev)
                     if pred:
