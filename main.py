@@ -23,7 +23,7 @@ class Config:
     DEFAULT_LEAGUES = ["NFL", "NBA", "MLB", "NHL", "NCAAF", "NCAAB", "MLS"]
     SPORTS_LEAGUES = os.environ.get("SPORTS_LEAGUES", ",".join(DEFAULT_LEAGUES)).split(",")
 
-    AI_MODEL = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
+    AI_MODEL = "perplexity/sonar-pro-search"
     MAX_PREDICTIONS = int(os.environ.get("MAX_PREDICTIONS", "10"))
     CONFIDENCE_THRESHOLD = float(os.environ.get("CONFIDENCE_THRESHOLD", "0.65"))
     ANALYSIS_INTERVAL_SECONDS = int(os.environ.get("ANALYSIS_INTERVAL_SECONDS", "3600"))
