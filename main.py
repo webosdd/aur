@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+"""
+Bot de predicciones deportivas con IA (NVIDIA vía OpenRouter)
+Usa la API de SportsGameOdds V2 con paginación y filtros por liga.
+"""
+
 import asyncio
 import json
 import os
@@ -18,24 +23,27 @@ class Config:
     OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
     TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
     TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-    
+
     AI_MODEL = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
     MAX_PREDICTIONS = int(os.environ.get("MAX_PREDICTIONS", "10"))
     CONFIDENCE_THRESHOLD = float(os.environ.get("CONFIDENCE_THRESHOLD", "0.65"))
     ANALYSIS_INTERVAL_SECONDS = int(os.environ.get("ANALYSIS_INTERVAL_SECONDS", "3600"))
-    SPORTS_LEAGUES = os.environ.get("SPORTS_LEAGUES", "football,tennis,basketball,baseball").split(",")
-    
+    SPORTS_LEAGUES = os.environ.get("SPORTS_LEAGUES", "NBA,NFL,MLB").split(",")
+
     OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
     OPENROUTER_SITE_URL = os.environ.get("OPENROUTER_SITE_URL", "https://railway.app")
     OPENROUTER_SITE_NAME = os.environ.get("OPENROUTER_SITE_NAME", "Sports Prediction Bot")
-    
+
+    # Mapeo de nombres de ligas (para referencia, aunque usamos los IDs directamente)
     SPORTS_MAPPING = {
-        "football": ["NFL","NCAAF","EPL","UCL","LaLiga","SerieA","Bundesliga","LigaMX","MLS"],
-        "tennis": ["ATP","WTA"],
-        "basketball": ["NBA","NCAA","EuroLeague","ACB"],
-        "baseball": ["MLB","KBO","NPB"]
+        "NBA": "basketball",
+        "NFL": "football",
+        "MLB": "baseball",
+        "EPL": "football",
+        "UCL": "football",
+        "LaLiga": "football"
     }
-    
+
     @classmethod
     def validate(cls):
         missing = []
@@ -51,64 +59,130 @@ class Config:
             raise ValueError(f"Faltan variables: {', '.join(missing)}")
         return True
 
-# ==================== CLIENTE API DE CUOTAS (VERSIÓN V2) ====================
+
+# ==================== CLIENTE API DE CUOTAS (V2 con paginación) ====================
 class OddsAPIClient:
     def __init__(self):
-        # CAMBIO IMPORTANTE: usar v2 en lugar de v1
         self.base_url = "https://api.sportsgameodds.com/v2"
         self.api_key = Config.SPORTS_ODDS_API_KEY
+        self.league_ids = Config.SPORTS_LEAGUES  # ej: ["NBA", "NFL", "MLB"]
         self.headers = {"x-api-key": self.api_key, "Content-Type": "application/json"}
-        self.relevant_leagues = []
-        for sport in Config.SPORTS_LEAGUES:
-            self.relevant_leagues.extend(Config.SPORTS_MAPPING.get(sport.strip(), []))
-    
-    async def _get(self, endpoint: str, params: dict = None) -> List[Dict]:
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with session.get(f"{self.base_url}/{endpoint}", headers=self.headers, params=params) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        # Ajuste según la respuesta real de la API (puede ser data.resultados)
-                        if isinstance(data, dict):
-                            return data.get("data", []) or data.get("results", [])
-                        return data
-                    else:
-                        print(f"⚠️ API error {resp.status}: {await resp.text()}")
+
+    async def fetch_all_events(self, endpoint: str) -> List[Dict]:
+        """
+        Obtiene eventos de forma paginada recorriendo el cursor.
+        endpoint puede ser "events?status=live" o "events?status=upcoming"
+        """
+        all_events = []
+        next_cursor = None
+        leagues_param = ",".join(self.league_ids)
+
+        while True:
+            params = {
+                "apiKey": self.api_key,
+                "leagueID": leagues_param,
+                "oddsAvailable": "true",
+            }
+            if next_cursor:
+                params["nextCursor"] = next_cursor
+
+            url = f"{self.base_url}/{endpoint}"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=self.headers, params=params) as resp:
+                    if resp.status != 200:
+                        error_text = await resp.text()
+                        print(f"❌ API error {resp.status}: {error_text}")
+                        return []  # Salimos, no podemos continuar
+
+                    data = await resp.json()
+                    if not data.get("success"):
+                        print(f"⚠️ API indicó fallo: {data.get('error')}")
                         return []
-            except Exception as e:
-                print(f"❌ API connection error: {e}")
-                return []
-    
-    async def get_live_events(self) -> List[Dict]:
-        events = await self._get("events", {"status": "live"})
-        return self._filter_relevant(events)
-    
-    async def get_upcoming_events(self) -> List[Dict]:
-        events = await self._get("events", {"status": "upcoming"})
-        return self._filter_relevant(events)
-    
-    async def get_event_details(self, event_id: str) -> Optional[Dict]:
-        data = await self._get(f"events/{event_id}")
-        return data[0] if data else None
-    
-    async def verify_result(self, event_id: str) -> Optional[Dict]:
-        return await self._get(f"events/{event_id}/result")
-    
-    def _filter_relevant(self, events: List[Dict]) -> List[Dict]:
-        return [self._normalize(ev) for ev in events if ev.get("league") in self.relevant_leagues]
-    
-    def _normalize(self, ev: Dict) -> Dict:
+
+                    page_events = data.get("data", [])
+                    all_events.extend(page_events)
+
+                    next_cursor = data.get("nextCursor")
+                    if not next_cursor:
+                        break
+                    await asyncio.sleep(0.5)  # evitar rate limiting
+
+        # Filtro de seguridad (aunque la query ya debería filtrar)
+        return [e for e in all_events if e.get("leagueID") in self.league_ids]
+
+    async def get_live_events(self) -> List[Dict[str, Any]]:
+        events = await self.fetch_all_events("events?status=live")
+        return [self._normalize_event(e) for e in events]
+
+    async def get_upcoming_events(self) -> List[Dict[str, Any]]:
+        events = await self.fetch_all_events("events?status=upcoming")
+        return [self._normalize_event(e) for e in events]
+
+    async def get_event_details(self, event_id: str) -> Optional[Dict[str, Any]]:
+        # Endpoint opcional; no se usa en el bucle principal
+        return None
+
+    async def verify_result(self, event_id: str) -> Optional[Dict[str, Any]]:
+        # Endpoint opcional; no se usa en el bucle principal
+        return None
+
+    def _normalize_event(self, event: Dict) -> Dict:
+        """
+        Convierte el JSON complejo de la API V2 al formato simple que espera el AIAnalyzer.
+        """
+        teams = event.get("teams", {})
+        home_data = teams.get("home", {})
+        away_data = teams.get("away", {})
+
+        # Extraer nombres de equipos (prioridad: long > medium > short)
+        home_name = (
+            home_data.get("names", {}).get("long") or
+            home_data.get("names", {}).get("medium") or
+            home_data.get("names", {}).get("short") or
+            "Unknown"
+        )
+        away_name = (
+            away_data.get("names", {}).get("long") or
+            away_data.get("names", {}).get("medium") or
+            away_data.get("names", {}).get("short") or
+            "Unknown"
+        )
+
+        status_info = event.get("status", {})
+        odds_info = event.get("odds", {})
+
+        # Intentar extraer cuotas de Moneyline (h2h) para home/draw/away
+        # Buscamos un mercado que contenga "moneyline" o "h2h"
+        home_odds = "N/A"
+        away_odds = "N/A"
+        draw_odds = "N/A"
+        for odd_id, odd_val in odds_info.items():
+            if "moneyline" in odd_id.lower() or "h2h" in odd_id.lower():
+                # Si la odd tiene home/away explícitos, extraemos.
+                # En la estructura real podría haber campos 'homeOdds', 'awayOdds'
+                # Esta es una simplificación; ajústala según la documentación real.
+                home_odds = odd_val.get("bookOdds", "N/A")
+                # Para el away, puede estar en otro objeto o en el mismo.
+                # Por ahora lo dejamos así.
+                break
+
+        # Devolvemos el formato esperado por el AIAnalyzer
         return {
-            "id": ev.get("id"),
-            "sport": ev.get("sport"),
-            "league": ev.get("league"),
-            "home_team": ev.get("home_team"),
-            "away_team": ev.get("away_team"),
-            "start_time": ev.get("start_time"),
-            "status": ev.get("status"),
-            "odds": ev.get("odds", {}),
-            "score": ev.get("score", {})
+            "id": event.get("eventID"),
+            "sport": event.get("sportID", "").lower(),
+            "league": event.get("leagueID"),
+            "home_team": home_name,
+            "away_team": away_name,
+            "start_time": status_info.get("startsAt"),
+            "status": status_info.get("displayLong", ""),
+            "odds": {
+                "home_win": home_odds,
+                "draw": draw_odds,
+                "away_win": away_odds
+            },
+            "score": {}
         }
+
 
 # ==================== ANALIZADOR IA (OpenRouter + NVIDIA) ====================
 class AIAnalyzer:
@@ -121,7 +195,7 @@ class AIAnalyzer:
         self.model = Config.AI_MODEL
         self.threshold = Config.CONFIDENCE_THRESHOLD
         self.headers = {"HTTP-Referer": Config.OPENROUTER_SITE_URL, "X-Title": Config.OPENROUTER_SITE_NAME}
-    
+
     async def analyze(self, event: Dict) -> Optional[Dict]:
         prompt = self._build_prompt(event)
         try:
@@ -140,16 +214,16 @@ class AIAnalyzer:
         except Exception as e:
             print(f"❌ Error IA: {e}")
             return None
-    
+
     async def rank(self, predictions: List[Dict]) -> List[Dict]:
         valid = [p for p in predictions if p and p.get("confidence", 0) >= self.threshold]
         return sorted(valid, key=lambda x: x.get("confidence", 0), reverse=True)[:Config.MAX_PREDICTIONS]
-    
+
     def _build_prompt(self, event: Dict) -> str:
         home = event.get("home_team", "Local")
         away = event.get("away_team", "Visitante")
         league = event.get("league", "Desconocida")
-        sport = event.get("sport", "Deporte")
+        sport = event.get("sport", "deporte")
         odds = event.get("odds", {})
         return f"""
 Analiza este evento deportivo y genera predicciones detalladas en JSON.
@@ -182,7 +256,7 @@ RESPUESTA JSON:
         "value_opportunity": "mejor apuesta"
     }}
 }}"""
-    
+
     def _parse(self, text: str, original: Dict) -> Optional[Dict]:
         try:
             cleaned = text.strip()
@@ -199,80 +273,127 @@ RESPUESTA JSON:
         except:
             return None
 
+
 # ==================== TELEGRAM BOT (con drop_pending_updates) ====================
 class TelegramBot:
     def __init__(self):
         self.bot = Bot(token=Config.TELEGRAM_BOT_TOKEN)
         self.chat_id = Config.TELEGRAM_CHAT_ID
         self.app = None
-    
+
     async def init(self):
-        # Solución al conflicto: drop_pending_updates=True y sin webhook previo
         self.app = Application.builder().token(Config.TELEGRAM_BOT_TOKEN).build()
-        await self.app.bot.delete_webhook(drop_pending_updates=True)  # <--- clave
+        await self.app.bot.delete_webhook(drop_pending_updates=True)
         self.app.add_handler(CommandHandler("start", self._start))
         self.app.add_handler(CommandHandler("status", self._status))
         await self.app.initialize()
         await self.app.start()
-        await self.app.updater.start_polling(drop_pending_updates=True)  # <--- clave
+        await self.app.updater.start_polling(drop_pending_updates=True)
         print("✅ Telegram bot ready (conflicto resuelto)")
-    
+
     async def _start(self, update, context):
-        await update.message.reply_text("🤖 Bot de predicciones activo. Usa /status", parse_mode="Markdown")
-    
+        await update.message.reply_text(
+            "🤖 Bot de predicciones IA activo.\nUsa /status para ver configuración.",
+            parse_mode="Markdown"
+        )
+
     async def _status(self, update, context):
-        msg = f"Modelo: {Config.AI_MODEL}\nConfianza mínima: {Config.CONFIDENCE_THRESHOLD*100}%"
+        msg = f"""
+⚙️ *Estado*
+- Modelo: `{Config.AI_MODEL}`
+- Confianza mínima: {Config.CONFIDENCE_THRESHOLD*100}%
+- Máx predicciones: {Config.MAX_PREDICTIONS}
+- Ligas: {', '.join(Config.SPORTS_LEAGUES)}
+        """
         await update.message.reply_text(msg, parse_mode="Markdown")
-    
+
     async def send_predictions(self, predictions: List[Dict]):
         if not predictions:
-            await self._send("⚠️ Sin predicciones ahora.")
+            await self._send("⚠️ Sin predicciones con suficiente confianza ahora.")
             return
-        await self._send("🎯 PREDICCIONES")
-        for i, p in enumerate(predictions[:5], 1):
+        await self._send("🎯 *PREDICCIONES DEPORTIVAS IA*\n━━━━━━━━━━━━━━━━━━━━━━━")
+        for i, p in enumerate(predictions[:Config.MAX_PREDICTIONS], 1):
             msg = self._format(p, i)
             await self._send(msg)
-    
-    def _format(self, p, idx):
+
+    def _format(self, p: Dict, idx: int) -> str:
         preds = p.get("predictions", {})
-        home = p.get("home_team","Local")
-        away = p.get("away_team","Visitante")
-        wp = preds.get("winner_probability",{})
-        g = preds.get("goals",{})
-        c = preds.get("corners",{})
-        ca = preds.get("cards",{})
-        f = preds.get("fouls",{})
-        nar = p.get("analysis_summary",{}).get("match_narrative","")
-        return f"""
-*#{idx}* {home} vs {away}
-🏠 {wp.get('home_win',0)*100:.0f}% | ⚖️ {wp.get('draw',0)*100:.0f}% | ✈️ {wp.get('away_win',0)*100:.0f}%
-⚽ Goles: {g.get('total_goals',0):.1f} | 🚩 Córners: {c.get('total_corners',0)} | 🟨 Tarjetas: {ca.get('total_cards',0)} | 💥 Faltas: {f.get('total_fouls',0)}
-📝 {nar[:150]}...
+        home = p.get("home_team", "Local")
+        away = p.get("away_team", "Visitante")
+        sport = p.get("sport", "deporte")
+        league = p.get("league", "")
+        conf = p.get("confidence", 0)
+        conf_emoji = "🟢" if conf >= 0.8 else "🟡" if conf >= 0.7 else "🟠" if conf >= 0.6 else "🔴"
+
+        wp = preds.get("winner_probability", {})
+        goals = preds.get("goals", {})
+        corners = preds.get("corners", {})
+        cards = preds.get("cards", {})
+        fouls = preds.get("fouls", {})
+        narrative = p.get("analysis_summary", {}).get("match_narrative", "")
+        value = p.get("analysis_summary", {}).get("value_opportunity", "")
+
+        sport_emoji = {"football": "⚽", "tennis": "🎾", "basketball": "🏀", "baseball": "⚾"}.get(sport.lower(), "🏆")
+
+        msg = f"""
+🎲 *Predicción #{idx}* | {sport_emoji} {sport.upper()}
+━━━━━━━━━━━━━━━━━━━━━━━
+*Partido:* {home} vs {away}
+*Liga:* {league}
+*Confianza:* {conf_emoji} {conf*100:.1f}%
+
+📊 *PROBABILIDADES*
+• 🏠 {home}: {wp.get('home_win', 0)*100:.1f}%
+• ⚖️ Empate: {wp.get('draw', 0)*100:.1f}%
+• ✈️ {away}: {wp.get('away_win', 0)*100:.1f}%
+
+⚽ *GOLES*
+Total: {goals.get('total_goals', 0):.1f} | {home}: {goals.get('home_goals', 0):.1f} | {away}: {goals.get('away_goals', 0):.1f}
+Over {goals.get('over_under_line', 2.5)}: {goals.get('over_probability', 0)*100:.0f}%
+
+🚩 *CÓRNERS*: {corners.get('total_corners', 0)} ({home}:{corners.get('home_corners', 0)} / {away}:{corners.get('away_corners', 0)})
+🟨 *TARJETAS*: {cards.get('total_cards', 0)} (A:{cards.get('yellow_cards', 0)} R:{cards.get('red_cards', 0)})
+💥 *FALTAS*: {fouls.get('total_fouls', 0)}
+
+💡 *ANÁLISIS*
+{narrative[:300]}
+
+🎯 *Valor:* {value if value else "No especificado"}
+━━━━━━━━━━━━━━━━━━━━━━━
 """
-    
-    async def _send(self, text):
-        await self.bot.send_message(chat_id=self.chat_id, text=text, parse_mode="Markdown")
-    
+        return msg
+
+    async def _send(self, text: str):
+        max_len = 4096
+        if len(text) <= max_len:
+            await self.bot.send_message(chat_id=self.chat_id, text=text, parse_mode="Markdown")
+        else:
+            for i in range(0, len(text), max_len):
+                await self.bot.send_message(chat_id=self.chat_id, text=text[i:i+max_len], parse_mode="Markdown")
+                await asyncio.sleep(0.5)
+
     async def shutdown(self):
         if self.app:
             await self.app.updater.stop()
             await self.app.stop()
             await self.app.shutdown()
 
+
 # ==================== VERIFICADOR (placeholder) ====================
 class Verifier:
-    def __init__(self, api_client, telegram_bot):
+    def __init__(self, api_client: OddsAPIClient, telegram_bot: TelegramBot):
         self.api = api_client
         self.bot = telegram_bot
         self.pending = {}
-    
-    def register(self, event_id, prediction):
+
+    def register(self, event_id: str, prediction: Dict):
         if event_id not in self.pending:
             self.pending[event_id] = prediction
-    
-    async def run_loop(self, interval=3600):
+
+    async def run_loop(self, interval: int = 3600):
         while True:
             await asyncio.sleep(interval)
+
 
 # ==================== BOT PRINCIPAL ====================
 class PredictionBot:
@@ -282,7 +403,7 @@ class PredictionBot:
         self.ai = AIAnalyzer()
         self.telegram = TelegramBot()
         self.verifier = Verifier(self.api, self.telegram)
-    
+
     async def start(self):
         Config.validate()
         print("🚀 Bot iniciando en Railway...")
@@ -290,7 +411,7 @@ class PredictionBot:
         signal.signal(signal.SIGINT, self._stop)
         signal.signal(signal.SIGTERM, self._stop)
         await self._analysis_loop()
-    
+
     async def _analysis_loop(self):
         while self.running:
             try:
@@ -299,34 +420,41 @@ class PredictionBot:
                 upcoming = await self.api.get_upcoming_events()
                 all_events = live + upcoming
                 print(f"📡 Eventos: {len(all_events)} (vivos:{len(live)}, próximos:{len(upcoming)})")
+
                 if not all_events:
                     await asyncio.sleep(60)
                     continue
+
                 predictions = []
-                for ev in all_events[:20]:
+                for ev in all_events[:20]:  # limitar a 20 por ciclo
                     print(f"🤖 Analizando {ev.get('home_team')} vs {ev.get('away_team')}")
                     pred = await self.ai.analyze(ev)
                     if pred:
                         predictions.append(pred)
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(2)  # pausa entre análisis
+
                 ranked = await self.ai.rank(predictions)
                 for p in ranked:
                     self.verifier.register(p.get("event_id"), p)
+
                 await self.telegram.send_predictions(ranked)
+
                 wait = Config.ANALYSIS_INTERVAL_SECONDS
                 if live:
-                    wait = min(wait, 1800)
+                    wait = min(wait, 1800)  # si hay partidos en vivo, analizar cada 30 min
                 print(f"⏳ Esperando {wait//60} minutos...")
                 await asyncio.sleep(wait)
+
             except Exception as e:
-                print(f"❌ Error en análisis: {e}")
+                print(f"❌ Error en ciclo de análisis: {e}")
                 await asyncio.sleep(60)
-    
+
     def _stop(self, *args):
         print("🛑 Apagando bot...")
         self.running = False
         asyncio.create_task(self.telegram.shutdown())
         sys.exit(0)
+
 
 async def main():
     bot = PredictionBot()
