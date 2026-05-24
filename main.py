@@ -1,1286 +1,452 @@
-# BOT TRADING CON GEMINI 3.1 FLASH + TA-Lib - VERSIÓN MEJORADA (SL + TRAILING + IA CONFIRMA PATRÓN)
-# ==============================================================================
-import os, time, requests, json, numpy as np, pandas as pd
-from scipy.stats import linregress
-from datetime import datetime, timezone
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-from PIL import Image
-import io
-import json_repair
-import base64
-from openai import OpenAI
-import hashlib
-import hmac
-import logging
-import re
+#!/usr/bin/env python3
+"""
+Bot de predicciones deportivas con IA (NVIDIA Nemotron a través de OpenRouter)
+Funciona 24/7 en Railway. Analiza eventos en vivo/próximos y envía top predicciones a Telegram.
+"""
+
+import asyncio
+import json
+import os
 import signal
 import sys
+from datetime import datetime
+from typing import Dict, Any, List, Optional
 
-# Configurar logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("bot.log", encoding='utf-8'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
+import aiohttp
+from dotenv import load_dotenv
+from openai import AsyncOpenAI
+from sports_odds_api import SportsGameOdds
+from telegram import Bot
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-# =================== TA-Lib (patrones de velas) ===================
-try:
-    import talib
-    TA_LIB_AVAILABLE = True
-    logger.info("✅ TA-Lib cargado correctamente.")
-except ImportError:
-    TA_LIB_AVAILABLE = False
-    logger.warning("⚠️ TA-Lib no instalado. Se omitirá la detección de patrones.")
-    class talib:
-        pass
+# ==================== CONFIGURACIÓN ====================
+load_dotenv()
 
-# =================== SANITIZAR EMOJIS ===================
-def sanitize_for_matplotlib(text):
-    if not isinstance(text, str):
-        return text
-    emoji_pattern = re.compile("["
-        u"\U0001F600-\U0001F64F"
-        u"\U0001F300-\U0001F5FF"
-        u"\U0001F680-\U0001F6FF"
-        u"\U0001F700-\U0001F77F"
-        u"\U0001F780-\U0001F7FF"
-        u"\U0001F800-\U0001F8FF"
-        u"\U0001F900-\U0001F9FF"
-        u"\U0001FA00-\U0001FA6F"
-        u"\U0001FA70-\U0001FAFF"
-        u"\U00002702-\U000027B0"
-        u"\U000024C2-\U0001F251"
-        "]+", flags=re.UNICODE)
-    return emoji_pattern.sub('', text)
+class Config:
+    SPORTS_ODDS_API_KEY = os.getenv("SPORTS_ODDS_API_KEY_HEADER")
+    OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+    TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+    
+    AI_MODEL = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
+    MAX_PREDICTIONS = int(os.getenv("MAX_PREDICTIONS", 10))
+    CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", 0.65))
+    ANALYSIS_INTERVAL_SECONDS = int(os.getenv("ANALYSIS_INTERVAL_SECONDS", 3600))
+    SPORTS_LEAGUES = os.getenv("SPORTS_LEAGUES", "football,tennis,basketball,baseball").split(",")
+    
+    OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+    OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "https://railway.app")
+    OPENROUTER_SITE_NAME = os.getenv("OPENROUTER_SITE_NAME", "Sports Prediction Bot")
+    
+    @classmethod
+    def validate(cls):
+        required = [cls.SPORTS_ODDS_API_KEY, cls.OPENROUTER_API_KEY, cls.TELEGRAM_BOT_TOKEN, cls.TELEGRAM_CHAT_ID]
+        if not all(required):
+            missing = [k for k in ["SPORTS_ODDS_API_KEY","OPENROUTER_API_KEY","TELEGRAM_BOT_TOKEN","TELEGRAM_CHAT_ID"] if not locals().get(k)]
+            raise ValueError(f"Faltan variables: {missing}")
 
-# =================== CONFIGURACIÓN DE APIS ===================
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-if not OPENROUTER_API_KEY:
-    raise ValueError("Falta OPENROUTER_API_KEY")
-
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-client = OpenAI(
-    base_url=OPENROUTER_BASE_URL,
-    api_key=OPENROUTER_API_KEY,
-    default_headers={
-        "HTTP-Referer": "https://railway.app",
-        "X-Title": "Trading Bot",
-    }
-)
-MODELO_VISION = "google/gemini-3.1-flash-image-preview"
-
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-BASE_URL = "https://api.bybit.com"
-
-BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
-BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
-if not BYBIT_API_KEY or not BYBIT_API_SECRET:
-    raise ValueError("Faltan BYBIT_API_KEY o BYBIT_API_SECRET")
-
-# =================== MODO PAPER TRADE ===================
-PAPER_TRADE = True   # Cambiar a False para real
-
-paper_balance = 1000.0
-paper_positions = {}
-paper_trade_counter = 0
-paper_win_count = 0
-paper_loss_count = 0
-paper_total_trades = 0
-paper_trade_history = []
-
-PAPER_COMMISSION_PCT = 0.001
-
-# =================== CONFIGURACIÓN DEL BOT ===================
-SYMBOL = "BTCUSDT"
-INTERVAL_LTF = "3"
-INTERVAL_HTF = "30"
-RISK_PER_TRADE_MAX = 3.0
-LEVERAGE = 34
-SLEEP_SECONDS = 60
-GRAFICO_VELAS_LIMIT = 120
-MAX_CONCURRENT_TRADES = 3
-MIN_MARGIN_PER_TRADE = 3.0
-TP1_PERCENT = 0.5               # Cierra 50% en TP1
-TRAILING_PERCENT = 0.0025       # 0.25% de trailing (antes 0.15%)
-MIN_SL_DIST_PCT = 0.0008        # 0.08% (antes 0.05%)
-MAX_SL_DIST_PCT = 0.008         # 0.8% (antes 0.5%)
-MIN_TP1_DIST_PCT = 0.003        # 0.3% (antes 0.2%)
-MAX_TP1_DIST_PCT = 0.010        # 1.0% (antes 0.6%)
-
-REAL_BALANCE = None
-REAL_ACTIVE_TRADES = {}
-TRADE_COUNTER = 0
-WIN_COUNT = 0
-LOSS_COUNT = 0
-TOTAL_TRADES = 0
-TRADE_HISTORY = []
-
-MAX_DAILY_DRAWDOWN_PCT = 0.20
-DAILY_START_BALANCE = None
-STOPPED_TODAY = False
-CURRENT_DAY = None
-
-ULTIMO_REPORTE = 0
-
-# =================== MEMORIA PERSISTENTE ===================
-MEMORY_FILE = "memoria_bot_paper.json" if PAPER_TRADE else "memoria_bot_real.json"
-
-def convertir_serializable(obj):
-    if isinstance(obj, np.generic):
-        return obj.item()
-    if isinstance(obj, dict):
-        return {k: convertir_serializable(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [convertir_serializable(item) for item in obj]
-    return obj
-
-def normalizar_trade_activo(trade):
-    defaults = {
-        'tp1': 0.0, 'tp1_ejecutado': False, 'trailing_activado': False,
-        'best_price': trade.get('entrada', 0.0), 'trailing_stop': None,
-        'pnl_parcial': 0.0, 'qty_restante': trade.get('qty_original', 0.0),
-        'sl_actual': trade.get('sl_inicial', 0.0), 'razon': '', 'decision': 'Hold',
-        'entrada': 0.0, 'qty_original': 0.0, 'order_id': None,
-        'breakeven_activado': False, 'contexto_pensamiento': ''
-    }
-    for key, val in defaults.items():
-        if key not in trade:
-            trade[key] = val
-    return trade
-
-def guardar_memoria():
-    if PAPER_TRADE:
-        active_trades_meta = {}
-        for tid, t in paper_positions.items():
-            active_trades_meta[tid] = {
-                "id": t["id"], "decision": t["decision"], "entrada": t["entrada"],
-                "razon": t.get("razon", ""), "tp1_ejecutado": t["tp1_ejecutado"],
-                "sl_actual": t.get("sl_actual"), "qty_original": t.get("qty_original"),
-                "qty_restante": t.get("qty_restante"), "breakeven_activado": t.get("breakeven_activado", False),
-                "trailing_activado": t.get("trailing_activado", False), "best_price": t.get("best_price"),
-                "trailing_stop": t.get("trailing_stop"), "pnl_parcial": t.get("pnl_parcial", 0.0),
-                "tp1": t.get("tp1", 0.0), "sl_inicial": t.get("sl_inicial", 0.0), "order_id": t.get("order_id")
-            }
-        data = {"TRADE_HISTORY": paper_trade_history, "REAL_BALANCE": paper_balance,
-                "WIN_COUNT": paper_win_count, "LOSS_COUNT": paper_loss_count, "TOTAL_TRADES": paper_total_trades,
-                "ACTIVE_TRADES_META": active_trades_meta}
-    else:
-        active_trades_meta = {}
-        for tid, t in REAL_ACTIVE_TRADES.items():
-            active_trades_meta[tid] = {
-                "id": t["id"], "decision": t["decision"], "entrada": t["entrada"],
-                "razon": t.get("razon", ""), "tp1_ejecutado": t["tp1_ejecutado"],
-                "sl_actual": t.get("sl_actual"), "qty_original": t.get("qty_original"),
-                "qty_restante": t.get("qty_restante"), "breakeven_activado": t.get("breakeven_activado", False),
-                "trailing_activado": t.get("trailing_activado", False), "best_price": t.get("best_price"),
-                "trailing_stop": t.get("trailing_stop"), "pnl_parcial": t.get("pnl_parcial", 0.0),
-                "tp1": t.get("tp1", 0.0), "sl_inicial": t.get("sl_inicial", 0.0), "order_id": t.get("order_id")
-            }
-        data = {"TRADE_HISTORY": TRADE_HISTORY, "REAL_BALANCE": REAL_BALANCE,
-                "WIN_COUNT": WIN_COUNT, "LOSS_COUNT": LOSS_COUNT, "TOTAL_TRADES": TOTAL_TRADES,
-                "ACTIVE_TRADES_META": active_trades_meta}
-    try:
-        tmp_file = MEMORY_FILE + ".tmp"
-        with open(tmp_file, "w") as f:
-            json.dump(convertir_serializable(data), f, indent=4)
-        os.replace(tmp_file, MEMORY_FILE)
-        logger.info("💾 Memoria guardada")
-    except Exception as e:
-        logger.error(f"Error guardando memoria: {e}")
-
-def cargar_memoria():
-    global TRADE_HISTORY, REAL_BALANCE, WIN_COUNT, LOSS_COUNT, TOTAL_TRADES, REAL_ACTIVE_TRADES
-    global paper_balance, paper_win_count, paper_loss_count, paper_total_trades, paper_trade_history, paper_positions
-    if not os.path.exists(MEMORY_FILE):
-        return
-    try:
-        with open(MEMORY_FILE, "r") as f:
-            data = json.load(f)
-        if PAPER_TRADE:
-            paper_trade_history = data.get("TRADE_HISTORY", [])
-            paper_balance = data.get("REAL_BALANCE", 1000.0)
-            paper_win_count = data.get("WIN_COUNT", 0)
-            paper_loss_count = data.get("LOSS_COUNT", 0)
-            paper_total_trades = data.get("TOTAL_TRADES", 0)
-            active_meta = data.get("ACTIVE_TRADES_META", {})
-            paper_positions = {}
-            for tid, meta in active_meta.items():
-                trade = normalizar_trade_activo(meta)
-                paper_positions[int(tid)] = trade
-        else:
-            TRADE_HISTORY = data.get("TRADE_HISTORY", [])
-            REAL_BALANCE = data.get("REAL_BALANCE", None)
-            WIN_COUNT = data.get("WIN_COUNT", 0)
-            LOSS_COUNT = data.get("LOSS_COUNT", 0)
-            TOTAL_TRADES = data.get("TOTAL_TRADES", 0)
-            active_meta = data.get("ACTIVE_TRADES_META", {})
-            REAL_ACTIVE_TRADES = {}
-            for tid, meta in active_meta.items():
-                trade = normalizar_trade_activo(meta)
-                REAL_ACTIVE_TRADES[int(tid)] = trade
-        logger.info(f"📂 Memoria cargada. Trades: {paper_total_trades if PAPER_TRADE else TOTAL_TRADES}")
-    except Exception as e:
-        logger.error(f"Error cargando memoria: {e}")
-
-ULTIMO_GUARDADO = 0
-def guardado_periodico():
-    global ULTIMO_GUARDADO
-    ahora = time.time()
-    if ahora - ULTIMO_GUARDADO > 300:
-        guardar_memoria()
-        ULTIMO_GUARDADO = ahora
-
-def guardar_y_salir(signum, frame):
-    logger.info("Señal SIGTERM recibida. Guardando memoria...")
-    guardar_memoria()
-    sys.exit(0)
-
-signal.signal(signal.SIGTERM, guardar_y_salir)
-
-# =================== FUNCIONES BYBIT ===================
-def bybit_request(endpoint, method="GET", params=None, body=None):
-    timestamp = str(int(time.time() * 1000))
-    recv_window = "5000"
-    query_string = ""
-    if params:
-        query_string = "&".join([f"{k}={v}" for k, v in sorted(params.items())])
-    if body:
-        body_str = json.dumps(body)
-        payload = timestamp + BYBIT_API_KEY + recv_window + body_str
-    else:
-        payload = timestamp + BYBIT_API_KEY + recv_window + query_string
-    signature = hmac.new(BYBIT_API_SECRET.encode('utf-8'), payload.encode('utf-8'), hashlib.sha256).hexdigest()
-    headers = {
-        "X-BAPI-API-KEY": BYBIT_API_KEY, "X-BAPI-TIMESTAMP": timestamp,
-        "X-BAPI-RECV-WINDOW": recv_window, "X-BAPI-SIGN": signature,
-        "Content-Type": "application/json"
-    }
-    url = f"{BASE_URL}{endpoint}"
-    if method == "GET":
-        resp = requests.get(url, headers=headers, params=params)
-    else:
-        resp = requests.post(url, headers=headers, json=body)
-    return resp.json()
-
-def set_leverage():
-    if PAPER_TRADE:
-        logger.info("📊 Paper trade: apalancamiento simulado 34x")
-        return
-    try:
-        body = {"category": "linear", "symbol": "BTCUSDT", "buyLeverage": "34", "sellLeverage": "34"}
-        result = bybit_request("/v5/position/set-leverage", method="POST", body=body)
-        ret_code = result.get('retCode')
-        if ret_code == 0 or ret_code == 110043:
-            logger.info("🔧 Apalancamiento 34x configurado")
-        else:
-            logger.warning(f"Error configurando apalancamiento: {result}")
-    except Exception as e:
-        logger.error(f"Excepción configurando apalancamiento: {e}")
-
-def get_real_balance():
-    if PAPER_TRADE:
-        return paper_balance
-    try:
-        params = {"accountType": "UNIFIED", "coin": "USDT"}
-        result = bybit_request("/v5/account/wallet-balance", method="GET", params=params)
-        return float(result['result']['list'][0]['coin'][0]['walletBalance'])
-    except Exception as e:
-        logger.error(f"Error obteniendo saldo: {e}")
-        return None
-
-def get_free_margin():
-    if PAPER_TRADE:
-        margin_used = sum((t['qty_original'] * t['entrada']) / LEVERAGE for t in paper_positions.values())
-        return max(0.0, paper_balance - margin_used)
-    try:
-        params = {"accountType": "UNIFIED"}
-        result = bybit_request("/v5/account/wallet-balance", method="GET", params=params)
-        if result.get('retCode') == 0:
-            for coin in result['result']['list'][0]['coin']:
-                if coin['coin'] == 'USDT':
-                    wallet = float(coin['walletBalance'])
-                    used = float(coin.get('usedMargin', 0))
-                    return wallet - used
-    except Exception as e:
-        logger.error(f"Error obteniendo margen libre: {e}")
-    return 0.0
-
-def get_real_position_size():
-    if PAPER_TRADE:
-        return sum(t['qty_restante'] for t in paper_positions.values())
-    try:
-        params = {"category": "linear", "symbol": "BTCUSDT"}
-        result = bybit_request("/v5/position/list", method="GET", params=params)
-        if result.get('retCode') == 0:
-            for pos in result['result']['list']:
-                if pos['symbol'] == "BTCUSDT":
-                    return abs(float(pos['size']))
-        return 0.0
-    except Exception as e:
-        logger.error(f"Error get_real_position_size: {e}")
-        return 0.0
-
-def place_market_order(side, qty):
-    if PAPER_TRADE:
-        logger.info(f"📄 PAPER: Orden {side} {qty} BTC simulada")
-        return f"paper_order_{int(time.time())}"
-    try:
-        body = {"category": "linear", "symbol": "BTCUSDT", "side": side.capitalize(),
-                "orderType": "Market", "qty": str(qty), "timeInForce": "GTC"}
-        result = bybit_request("/v5/order/create", method="POST", body=body)
-        if result.get('retCode') == 0:
-            return result['result']['orderId']
-        else:
-            logger.error(f"Error orden market: {result}")
-            return None
-    except Exception as e:
-        logger.error(f"Excepción place_market_order: {e}")
-        return None
-
-def close_position_qty(qty, side_to_close):
-    if PAPER_TRADE:
-        logger.info(f"📄 PAPER: Cierre simulado de {qty} BTC lado {side_to_close}")
-        return f"paper_close_{int(time.time())}"
-    try:
-        real_size = get_real_position_size()
-        if real_size <= 0.0:
-            return "already_closed"
-        qty_to_close = min(qty, real_size)
-        if qty_to_close <= 0.0 or qty_to_close < 0.001:
-            return "already_closed"
-        close_side = "Sell" if side_to_close == "Buy" else "Buy"
-        body = {"category": "linear", "symbol": "BTCUSDT", "side": close_side,
-                "orderType": "Market", "qty": str(round(qty_to_close, 3)), "timeInForce": "GTC", "reduceOnly": True}
-        result = bybit_request("/v5/order/create", method="POST", body=body)
-        if result.get('retCode') == 0:
-            logger.info(f"Orden de cierre enviada: {qty_to_close} BTC")
-            return result['result']['orderId']
-        else:
-            logger.error(f"Error close_position_qty: {result}")
-            return None
-    except Exception as e:
-        logger.error(f"Excepción close_position_qty: {e}")
-        return None
-
-def close_position_qty_confirm(qty, side_to_close, max_wait=5):
-    if PAPER_TRADE:
-        return f"paper_confirm_{int(time.time())}"
-    size_before = get_real_position_size()
-    if size_before <= 0:
-        return "already_closed"
-    qty_to_close = min(qty, size_before)
-    if qty_to_close < 0.001:
-        return "already_closed"
-    order_id = close_position_qty(qty_to_close, side_to_close)
-    if not order_id or order_id == "already_closed":
-        return None
-    for _ in range(max_wait * 2):
-        time.sleep(0.5)
-        size_after = get_real_position_size()
-        if size_before - size_after >= qty_to_close * 0.99:
-            logger.info(f"Confirmada reducción: {size_before:.4f} -> {size_after:.4f}")
-            return order_id
-    logger.error(f"No se confirmó reducción tras {max_wait}s")
-    return None
-
-# =================== TELEGRAM ===================
-def telegram_mensaje_largo(texto):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning("Telegram no configurado")
-        return
-    MAX_LEN = 4000
-    if len(texto) <= MAX_LEN:
+# ==================== CLIENTE API DE CUOTAS ====================
+class OddsClient:
+    def __init__(self):
+        self.client = SportsGameOdds(api_key_param=Config.SPORTS_ODDS_API_KEY)
+        self.sports_mapping = {
+            "football": ["NFL","NCAAF","EPL","UCL","LaLiga","SerieA","Bundesliga","LigaMX","MLS"],
+            "tennis": ["ATP","WTA"],
+            "basketball": ["NBA","NCAA","EuroLeague","ACB"],
+            "baseball": ["MLB","KBO","NPB"]
+        }
+    
+    async def get_live_events(self) -> List[Dict]:
         try:
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                          data={"chat_id": TELEGRAM_CHAT_ID, "text": texto}, timeout=10)
+            loop = asyncio.get_event_loop()
+            page = await loop.run_in_executor(None, self.client.events.get, {"status": "live"})
+            events = page.data if page and hasattr(page, "data") else []
+            return self._filter_relevant(events)
         except Exception as e:
-            logger.error(f"Excepción telegram: {e}")
-        return
-    for i in range(0, len(texto), MAX_LEN):
-        parte = texto[i:i+MAX_LEN]
+            print(f"❌ Error eventos en vivo: {e}")
+            return []
+    
+    async def get_upcoming_events(self) -> List[Dict]:
         try:
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                          data={"chat_id": TELEGRAM_CHAT_ID, "text": parte}, timeout=10)
+            loop = asyncio.get_event_loop()
+            page = await loop.run_in_executor(None, self.client.events.get, {"status": "upcoming"})
+            events = page.data if page and hasattr(page, "data") else []
+            return self._filter_relevant(events)
         except Exception as e:
-            logger.error(f"Excepción telegram: {e}")
-
-def telegram_mensaje(texto):
-    telegram_mensaje_largo(texto)
-
-def telegram_enviar_imagen(ruta_imagen, caption=""):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    try:
-        if not os.path.exists(ruta_imagen):
-            logger.warning(f"Imagen no encontrada: {ruta_imagen}")
-            return
-        if len(caption) > 1000:
-            caption = caption[:997] + "..."
-        with open(ruta_imagen, 'rb') as foto:
-            resp = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
-                                 data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption},
-                                 files={"photo": foto}, timeout=15)
-        if resp.status_code != 200:
-            logger.error(f"Error imagen Telegram: {resp.status_code} - {resp.text[:200]}")
-        else:
-            logger.info("🖼️ Imagen enviada a Telegram")
-    except Exception as e:
-        logger.error(f"Excepción en telegram_enviar_imagen: {e}")
-
-def reporte_estado():
-    if PAPER_TRADE:
-        balance, win, loss, total, active = paper_balance, paper_win_count, paper_loss_count, paper_total_trades, len(paper_positions)
-    else:
-        if REAL_BALANCE is None: return
-        balance, win, loss, total, active = REAL_BALANCE, WIN_COUNT, LOSS_COUNT, TOTAL_TRADES, len(REAL_ACTIVE_TRADES)
-    pnl_global = balance - (DAILY_START_BALANCE or balance)
-    winrate = (win / total * 100) if total > 0 else 0
-    max_din = get_dynamic_max_trades()
-    modo = "📄 PAPER" if PAPER_TRADE else "💰 REAL"
-    mensaje = (f"{modo} ESTADO BTC\n💰 Balance: {balance:.2f} USDT\n📈 PnL día: {pnl_global:+.2f} USDT\n"
-               f"🏆 Winrate: {winrate:.1f}%\n🎯 Activos: {active}/{max_din}")
-    telegram_mensaje(mensaje)
-
-# =================== INDICADORES Y GRÁFICOS ===================
-def obtener_velas(interval="3", limit=150):
-    try:
-        r = requests.get(f"{BASE_URL}/v5/market/kline",
-                         params={"category": "linear", "symbol": SYMBOL, "interval": interval, "limit": limit},
-                         timeout=20)
-        data = r.json()
-        if data.get("retCode") != 0:
-            return pd.DataFrame()
-        lista = data.get("result")["list"][::-1]
-        df = pd.DataFrame(lista, columns=['time','open','high','low','close','volume','turnover'])
-        for col in ['open','high','low','close','volume']:
-            df[col] = df[col].astype(float)
-        df['time'] = pd.to_datetime(df['time'].astype(np.int64), unit='ms', utc=True)
-        df.set_index('time', inplace=True)
-        return df
-    except Exception as e:
-        logger.error(f"Error obteniendo velas {interval}: {e}")
-        return pd.DataFrame()
-
-def calcular_indicadores(df):
-    if df.empty:
-        return df
-    df['ema20'] = df['close'].ewm(span=20).mean()
-    df['ema50'] = df['close'].ewm(span=50).mean()
-    df['tr'] = np.maximum(df['high'] - df['low'],
-                          np.maximum(abs(df['high'] - df['close'].shift(1)),
-                                     abs(df['low'] - df['close'].shift(1))))
-    df['atr'] = df['tr'].rolling(14).mean()
-    return df.dropna()
-
-def detectar_zonas_mercado(df, idx=-2):
-    if df.empty or len(df) < 20:
-        return 0,0,0,0,"LATERAL","LATERAL"
-    df_eval = df if idx == -1 else df.iloc[:idx+1]
-    soporte = df_eval['low'].rolling(20).min().iloc[-1]
-    resistencia = df_eval['high'].rolling(20).max().iloc[-1]
-    y = df_eval['close'].values[-120:]
-    slope, intercept, _, _, _ = linregress(np.arange(len(y)), y)
-    micro_slope, _, _, _, _ = linregress(np.arange(8), df_eval['close'].values[-8:])
-    tend = 'ALCISTA' if slope > 0.01 else 'BAJISTA' if slope < -0.01 else 'LATERAL'
-    micro = 'SUBIENDO' if micro_slope > 0.2 else 'CAYENDO' if micro_slope < -0.2 else 'LATERAL'
-    return soporte, resistencia, slope, intercept, tend, micro
-
-def generar_grafico_para_vision(df, titulo, soporte=None, resistencia=None, slope=None, intercept=None,
-                                entry_price=None, sl_price=None, tp1_price=None, side=None, excluir_actual=False):
-    if df.empty:
-        return None
-    if excluir_actual and len(df) > 1:
-        df_plot = df.iloc[:-1].tail(GRAFICO_VELAS_LIMIT).copy()
-    else:
-        df_plot = df.tail(GRAFICO_VELAS_LIMIT).copy()
-    if len(df_plot) < 3:
-        return None
-    fig, ax = plt.subplots(figsize=(16,8))
-    x = np.arange(len(df_plot))
-    for i in range(len(df_plot)):
-        o, h, l, c = df_plot['open'].iloc[i], df_plot['high'].iloc[i], df_plot['low'].iloc[i], df_plot['close'].iloc[i]
-        color = '#00ff00' if c >= o else '#ff0000'
-        ax.vlines(x[i], l, h, color=color, linewidth=1.5)
-        ax.add_patch(plt.Rectangle((x[i]-0.35, min(o,c)), 0.7, max(abs(c-o), 0.1), color=color, alpha=0.9))
-    if soporte:
-        ax.axhline(soporte, color='cyan', ls='--', lw=2, label='Soporte')
-    if resistencia:
-        ax.axhline(resistencia, color='magenta', ls='--', lw=2, label='Resistencia')
-    if 'ema20' in df_plot.columns:
-        ax.plot(x, df_plot['ema20'], 'yellow', lw=2, label='EMA20')
-    if slope is not None and intercept is not None and slope != 0:
-        x_trend = np.array([0, len(df_plot)-1])
-        y_trend = intercept + slope * x_trend
-        ax.plot(x_trend, y_trend, color='white', linestyle='-.', lw=2, label='Tendencia', alpha=0.7)
-    if entry_price is not None:
-        ax.axhline(entry_price, color='orange', linestyle=':', linewidth=1.5, alpha=0.7, label='Entry')
-        circle_color = 'lime' if side == 'Buy' else 'red'
-        ax.scatter(x[-1], entry_price, color=circle_color, s=100, edgecolors='white', zorder=5)
-        ax.annotate(f'Entry {entry_price:.0f}', xy=(x[-1], entry_price), xytext=(5, 5),
-                    textcoords='offset points', fontsize=9, color='white',
-                    bbox=dict(boxstyle='round,pad=0.2', fc='black', alpha=0.6))
-    if sl_price is not None:
-        ax.axhline(sl_price, color='red', linestyle='--', linewidth=2, label=f'SL {sl_price:.0f}')
-    if tp1_price is not None:
-        ax.axhline(tp1_price, color='lime', linestyle='--', linewidth=2, label=f'TP1 {tp1_price:.0f}')
-    titulo_limpio = sanitize_for_matplotlib(titulo)
-    ax.set_title(titulo_limpio, color='white', fontsize=14)
-    ax.set_xlabel('Tiempo (velas)', color='white')
-    ax.set_ylabel('Precio (USDT)', color='white')
-    ax.tick_params(colors='white')
-    ax.spines['bottom'].set_color('white')
-    ax.spines['top'].set_color('white')
-    ax.spines['left'].set_color('white')
-    ax.spines['right'].set_color('white')
-    ax.set_facecolor('#121212')
-    fig.patch.set_facecolor('#121212')
-    ax.legend(loc='upper left', bbox_to_anchor=(1, 1), framealpha=0.5, facecolor='black', edgecolor='white', labelcolor='white')
-    plt.tight_layout()
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png', dpi=100)
-    buf.seek(0)
-    img = Image.open(buf)
-    plt.close(fig)
-    plt.close('all')
-    return img
-
-def pil_to_base64(img):
-    buffered = io.BytesIO()
-    img.save(buffered, format="PNG")
-    return f"data:image/png;base64,{base64.b64encode(buffered.getvalue()).decode()}"
-
-def parse_json_seguro(raw):
-    if not raw or raw.strip() == "":
-        return None
-    try:
-        repaired = json_repair.repair_json(raw)
-        return json.loads(repaired)
-    except:
-        return None
-
-# =================== DETECCIÓN DE PATRONES CON TA-Lib ===================
-def obtener_todos_patrones_talib(df: pd.DataFrame) -> dict:
-    if not TA_LIB_AVAILABLE or df.empty or len(df) < 5:
-        return {}
-    open_ = df['open'].values.astype(float)
-    high = df['high'].values.astype(float)
-    low = df['low'].values.astype(float)
-    close = df['close'].values.astype(float)
-    pattern_names = [
-        'CDL2CROWS', 'CDL3BLACKCROWS', 'CDL3INSIDE', 'CDL3LINESTRIKE', 'CDL3OUTSIDE',
-        'CDL3STARSINSOUTH', 'CDL3WHITESOLDIERS', 'CDLABANDONEDBABY', 'CDLADVANCEBLOCK',
-        'CDLBELTHOLD', 'CDLBREAKAWAY', 'CDLCLOSINGMARUBOZU', 'CDLCONCEALBABYSWALL',
-        'CDLCOUNTERATTACK', 'CDLDARKCLOUDCOVER', 'CDLDOJI', 'CDLDOJISTAR', 'CDLDRAGONFLYDOJI',
-        'CDLENGULFING', 'CDLEVENINGDOJISTAR', 'CDLEVENINGSTAR', 'CDLGAPSIDESIDEWHITE',
-        'CDLGRAVESTONEDOJI', 'CDLHAMMER', 'CDLHANGINGMAN', 'CDLHARAMI', 'CDLHARAMICROSS',
-        'CDLHIGHWAVE', 'CDLHIKKAKE', 'CDLHIKKAKEMOD', 'CDLHOMINGPIGEON', 'CDLIDENTICAL3CROWS',
-        'CDLINNECK', 'CDLINVERTEDHAMMER', 'CDLKICKING', 'CDLKICKINGBYLENGTH', 'CDLLADDERBOTTOM',
-        'CDLLONGLEGGEDDOJI', 'CDLLONGLINE', 'CDLMARUBOZU', 'CDLMATCHINGLOW', 'CDLMATHOLD',
-        'CDLMORNINGDOJISTAR', 'CDLMORNINGSTAR', 'CDLONNECK', 'CDLPIERCING', 'CDLRICKSHAWMAN',
-        'CDLRISEFALL3METHODS', 'CDLSEPARATINGLINES', 'CDLSHOOTINGSTAR', 'CDLSHORTLINE',
-        'CDLSPINNINGTOP', 'CDLSTALLEDPATTERN', 'CDLSTICKSANDWICH', 'CDLTAKURI', 'CDLTASUKIGAP',
-        'CDLTHRUSTING', 'CDLTRISTAR', 'CDLUNIQUE3RIVER', 'CDLUPSIDEGAP2CROWS', 'CDLXSIDEGAP3METHODS'
-    ]
-    resultados = {}
-    for name in pattern_names:
+            print(f"❌ Error eventos próximos: {e}")
+            return []
+    
+    async def get_event_details(self, event_id: str) -> Optional[Dict]:
         try:
-            func = getattr(talib, name, None)
-            if func is None:
-                continue
-            result_array = func(open_, high, low, close)
-            if len(result_array) > 0:
-                signal = result_array[-1]
-                if signal != 0:
-                    resultados[name] = int(signal)
+            loop = asyncio.get_event_loop()
+            event = await loop.run_in_executor(None, self.client.events.get_by_id, event_id)
+            return event.data if event and hasattr(event, "data") else None
         except Exception:
-            continue
-    return resultados
-
-def resumen_patrones_texto(patrones_dict: dict) -> str:
-    if not patrones_dict:
-        return "No se detectaron patrones significativos."
-    bullish = [p for p, s in patrones_dict.items() if s > 0]
-    bearish = [p for p, s in patrones_dict.items() if s < 0]
-    texto = ""
-    if bullish:
-        texto += f"Patrones ALCISTAS: {', '.join(bullish)}.\n"
-    if bearish:
-        texto += f"Patrones BAJISTAS: {', '.join(bearish)}.\n"
-    if not bullish and not bearish:
-        texto = "Patrón neutro o sin patrón claro.\n"
-    return texto
-
-# =================== PROMPT PARA GEMINI (CON CONFIRMACIÓN DE PATRÓN) ===================
-def analizar_con_gemini(img_ltf, img_htf, patrones_ltf_texto, patrones_htf_texto):
-    try:
-        img_ltf_b64 = pil_to_base64(img_ltf)
-        img_htf_b64 = pil_to_base64(img_htf)
-
-        prompt = f"""
-Eres un trader profesional de crypto especializado en scalping con velas de 3 minutos.
-Te muestro gráficos de BTC/USDT: 3m (LTF) y 30m (HTF).
-
-Además, un análisis automático (TA-Lib) ha detectado estos patrones de velas:
-
-🔍 **Patrones en 3m:** {patrones_ltf_texto}
-🔍 **Patrones en 30m:** {patrones_htf_texto}
-
-**Tu tarea:**
-1. Observa los gráficos y confirma VISUALMENTE si los patrones mencionados realmente se están formando (o si hay contradicción).
-2. Evalúa si el precio está cerca de niveles de SOPORTE (para Buy) o RESISTENCIA (para Sell) - distancia <0.3%.
-3. Ten en cuenta la EMA20 y la tendencia general.
-
-**Reglas de decisión:**
-- COMPRAR solo si: (cerca de soporte O patrón alcista confirmado visualmente) Y contexto alcista.
-- VENDER solo si: (cerca de resistencia O patrón bajista confirmado visualmente) Y contexto bajista.
-- Si los patrones automáticos no se corresponden con la realidad (ej: TA-Lib dice Martillo pero tú ves una vela sin forma), indícalo en "razon" y pon "Hold".
-- La confianza debe ser alta (>=70) si hay confluencia de niveles + patrón confirmado; media (40-69) si solo hay niveles; baja (<40) si solo patrón.
-
-Devuelve ÚNICAMENTE un JSON en una línea con:
-{{"decision": "Buy/Sell/Hold", "razon": "explicación breve", "explicacion": "análisis detallado",
-  "entry_price": 0.0, "sl_price": 0.0, "tp1_price": 0.0, "confianza": 0-100,
-  "patron_confirmado": true/false}}
-Si Hold, precios 0.0.
-No añadas texto fuera del JSON.
-"""
-        response = client.chat.completions.create(
-            model=MODELO_VISION,
-            messages=[{"role": "user", "content": [{"type": "text", "text": prompt},
-                                                   {"type": "image_url", "image_url": {"url": img_ltf_b64}},
-                                                   {"type": "image_url", "image_url": {"url": img_htf_b64}}]}],
-            temperature=0.3,
-            timeout=60
-        )
-        contenido = response.choices[0].message.content
-        json_match = re.search(r'\{.*\}(?=\s*$)', contenido, re.DOTALL)
-        datos = parse_json_seguro(json_match.group()) if json_match else parse_json_seguro(contenido)
-        if not datos:
-            return "Hold", "Error parsing", "", None, None, None, 0, False
-
-        return (datos.get("decision", "Hold"), datos.get("razon", ""), datos.get("explicacion", ""),
-                datos.get("entry_price"), datos.get("sl_price"), datos.get("tp1_price"),
-                datos.get("confianza", 0), datos.get("patron_confirmado", False))
-    except Exception as e:
-        logger.error(f"Error en IA: {e}")
-        return "Hold", f"Error: {str(e)[:50]}", "", None, None, None, 0, False
-
-# =================== AJUSTE DE SL Y TP (más holgados) ===================
-def ajustar_sl_tp_para_scalping(decision, entrada, sl_ia, tp1_ia):
-    # SL
-    if sl_ia is None or sl_ia <= 0:
-        distancia_sl = entrada * 0.0025   # 0.25% (más holgado)
-        sl_ajustado = entrada - distancia_sl if decision == "Buy" else entrada + distancia_sl
-    else:
-        if decision == "Buy":
-            distancia_raw = entrada - sl_ia
-        else:
-            distancia_raw = sl_ia - entrada
-        min_sl = entrada * MIN_SL_DIST_PCT   # 0.08%
-        max_sl = entrada * MAX_SL_DIST_PCT   # 0.8%
-        distancia_final = np.clip(distancia_raw, min_sl, max_sl)
-        sl_ajustado = entrada - distancia_final if decision == "Buy" else entrada + distancia_final
-
-    # TP1
-    if tp1_ia is None or tp1_ia <= 0:
-        distancia_tp1 = entrada * 0.004     # 0.4% (antes 0.3%)
-        tp1_ajustado = entrada + distancia_tp1 if decision == "Buy" else entrada - distancia_tp1
-    else:
-        if decision == "Buy":
-            distancia_raw = tp1_ia - entrada
-        else:
-            distancia_raw = entrada - tp1_ia
-        min_tp = entrada * MIN_TP1_DIST_PCT   # 0.3%
-        max_tp = entrada * MAX_TP1_DIST_PCT   # 1.0%
-        distancia_final_tp = np.clip(distancia_raw, min_tp, max_tp)
-        tp1_ajustado = entrada + distancia_final_tp if decision == "Buy" else entrada - distancia_final_tp
-    return sl_ajustado, tp1_ajustado
-
-# =================== GESTIÓN DE RIESGO Y APERTURA ===================
-def calcular_riesgo_dinamico(free_margin):
-    if free_margin >= 20:
-        return RISK_PER_TRADE_MAX
-    elif free_margin >= 10:
-        return 1.5
-    else:
-        return 1.0
-
-def abrir_posicion_con_ia(decision, precio_actual, razon, contexto, sl_ia, tp1_ia, df_ltf, sop, res, slope, inter, patron_confirmado):
-    global paper_balance, paper_positions, paper_trade_counter, REAL_BALANCE, TRADE_COUNTER, REAL_ACTIVE_TRADES, paper_total_trades, TOTAL_TRADES
-
-    if decision not in ["Buy", "Sell"]:
-        logger.info(f"Decisión {decision} no es operativa.")
-        return
-
-    if PAPER_TRADE:
-        balance = paper_balance
-        positions = paper_positions
-        is_paper = True
-    else:
-        if REAL_BALANCE is None:
-            REAL_BALANCE = get_real_balance()
-            if REAL_BALANCE is None:
-                logger.error("No se pudo obtener balance real")
-                return
-        balance = REAL_BALANCE
-        positions = REAL_ACTIVE_TRADES
-        is_paper = False
-
-    max_trades = get_dynamic_max_trades()
-    if len(positions) >= max_trades:
-        logger.warning(f"Máximo dinámico de trades ({max_trades}) alcanzado.")
-        return
-
-    free_margin = get_free_margin()
-    if free_margin <= 0:
-        logger.error("Margen libre insuficiente.")
-        return
-
-    risk_per_trade = calcular_riesgo_dinamico(free_margin)
-    logger.info(f"Riesgo fijado en {risk_per_trade} USDT (margen libre: {free_margin:.2f})")
-
-    entrada = precio_actual
-    sl_ajustado, tp1_ajustado = ajustar_sl_tp_para_scalping(decision, entrada, sl_ia, tp1_ia)
-
-    if decision == "Buy":
-        distancia_final = entrada - sl_ajustado
-    else:
-        distancia_final = sl_ajustado - entrada
-
-    if distancia_final <= 0:
-        logger.error("Distancia SL inválida. Cancelando.")
-        return
-
-    qty_btc = risk_per_trade / distancia_final
-    max_qty = (balance * LEVERAGE) / entrada
-    qty_btc = min(qty_btc, max_qty)
-    if qty_btc < 0.001:
-        logger.warning(f"Cantidad muy pequeña ({qty_btc:.4f} BTC). No se abre.")
-        return
-
-    margen_necesario = (qty_btc * entrada) / LEVERAGE
-    if margen_necesario > free_margin * 0.98:
-        logger.error(f"Margen insuficiente: necesario {margen_necesario:.2f} > libre {free_margin:.2f}")
-        return
-
-    qty_btc = round(qty_btc, 3)
-    nocional = qty_btc * entrada
-    if nocional < 100.0:
-        qty_btc = round(100.0 / entrada, 3)
-        logger.warning(f"Ajustado a nocional mínimo: {qty_btc} BTC")
-        margen_necesario = (qty_btc * entrada) / LEVERAGE
-        if margen_necesario > free_margin:
-            logger.error("Tras ajuste, margen excedido.")
-            return
-
-    if is_paper:
-        order_id = f"paper_{paper_trade_counter+1}"
-        logger.info(f"📄 PAPER: Orden MARKET {decision} {qty_btc} BTC a {entrada:.2f}")
-        comision = nocional * PAPER_COMMISSION_PCT
-        paper_balance -= comision
-        paper_trade_counter += 1
-        trade_id = paper_trade_counter
-        positions[trade_id] = normalizar_trade_activo({
-            "id": trade_id, "decision": decision, "entrada": entrada,
-            "sl_inicial": sl_ajustado, "sl_actual": sl_ajustado, "tp1": tp1_ajustado,
-            "qty_original": qty_btc, "qty_restante": round(qty_btc - qty_btc * TP1_PERCENT, 3),
-            "tp1_ejecutado": False, "pnl_parcial": 0.0, "razon": razon, "order_id": order_id,
-            "breakeven_activado": False, "contexto_pensamiento": contexto,
-            "trailing_activado": False, "best_price": entrada, "trailing_stop": None
-        })
-        modo = "📄 PAPER"
-    else:
-        order_id = place_market_order(decision, qty_btc)
-        if not order_id:
-            logger.error("No se pudo abrir orden real.")
-            return
-        TRADE_COUNTER += 1
-        trade_id = TRADE_COUNTER
-        positions[trade_id] = normalizar_trade_activo({
-            "id": trade_id, "decision": decision, "entrada": entrada,
-            "sl_inicial": sl_ajustado, "sl_actual": sl_ajustado, "tp1": tp1_ajustado,
-            "qty_original": qty_btc, "qty_restante": round(qty_btc - qty_btc * TP1_PERCENT, 3),
-            "tp1_ejecutado": False, "pnl_parcial": 0.0, "razon": razon, "order_id": order_id,
-            "breakeven_activado": False, "contexto_pensamiento": contexto,
-            "trailing_activado": False, "best_price": entrada, "trailing_stop": None
-        })
-        modo = "💰 REAL"
-
-    msg = (f"{modo} [#{trade_id}] {decision} MARKET en {entrada:.2f} | Qty {qty_btc} BTC (riesgo {risk_per_trade} USDT)\n"
-           f"🛑 SL: {sl_ajustado:.2f} (dist {distancia_final:.1f} USD)\n"
-           f"🎯 TP1: {tp1_ajustado:.2f} | Trailing tras TP1: {TRAILING_PERCENT*100:.2f}%\n"
-           f"📝 Razón: {razon}\n"
-           f"💰 Margen requerido: {margen_necesario:.2f} USDT | Libre: {free_margin:.2f} USDT")
-    logger.info(msg)
-    telegram_mensaje(msg)
-
-    titulo_grafico = f"Entrada - {modo} #{trade_id}"
-    img_completa = generar_grafico_para_vision(df_ltf, titulo_grafico, sop, res, slope, inter,
-                                               entry_price=entrada, sl_price=sl_ajustado,
-                                               tp1_price=tp1_ajustado, side=decision, excluir_actual=False)
-    if img_completa:
-        img_completa.save("/tmp/in_completo.png")
-        caption = (f"{modo} #{trade_id} {decision}\nEntry: {entrada:.2f} | SL: {sl_ajustado:.2f} | TP1: {tp1_ajustado:.2f}")
-        telegram_enviar_imagen("/tmp/in_completo.png", caption)
-    guardar_memoria()
-
-def get_dynamic_max_trades():
-    balance = paper_balance if PAPER_TRADE else (REAL_BALANCE if REAL_BALANCE else 1000)
-    max_by_balance = int(balance // MIN_MARGIN_PER_TRADE)
-    return min(MAX_CONCURRENT_TRADES, max(1, max_by_balance))
-
-def sync_active_trades_with_bybit():
-    if PAPER_TRADE:
-        return
-    global REAL_ACTIVE_TRADES
-    real_size = get_real_position_size()
-    if real_size == 0.0 and REAL_ACTIVE_TRADES:
-        logger.info("🔄 Sincronización: No hay posición real. Limpiando trades fantasmas.")
-        REAL_ACTIVE_TRADES.clear()
-        guardar_memoria()
-    elif real_size > 0.0 and not REAL_ACTIVE_TRADES:
-        logger.warning("⚠️ Hay posición real pero el bot no la registra.")
-    else:
-        mem_size = sum(t['qty_restante'] for t in REAL_ACTIVE_TRADES.values())
-        if abs(mem_size - real_size) > 0.002:
-            logger.warning(f"⚠️ Discrepancia: memoria {mem_size:.3f} BTC, real {real_size:.3f} BTC.")
-            if REAL_ACTIVE_TRADES:
-                tid = list(REAL_ACTIVE_TRADES.keys())[0]
-                REAL_ACTIVE_TRADES[tid]['qty_restante'] = real_size
-                for other in list(REAL_ACTIVE_TRADES.keys())[1:]:
-                    del REAL_ACTIVE_TRADES[other]
-                guardar_memoria()
-
-def enviar_reporte_cada_10_trades():
-    global ULTIMO_REPORTE
-    if PAPER_TRADE:
-        total, win, loss, balance, history = paper_total_trades, paper_win_count, paper_loss_count, paper_balance, paper_trade_history
-    else:
-        total, win, loss, balance, history = TOTAL_TRADES, WIN_COUNT, LOSS_COUNT, REAL_BALANCE, TRADE_HISTORY
-    if total - ULTIMO_REPORTE >= 10 and total > 0:
-        ultimos = history[-10:] if len(history) >= 10 else history
-        ganancias = sum(t['pnl'] for t in ultimos if t['pnl'] > 0)
-        perdidas = abs(sum(t['pnl'] for t in ultimos if t['pnl'] < 0))
-        pf = ganancias / perdidas if perdidas > 0 else 0.0
-        winrate_10 = (sum(1 for t in ultimos if t['pnl'] > 0) / len(ultimos)) * 100 if ultimos else 0
-        modo = "📄 PAPER" if PAPER_TRADE else "💰 REAL"
-        msg = (f"{modo} - REPORTE CADA 10 TRADES\n📊 Trades totales: {total}\n"
-               f"🏆 Winrate últimos 10: {winrate_10:.1f}%\n⚖️ Profit Factor últimos 10: {pf:.2f}\n"
-               f"💰 Balance actual: {balance:.2f} USDT\n"
-               f"📈 Winrate global: {(win/(win+loss)*100) if (win+loss)>0 else 0:.1f}%")
-        telegram_mensaje(msg)
-        logger.info(msg)
-        ULTIMO_REPORTE = total
-
-# =================== GESTIÓN DE TRADES ACTIVOS (con trailing mejorado) ===================
-def revisar_sl_tp_simulado(df, precio_actual):
-    global paper_balance, paper_win_count, paper_loss_count, paper_total_trades, paper_trade_history, paper_positions
-    if not paper_positions:
-        return
-    h = df['high'].iloc[-1]
-    l = df['low'].iloc[-1]
-    cerrar_ids = []
-    for tid, t in list(paper_positions.items()):
-        decision = t.get('decision', 'Hold')
-        entrada = t.get('entrada', 0.0)
-        sl_actual = t.get('sl_actual', 0.0)
-        qty_original = t.get('qty_original', 0.0)
-        qty_restante = t.get('qty_restante', 0.0)
-        razon = t.get('razon', '')
-        tp1_ejecutado = t.get('tp1_ejecutado', False)
-        tp1 = t.get('tp1', 0.0)
-        trailing_activado = t.get('trailing_activado', False)
-        best_price = t.get('best_price', entrada)
-        trailing_stop = t.get('trailing_stop')
-
-        # TP1: cierre parcial
-        if not tp1_ejecutado and tp1 > 0:
-            if (decision == "Buy" and h >= tp1) or (decision == "Sell" and l <= tp1):
-                qty_tp1 = round(qty_original * TP1_PERCENT, 3)
-                if qty_tp1 >= 0.001 and qty_restante > 0:
-                    pnl_parcial = (tp1 - entrada) * qty_tp1 if decision == "Buy" else (entrada - tp1) * qty_tp1
-                    comision = abs(pnl_parcial) * PAPER_COMMISSION_PCT
-                    pnl_parcial -= comision
-                    t['pnl_parcial'] = t.get('pnl_parcial', 0.0) + pnl_parcial
-                    t['qty_restante'] = round(qty_original - qty_tp1, 3)
-                    t['tp1_ejecutado'] = True
-                    t['trailing_activado'] = True
-                    t['best_price'] = entrada
-                    # Trailing stop inicial: a 0.25% del precio de entrada
-                    t['trailing_stop'] = entrada * (1 - TRAILING_PERCENT) if decision == "Buy" else entrada * (1 + TRAILING_PERCENT)
-                    logger.info(f"✅ PAPER: TP1 #{tid} +{pnl_parcial:.2f} USDT, trailing activado en {t['trailing_stop']:.2f}")
-                    telegram_mensaje(f"✅ PAPER TP1 #{tid}: +{pnl_parcial:.2f} USDT. Trailing stop activado.")
-                    if t['qty_restante'] <= 0.0001:
-                        cerrar_ids.append(tid)
-                else:
-                    cerrar_ids.append(tid)
-
-        # Trailing stop (solo después de TP1)
-        if t.get('trailing_activado', False) and t['qty_restante'] > 0:
-            if decision == 'Buy':
-                # Actualizar máximo alcanzado
-                if h > best_price:
-                    t['best_price'] = h
-                    t['trailing_stop'] = h * (1 - TRAILING_PERCENT)
-                # Verificar si se tocó el trailing stop
-                if l <= t['trailing_stop']:
-                    qty_cerrar = t['qty_restante']
-                    pnl_resto = (t['trailing_stop'] - entrada) * qty_cerrar
-                    comision = abs(pnl_resto) * PAPER_COMMISSION_PCT
-                    pnl_resto -= comision
-                    pnl_total = t.get('pnl_parcial', 0.0) + pnl_resto
-                    paper_balance += pnl_total
-                    paper_total_trades += 1
-                    if pnl_total > 0:
-                        paper_win_count += 1
-                    else:
-                        paper_loss_count += 1
-                    paper_trade_history.append(convertir_serializable({"pnl": pnl_total, "resultado_win": pnl_total>0, "decision": decision, "razon": razon}))
-                    cerrar_ids.append(tid)
-                    msg = f"📉 PAPER CIERRE #{tid} por Trailing Stop - PnL: {pnl_total:+.2f} USDT"
-                    logger.info(msg)
-                    telegram_mensaje(msg)
-                    reporte_estado()
-                    enviar_reporte_cada_10_trades()
-            else:  # Sell
-                if l < best_price:
-                    t['best_price'] = l
-                    t['trailing_stop'] = l * (1 + TRAILING_PERCENT)
-                if h >= t['trailing_stop']:
-                    qty_cerrar = t['qty_restante']
-                    pnl_resto = (entrada - t['trailing_stop']) * qty_cerrar
-                    comision = abs(pnl_resto) * PAPER_COMMISSION_PCT
-                    pnl_resto -= comision
-                    pnl_total = t.get('pnl_parcial', 0.0) + pnl_resto
-                    paper_balance += pnl_total
-                    paper_total_trades += 1
-                    if pnl_total > 0:
-                        paper_win_count += 1
-                    else:
-                        paper_loss_count += 1
-                    paper_trade_history.append(convertir_serializable({"pnl": pnl_total, "resultado_win": pnl_total>0, "decision": decision, "razon": razon}))
-                    cerrar_ids.append(tid)
-                    msg = f"📉 PAPER CIERRE #{tid} por Trailing Stop - PnL: {pnl_total:+.2f} USDT"
-                    logger.info(msg)
-                    telegram_mensaje(msg)
-                    reporte_estado()
-                    enviar_reporte_cada_10_trades()
-
-        # Stop loss inicial (solo si no se ha activado TP1)
-        if not t.get('tp1_ejecutado', False) and t['qty_restante'] > 0:
-            cond = (decision == "Buy" and l <= sl_actual) or (decision == "Sell" and h >= sl_actual)
-            if cond:
-                qty_cerrar = t['qty_restante']
-                pnl_resto = (sl_actual - entrada) * qty_cerrar if decision == "Buy" else (entrada - sl_actual) * qty_cerrar
-                comision = abs(pnl_resto) * PAPER_COMMISSION_PCT
-                pnl_resto -= comision
-                pnl_total = t.get('pnl_parcial', 0.0) + pnl_resto
-                paper_balance += pnl_total
-                paper_total_trades += 1
-                if pnl_total>0:
-                    paper_win_count+=1
-                else:
-                    paper_loss_count+=1
-                paper_trade_history.append(convertir_serializable({"pnl": pnl_total, "resultado_win": pnl_total>0, "decision": decision, "razon": razon}))
-                cerrar_ids.append(tid)
-                msg = f"🛑 PAPER CIERRE #{tid} por Stop Loss - PnL: {pnl_total:+.2f} USDT"
-                logger.info(msg)
-                telegram_mensaje(msg)
-                reporte_estado()
-                enviar_reporte_cada_10_trades()
-
-    for tid in cerrar_ids:
-        del paper_positions[tid]
-
-def real_revisar_sl_tp(df, precio_actual):
-    global REAL_BALANCE, WIN_COUNT, LOSS_COUNT, TOTAL_TRADES, TRADE_HISTORY, REAL_ACTIVE_TRADES
-    if not REAL_ACTIVE_TRADES:
-        return
-    h = df['high'].iloc[-1]
-    l = df['low'].iloc[-1]
-    cerrar_ids = []
-    for tid, t in list(REAL_ACTIVE_TRADES.items()):
-        decision = t.get('decision', 'Hold')
-        entrada = t.get('entrada', 0.0)
-        sl_actual = t.get('sl_actual', 0.0)
-        qty_original = t.get('qty_original', 0.0)
-        qty_restante = t.get('qty_restante', 0.0)
-        razon = t.get('razon', '')
-        tp1_ejecutado = t.get('tp1_ejecutado', False)
-        tp1 = t.get('tp1', 0.0)
-        trailing_activado = t.get('trailing_activado', False)
-        best_price = t.get('best_price', entrada)
-        # TP1
-        if not tp1_ejecutado and tp1 > 0:
-            if (decision == "Buy" and h >= tp1) or (decision == "Sell" and l <= tp1):
-                qty_tp1 = round(qty_original * TP1_PERCENT, 3)
-                if qty_tp1 >= 0.001 and qty_restante > 0:
-                    result = close_position_qty_confirm(qty_tp1, decision)
-                    if result and result != "already_closed":
-                        pnl_parcial = (tp1 - entrada) * qty_tp1 if decision == "Buy" else (entrada - tp1) * qty_tp1
-                        t['pnl_parcial'] = t.get('pnl_parcial', 0.0) + pnl_parcial
-                        t['qty_restante'] = round(qty_original - qty_tp1, 3)
-                        t['tp1_ejecutado'] = True
-                        t['trailing_activado'] = True
-                        t['best_price'] = entrada
-                        t['trailing_stop'] = entrada * (1 - TRAILING_PERCENT) if decision == "Buy" else entrada * (1 + TRAILING_PERCENT)
-                        logger.info(f"✅ TP1 #{tid} +{pnl_parcial:.2f} USDT, trailing activado")
-                        telegram_mensaje(f"✅ TP1 #{tid}: +{pnl_parcial:.2f} USDT. Trailing activado.")
-                        if t['qty_restante'] <= 0.0001:
-                            cerrar_ids.append(tid)
-                    else:
-                        logger.warning(f"TP1 no confirmado #{tid}")
-                else:
-                    cerrar_ids.append(tid)
-        # Trailing
-        if t.get('trailing_activado', False) and t['qty_restante'] > 0:
-            if decision == 'Buy':
-                if h > best_price:
-                    t['best_price'] = h
-                    t['trailing_stop'] = h * (1 - TRAILING_PERCENT)
-                if l <= t['trailing_stop']:
-                    qty_cerrar = t['qty_restante']
-                    result = close_position_qty_confirm(qty_cerrar, decision)
-                    if result and result != "already_closed":
-                        pnl_resto = (t['trailing_stop'] - entrada) * qty_cerrar
-                        pnl_total = t.get('pnl_parcial', 0.0) + pnl_resto
-                        REAL_BALANCE = get_real_balance()
-                        TOTAL_TRADES += 1
-                        if pnl_total > 0:
-                            WIN_COUNT += 1
-                        else:
-                            LOSS_COUNT += 1
-                        TRADE_HISTORY.append(convertir_serializable({"pnl": pnl_total, "resultado_win": pnl_total>0, "decision": decision, "razon": razon}))
-                        cerrar_ids.append(tid)
-                        msg = f"📉 CIERRE #{tid} por Trailing Stop - PnL: {pnl_total:+.2f} USDT"
-                        logger.info(msg)
-                        telegram_mensaje(msg)
-                        reporte_estado()
-                        enviar_reporte_cada_10_trades()
-                    else:
-                        logger.error(f"Falló cierre por trailing #{tid}")
-            else:
-                if l < best_price:
-                    t['best_price'] = l
-                    t['trailing_stop'] = l * (1 + TRAILING_PERCENT)
-                if h >= t['trailing_stop']:
-                    qty_cerrar = t['qty_restante']
-                    result = close_position_qty_confirm(qty_cerrar, decision)
-                    if result and result != "already_closed":
-                        pnl_resto = (entrada - t['trailing_stop']) * qty_cerrar
-                        pnl_total = t.get('pnl_parcial', 0.0) + pnl_resto
-                        REAL_BALANCE = get_real_balance()
-                        TOTAL_TRADES += 1
-                        if pnl_total > 0:
-                            WIN_COUNT += 1
-                        else:
-                            LOSS_COUNT += 1
-                        TRADE_HISTORY.append(convertir_serializable({"pnl": pnl_total, "resultado_win": pnl_total>0, "decision": decision, "razon": razon}))
-                        cerrar_ids.append(tid)
-                        msg = f"📉 CIERRE #{tid} por Trailing Stop - PnL: {pnl_total:+.2f} USDT"
-                        logger.info(msg)
-                        telegram_mensaje(msg)
-                        reporte_estado()
-                        enviar_reporte_cada_10_trades()
-                    else:
-                        logger.error(f"Falló cierre por trailing #{tid}")
-        # Stop loss inicial
-        if not t.get('tp1_ejecutado', False) and t['qty_restante'] > 0:
-            cond = (decision == "Buy" and l <= sl_actual) or (decision == "Sell" and h >= sl_actual)
-            if cond:
-                qty_cerrar = t['qty_restante']
-                result = close_position_qty_confirm(qty_cerrar, decision)
-                if result and result != "already_closed":
-                    pnl_resto = (sl_actual - entrada) * qty_cerrar if decision == "Buy" else (entrada - sl_actual) * qty_cerrar
-                    pnl_total = t.get('pnl_parcial', 0.0) + pnl_resto
-                    REAL_BALANCE = get_real_balance()
-                    TOTAL_TRADES += 1
-                    if pnl_total > 0:
-                        WIN_COUNT += 1
-                    else:
-                        LOSS_COUNT += 1
-                    TRADE_HISTORY.append(convertir_serializable({"pnl": pnl_total, "resultado_win": pnl_total>0, "decision": decision, "razon": razon}))
-                    cerrar_ids.append(tid)
-                    msg = f"🛑 CIERRE #{tid} por Stop Loss - PnL: {pnl_total:+.2f} USDT"
-                    logger.info(msg)
-                    telegram_mensaje(msg)
-                    reporte_estado()
-                    enviar_reporte_cada_10_trades()
-                else:
-                    logger.error(f"Falló cierre por stop #{tid}")
-    for tid in cerrar_ids:
-        del REAL_ACTIVE_TRADES[tid]
-
-def risk_management_check():
-    global DAILY_START_BALANCE, STOPPED_TODAY, CURRENT_DAY
-    hoy = datetime.now(timezone.utc).date()
-    if CURRENT_DAY != hoy:
-        CURRENT_DAY = hoy
-        balance = paper_balance if PAPER_TRADE else (REAL_BALANCE or get_real_balance())
-        DAILY_START_BALANCE = balance
-        STOPPED_TODAY = False
-        logger.info(f"📅 Nuevo día: {hoy}. Balance inicial: {balance:.2f}")
-    balance_actual = paper_balance if PAPER_TRADE else REAL_BALANCE
-    if balance_actual is not None and DAILY_START_BALANCE is not None:
-        drawdown = (balance_actual - DAILY_START_BALANCE) / DAILY_START_BALANCE
-        if drawdown <= -MAX_DAILY_DRAWDOWN_PCT:
-            STOPPED_TODAY = True
-            logger.warning("⚠️ Drawdown diario superado. Operaciones detenidas.")
-    return not STOPPED_TODAY
-
-# =================== LOOP PRINCIPAL ===================
-def run_bot():
-    global REAL_BALANCE, TRADE_HISTORY, REAL_ACTIVE_TRADES, paper_balance, paper_trade_counter
-    global paper_win_count, paper_loss_count, paper_total_trades, paper_trade_history, paper_positions, ultima_vela
-    global ULTIMO_REPORTE
-
-    cargar_memoria()
-    set_leverage()
-    sync_active_trades_with_bybit()
-
-    if PAPER_TRADE:
-        ULTIMO_REPORTE = paper_total_trades
-    else:
-        ULTIMO_REPORTE = TOTAL_TRADES
-
-    telegram_mensaje("🤖 Bot iniciado - Gemini 3.1 + TA-Lib (SL holgado + trailing 0.25% + confirmación IA)")
-    logger.info("Bot iniciado con mejoras: SL más amplio, trailing 0.25%, IA confirma patrones")
-
-    if PAPER_TRADE:
-        logger.info(f"📄 PAPER TRADE - Saldo: {paper_balance:.2f} USDT")
-        telegram_mensaje(f"📄 Bot Paper Trade Online - Saldo simulado: {paper_balance:.2f} USDT")
-    else:
-        REAL_BALANCE = get_real_balance()
-        if REAL_BALANCE is None:
-            logger.error("No se pudo obtener saldo real. Abortando.")
-            return
-        logger.info(f"💰 BOT REAL - Balance: {REAL_BALANCE:.2f} USDT")
-        telegram_mensaje(f"💰 Bot Real Online - Balance: {REAL_BALANCE:.2f} USDT")
-
-    ultima_vela = None
-    while True:
+            return None
+    
+    async def verify_result(self, event_id: str) -> Optional[Dict]:
         try:
-            guardado_periodico()
-            if int(time.time()) % 300 < 5:
-                logger.info("❤️ Bot heartbeat")
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, self.client.events.get_result, event_id)
+            return result.data if result and hasattr(result, "data") else None
+        except Exception:
+            return None
+    
+    def _filter_relevant(self, events):
+        relevant_leagues = []
+        for sport in Config.SPORTS_LEAGUES:
+            relevant_leagues.extend(self.sports_mapping.get(sport.strip(), []))
+        filtered = []
+        for ev in events:
+            league = ev.get("league") if isinstance(ev, dict) else getattr(ev, "league", "")
+            if league in relevant_leagues:
+                filtered.append(self._normalize(ev))
+        return filtered
+    
+    def _normalize(self, ev):
+        if isinstance(ev, dict):
+            return {
+                "id": ev.get("id"),
+                "sport": ev.get("sport"),
+                "league": ev.get("league"),
+                "home_team": ev.get("home_team"),
+                "away_team": ev.get("away_team"),
+                "start_time": ev.get("start_time"),
+                "status": ev.get("status"),
+                "odds": ev.get("odds", {}),
+                "score": ev.get("score", {})
+            }
+        else:
+            return {
+                "id": getattr(ev, "id", None),
+                "sport": getattr(ev, "sport", None),
+                "league": getattr(ev, "league", None),
+                "home_team": getattr(ev, "home_team", None),
+                "away_team": getattr(ev, "away_team", None),
+                "start_time": getattr(ev, "start_time", None),
+                "status": getattr(ev, "status", None),
+                "odds": getattr(ev, "odds", {}),
+                "score": getattr(ev, "score", {})
+            }
 
-            df_ltf_raw = obtener_velas(INTERVAL_LTF)
-            df_htf_raw = obtener_velas(INTERVAL_HTF)
-            if df_ltf_raw.empty or df_htf_raw.empty:
-                time.sleep(SLEEP_SECONDS)
-                continue
-            df_ltf = calcular_indicadores(df_ltf_raw)
-            df_htf = calcular_indicadores(df_htf_raw)
-            if df_ltf.empty or df_htf.empty:
-                time.sleep(SLEEP_SECONDS)
-                continue
-
-            precio_actual = df_ltf['close'].iloc[-1]
-            if not PAPER_TRADE:
-                REAL_BALANCE = get_real_balance()
-            max_trades_actual = get_dynamic_max_trades()
-            active_count = len(paper_positions) if PAPER_TRADE else len(REAL_ACTIVE_TRADES)
-
-            vela_actual_time = df_ltf.index[-1]
-            es_vela_nueva = (ultima_vela is None) or (ultima_vela != vela_actual_time)
-
-            if es_vela_nueva and active_count < max_trades_actual and risk_management_check():
-                sop_ltf, res_ltf, slope_ltf, inter_ltf, _, _ = detectar_zonas_mercado(df_ltf)
-                sop_htf, res_htf, slope_htf, inter_htf, _, _ = detectar_zonas_mercado(df_htf)
-
-                # Patrones TA-Lib
-                patrones_ltf = obtener_todos_patrones_talib(df_ltf)
-                patrones_htf = obtener_todos_patrones_talib(df_htf)
-                patrones_ltf_texto = resumen_patrones_texto(patrones_ltf)
-                patrones_htf_texto = resumen_patrones_texto(patrones_htf)
-                if patrones_ltf:
-                    logger.info(f"📊 Patrones LTF: {patrones_ltf_texto[:200]}")
-                if patrones_htf:
-                    logger.info(f"📊 Patrones HTF: {patrones_htf_texto[:200]}")
-
-                img_ltf = generar_grafico_para_vision(df_ltf, "BTC/USDT 3m (LTF)", sop_ltf, res_ltf, slope_ltf, inter_ltf, excluir_actual=True)
-                img_htf = generar_grafico_para_vision(df_htf, "BTC/USDT 30m (HTF)", sop_htf, res_htf, slope_htf, inter_htf, excluir_actual=True)
-
-                if img_ltf and img_htf:
-                    dec, raz, explicacion, entry_ia, sl_ia, tp1_ia, conf, patron_confirmado = analizar_con_gemini(
-                        img_ltf, img_htf, patrones_ltf_texto, patrones_htf_texto
-                    )
-                    logger.info(f"🧠 Decisión IA: {dec} - Confianza: {conf} - Patrón confirmado: {patron_confirmado} - Razón: {raz}")
-
-                    # Filtro por niveles (soporte/resistencia) con umbral 0.25%
-                    if dec != "Hold":
-                        sop_ltf_actual, res_ltf_actual, _, _, _, _ = detectar_zonas_mercado(df_ltf, idx=-1)
-                        sop_htf_actual, res_htf_actual, _, _, _, _ = detectar_zonas_mercado(df_htf, idx=-1)
-                        umbral_distancia = 0.0025
-                        nivel_cerca = False
-                        if dec == "Buy":
-                            if (sop_ltf_actual and abs(precio_actual - sop_ltf_actual) / precio_actual < umbral_distancia) or \
-                               (sop_htf_actual and abs(precio_actual - sop_htf_actual) / precio_actual < umbral_distancia):
-                                nivel_cerca = True
-                        elif dec == "Sell":
-                            if (res_ltf_actual and abs(res_ltf_actual - precio_actual) / precio_actual < umbral_distancia) or \
-                               (res_htf_actual and abs(res_htf_actual - precio_actual) / precio_actual < umbral_distancia):
-                                nivel_cerca = True
-                        if not nivel_cerca and not patron_confirmado:
-                            logger.warning(f"🚫 Señal {dec} rechazada: sin nivel cercano ni patrón confirmado.")
-                            telegram_mensaje(f"🚫 {dec} rechazado: no hay soporte/resistencia cercano ni patrón confirmado")
-                            dec = "Hold"
-                        elif not nivel_cerca and patron_confirmado:
-                            logger.info(f"⚠️ Señal {dec} sin nivel cercano pero con patrón confirmado. Confianza reducida.")
-                            conf = max(conf - 15, 0)
-                            if conf < 25:
-                                logger.warning(f"🚫 Señal {dec} anulada por baja confianza tras falta de nivel.")
-                                dec = "Hold"
-
-                    # Segundo filtro: consistencia con TA-Lib (si la IA no confirmó patrón pero TA-Lib sí, penalizar)
-                    if dec != "Hold":
-                        talib_coincide = False
-                        if dec == "Buy":
-                            if any(v > 0 for v in patrones_ltf.values()) or any(v > 0 for v in patrones_htf.values()):
-                                talib_coincide = True
-                        elif dec == "Sell":
-                            if any(v < 0 for v in patrones_ltf.values()) or any(v < 0 for v in patrones_htf.values()):
-                                talib_coincide = True
-                        if talib_coincide and not patron_confirmado:
-                            # La IA no ve el patrón que TA-Lib detectó → desconfiar
-                            logger.warning(f"⚠️ TA-Lib detectó patrón pero IA no lo confirma. Confianza reducida.")
-                            conf = max(conf - 20, 0)
-                            if conf < 20:
-                                logger.warning(f"🚫 Señal {dec} anulada por discrepancia IA-TA-Lib.")
-                                dec = "Hold"
-
-                    if dec != "Hold":
-                        if conf >= 25:   # Umbral más bajo para permitir más operaciones
-                            abrir_posicion_con_ia(dec, precio_actual, raz, explicacion, sl_ia, tp1_ia,
-                                                  df_ltf, sop_ltf, res_ltf, slope_ltf, inter_ltf, patron_confirmado)
-                        else:
-                            logger.warning(f"🚫 Señal {dec} rechazada: confianza baja ({conf})")
-                            telegram_mensaje(f"🚫 Señal {dec} rechazada: confianza baja ({conf})")
-                    else:
-                        logger.info(f"IA decidió HOLD. Motivo: {raz[:100]}")
-                else:
-                    logger.error("No se pudieron generar los gráficos")
-
-                ultima_vela = vela_actual_time
-
-            # Gestión de trades activos
-            if PAPER_TRADE and paper_positions:
-                revisar_sl_tp_simulado(df_ltf, precio_actual)
-            elif not PAPER_TRADE and REAL_ACTIVE_TRADES:
-                real_revisar_sl_tp(df_ltf, precio_actual)
-
-            time.sleep(SLEEP_SECONDS)
+# ==================== ANALIZADOR IA (OpenRouter + NVIDIA) ====================
+class AIAnalyzer:
+    def __init__(self):
+        self.client = AsyncOpenAI(
+            base_url=Config.OPENROUTER_BASE_URL,
+            api_key=Config.OPENROUTER_API_KEY,
+            timeout=30
+        )
+        self.model = Config.AI_MODEL
+        self.threshold = Config.CONFIDENCE_THRESHOLD
+        self.headers = {"HTTP-Referer": Config.OPENROUTER_SITE_URL, "X-Title": Config.OPENROUTER_SITE_NAME}
+    
+    async def analyze(self, event: Dict) -> Optional[Dict]:
+        prompt = self._build_prompt(event)
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "Eres un analista deportivo. Responde SOLO con JSON válido, sin texto adicional."},
+                    {"role": "user", "content": prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.3,
+                max_tokens=4000,
+                extra_headers=self.headers
+            )
+            text = response.choices[0].message.content
+            pred = self._parse(text, event)
+            print(f"📊 Tokens: prompt={response.usage.prompt_tokens}, completion={response.usage.completion_tokens}")
+            return pred
         except Exception as e:
-            logger.error(f"ERROR CRÍTICO: {e}")
-            import traceback
-            traceback.print_exc()
-            time.sleep(30)
+            print(f"❌ Error IA: {e}")
+            return None
+    
+    async def rank(self, predictions: List[Dict]) -> List[Dict]:
+        valid = [p for p in predictions if p and p.get("confidence", 0) >= self.threshold]
+        return sorted(valid, key=lambda x: x.get("confidence", 0), reverse=True)[:Config.MAX_PREDICTIONS]
+    
+    def _build_prompt(self, event: Dict) -> str:
+        home = event.get("home_team", "Local")
+        away = event.get("away_team", "Visitante")
+        league = event.get("league", "Desconocida")
+        sport = event.get("sport", "Deporte")
+        odds = event.get("odds", {})
+        return f"""
+Analiza este evento deportivo y genera predicciones detalladas en JSON.
 
-if __name__ == '__main__':
-    run_bot()
+DEPORTE: {sport}
+LIGA: {league}
+PARTIDO: {home} vs {away}
+
+CUOTAS:
+- Local: {odds.get('home_win', 'N/A')}
+- Empate: {odds.get('draw', 'N/A')}
+- Visitante: {odds.get('away_win', 'N/A')}
+
+INSTRUCCIONES:
+1. Usa tu conocimiento para estimar todas las métricas.
+2. Para fútbol: goles, corners, tarjetas, faltas.
+3. Da un análisis narrativo corto.
+4. Confianza global (0-1) según calidad de datos.
+
+RESPUESTE JSON EXACTO:
+{{
+    "event_id": "{event.get('id')}",
+    "home_team": "{home}",
+    "away_team": "{away}",
+    "sport": "{sport}",
+    "league": "{league}",
+    "status": "{event.get('status', 'upcoming')}",
+    "predictions": {{
+        "winner_probability": {{"home_win": 0.0, "draw": 0.0, "away_win": 0.0}},
+        "goals": {{"total_goals": 0.0, "home_goals": 0.0, "away_goals": 0.0, "over_under_line": 2.5, "over_probability": 0.0}},
+        "corners": {{"total_corners": 0, "home_corners": 0, "away_corners": 0}},
+        "cards": {{"total_cards": 0, "yellow_cards": 0, "red_cards": 0}},
+        "fouls": {{"total_fouls": 0}},
+        "recommended_bet": {{"type": "winner", "selection": "home", "value": ""}},
+        "confidence_breakdown": {{"data_quality": 0.0, "market_consistency": 0.0, "historical_accuracy": 0.0, "overall_confidence": 0.0}}
+    }},
+    "analysis_summary": {{
+        "key_factors": ["factor1", "factor2"],
+        "match_narrative": "Breve análisis en español",
+        "value_opportunity": "Mejor apuesta según cuotas"
+    }}
+}}"""
+
+    def _parse(self, text: str, original: Dict) -> Optional[Dict]:
+        try:
+            cleaned = text.strip()
+            if cleaned.startswith("```json"):
+                cleaned = cleaned[7:]
+            if cleaned.startswith("```"):
+                cleaned = cleaned[3:]
+            if cleaned.endswith("```"):
+                cleaned = cleaned[:-3]
+            data = json.loads(cleaned)
+            if "predictions" not in data:
+                raise ValueError
+            conf = data.get("predictions", {}).get("confidence_breakdown", {}).get("overall_confidence", 0.65)
+            data["confidence"] = conf
+            data["timestamp"] = datetime.now().isoformat()
+            return data
+        except:
+            return None
+
+# ==================== BOT DE TELEGRAM ====================
+class TelegramBot:
+    def __init__(self):
+        self.bot = Bot(token=Config.TELEGRAM_BOT_TOKEN)
+        self.chat_id = Config.TELEGRAM_CHAT_ID
+        self.app = None
+    
+    async def init(self):
+        self.app = Application.builder().token(Config.TELEGRAM_BOT_TOKEN).build()
+        self.app.add_handler(CommandHandler("start", self._start))
+        self.app.add_handler(CommandHandler("status", self._status))
+        await self.app.initialize()
+        await self.app.start()
+        await self.app.updater.start_polling()
+        print("✅ Telegram bot listo")
+    
+    async def _start(self, update, context):
+        await update.message.reply_text(
+            "🤖 *Bot de Predicciones IA*\n\nAnalizo partidos con NVIDIA AI y te envío las mejores predicciones.\nUsa /status para ver configuración.",
+            parse_mode="Markdown"
+        )
+    
+    async def _status(self, update, context):
+        msg = f"""
+⚙️ *Estado*
+- Modelo: `{Config.AI_MODEL}`
+- Confianza mínima: {Config.CONFIDENCE_THRESHOLD*100}%
+- Máx predicciones: {Config.MAX_PREDICTIONS}
+- Deportes: {', '.join(Config.SPORTS_LEAGUES)}
+        """
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    
+    async def send_predictions(self, predictions: List[Dict]):
+        if not predictions:
+            await self._send("⚠️ No hay predicciones con suficiente confianza ahora.")
+            return
+        await self._send("🎯 *PREDICCIONES DEPORTIVAS IA*\n━━━━━━━━━━━━━━━━━━━━━━━")
+        for i, p in enumerate(predictions, 1):
+            msg = self._format(p, i)
+            await self._send(msg)
+    
+    async def send_verification(self, event_id, predicted, actual):
+        correct = self._check(predicted, actual)
+        emoji = "✅" if correct else "❌"
+        txt = f"📋 *VERIFICACIÓN* {emoji}\nEvento: `{event_id}`\nResultado: {'ACERTADA' if correct else 'FALLIDA'}"
+        await self._send(txt)
+    
+    def _format(self, p: Dict, idx: int) -> str:
+        preds = p.get("predictions", {})
+        home = p.get("home_team", "Local")
+        away = p.get("away_team", "Visitante")
+        sport = p.get("sport", "Deporte")
+        league = p.get("league", "")
+        conf = p.get("confidence", 0)
+        conf_emoji = "🟢" if conf>=0.8 else "🟡" if conf>=0.7 else "🟠" if conf>=0.6 else "🔴"
+        
+        wp = preds.get("winner_probability", {})
+        goals = preds.get("goals", {})
+        corners = preds.get("corners", {})
+        cards = preds.get("cards", {})
+        fouls = preds.get("fouls", {})
+        narrative = p.get("analysis_summary", {}).get("match_narrative", "")
+        value = p.get("analysis_summary", {}).get("value_opportunity", "")
+        
+        sport_emoji = {"football":"⚽","tennis":"🎾","basketball":"🏀","baseball":"⚾"}.get(sport.lower(), "🏆")
+        
+        msg = f"""
+🎲 *Predicción #{idx}* | {sport_emoji} {sport.upper()}
+━━━━━━━━━━━━━━━━━━━━━━━
+*Partido:* {home} vs {away}
+*Liga:* {league}
+*Confianza:* {conf_emoji} {conf*100:.1f}%
+
+📊 *PROBABILIDADES*
+• 🏠 {home}: {wp.get('home_win',0)*100:.1f}%
+• ⚖️ Empate: {wp.get('draw',0)*100:.1f}%
+• ✈️ {away}: {wp.get('away_win',0)*100:.1f}%
+
+⚽ *GOLES*
+Total: {goals.get('total_goals',0):.1f} | {home}: {goals.get('home_goals',0):.1f} | {away}: {goals.get('away_goals',0):.1f}
+Over {goals.get('over_under_line',2.5)}: {goals.get('over_probability',0)*100:.0f}%
+
+🚩 *CÓRNERS*: {corners.get('total_corners',0)} ({home}:{corners.get('home_corners',0)} / {away}:{corners.get('away_corners',0)})
+🟨 *TARJETAS*: {cards.get('total_cards',0)} (A:{cards.get('yellow_cards',0)} R:{cards.get('red_cards',0)})
+💥 *FALTAS*: {fouls.get('total_fouls',0)}
+
+💡 *ANÁLISIS*
+{narrative[:300]}
+
+🎯 *Valor:* {value if value else "No especificado"}
+━━━━━━━━━━━━━━━━━━━━━━━
+"""
+        return msg
+    
+    async def _send(self, text):
+        max_len = 4096
+        if len(text) <= max_len:
+            await self.bot.send_message(chat_id=self.chat_id, text=text, parse_mode="Markdown")
+        else:
+            for i in range(0, len(text), max_len):
+                await self.bot.send_message(chat_id=self.chat_id, text=text[i:i+max_len], parse_mode="Markdown")
+                await asyncio.sleep(0.5)
+    
+    def _check(self, predicted, actual):
+        bet = predicted.get("predictions", {}).get("recommended_bet", {})
+        bet_type = bet.get("type", "")
+        bet_sel = bet.get("selection", "")
+        actual_res = actual.get("result", "").lower()
+        if bet_type == "winner":
+            if bet_sel == "home" and "home" in actual_res: return True
+            if bet_sel == "away" and "away" in actual_res: return True
+            if bet_sel == "draw" and "draw" in actual_res: return True
+        return False
+    
+    async def shutdown(self):
+        if self.app:
+            await self.app.updater.stop()
+            await self.app.stop()
+            await self.app.shutdown()
+
+# ==================== VERIFICADOR DE RESULTADOS ====================
+class Verifier:
+    def __init__(self, api_client: OddsClient, telegram_bot: TelegramBot):
+        self.api = api_client
+        self.bot = telegram_bot
+        self.pending = {}
+    
+    def register(self, event_id: str, prediction: Dict):
+        if event_id not in self.pending:
+            self.pending[event_id] = {"prediction": prediction, "status": "pending"}
+            print(f"📝 Registrada predicción para {event_id}")
+    
+    async def check_pending(self):
+        to_remove = []
+        for eid, data in self.pending.items():
+            if data["status"] != "pending":
+                to_remove.append(eid)
+                continue
+            result = await self.api.verify_result(eid)
+            if result and result.get("status") == "finished":
+                await self.bot.send_verification(eid, data["prediction"], result)
+                data["status"] = "verified"
+                to_remove.append(eid)
+        for eid in to_remove:
+            del self.pending[eid]
+    
+    async def run_loop(self, interval=3600):
+        while True:
+            await self.check_pending()
+            await asyncio.sleep(interval)
+
+# ==================== BOT PRINCIPAL ====================
+class PredictionBot:
+    def __init__(self):
+        self.running = True
+        self.api_client = OddsClient()
+        self.ai = AIAnalyzer()
+        self.telegram = TelegramBot()
+        self.verifier = Verifier(self.api_client, self.telegram)
+    
+    async def start(self):
+        Config.validate()
+        print("🚀 Iniciando bot en Railway...")
+        await self.telegram.init()
+        signal.signal(signal.SIGINT, self._stop)
+        signal.signal(signal.SIGTERM, self._stop)
+        await asyncio.gather(self._analysis_loop(), self.verifier.run_loop())
+    
+    async def _analysis_loop(self):
+        while self.running:
+            try:
+                print(f"\n📊 [{datetime.now()}] Analizando eventos...")
+                live = await self.api_client.get_live_events()
+                upcoming = await self.api_client.get_upcoming_events()
+                all_events = live + upcoming
+                print(f"📡 Eventos: {len(all_events)} (vivos:{len(live)}, próximos:{len(upcoming)})")
+                
+                if not all_events:
+                    await asyncio.sleep(60)
+                    continue
+                
+                predictions = []
+                for ev in all_events[:20]:
+                    print(f"🤖 Analizando {ev.get('home_team')} vs {ev.get('away_team')}")
+                    pred = await self.ai.analyze(ev)
+                    if pred:
+                        predictions.append(pred)
+                    await asyncio.sleep(2)
+                
+                ranked = await self.ai.rank(predictions)
+                print(f"🏆 Mejores: {len(ranked)}")
+                for p in ranked:
+                    self.verifier.register(p.get("event_id"), p)
+                await self.telegram.send_predictions(ranked)
+                
+                wait = Config.ANALYSIS_INTERVAL_SECONDS
+                if live:
+                    wait = min(wait, 1800)
+                print(f"⏳ Esperando {wait//60} minutos...")
+                await asyncio.sleep(wait)
+            except Exception as e:
+                print(f"❌ Error en análisis: {e}")
+                await asyncio.sleep(60)
+    
+    def _stop(self, *args):
+        print("🛑 Deteniendo bot...")
+        self.running = False
+        asyncio.create_task(self.telegram.shutdown())
+        sys.exit(0)
+
+async def main():
+    bot = PredictionBot()
+    await bot.start()
+
+if __name__ == "__main__":
+    asyncio.run(main())
