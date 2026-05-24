@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-"""
-Bot de predicciones deportivas con IA (NVIDIA vía OpenRouter)
-Sin dependencias externas problemáticas. Usa aiohttp para llamar a la API de cuotas.
-"""
-
 import asyncio
 import json
 import os
@@ -13,31 +8,27 @@ from datetime import datetime
 from typing import Dict, Any, List, Optional
 
 import aiohttp
-from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from telegram import Bot
 from telegram.ext import Application, CommandHandler
 
-# ==================== CONFIGURACIÓN ====================
-load_dotenv()
-
+# ==================== CONFIGURACIÓN (solo variables de entorno) ====================
 class Config:
-    SPORTS_ODDS_API_KEY = os.getenv("SPORTS_ODDS_API_KEY_HEADER")
-    OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-    TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+    SPORTS_ODDS_API_KEY = os.environ.get("SPORTS_ODDS_API_KEY_HEADER")
+    OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+    TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+    TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
     
     AI_MODEL = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
-    MAX_PREDICTIONS = int(os.getenv("MAX_PREDICTIONS", "10"))
-    CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.65"))
-    ANALYSIS_INTERVAL_SECONDS = int(os.getenv("ANALYSIS_INTERVAL_SECONDS", "3600"))
-    SPORTS_LEAGUES = os.getenv("SPORTS_LEAGUES", "football,tennis,basketball,baseball").split(",")
+    MAX_PREDICTIONS = int(os.environ.get("MAX_PREDICTIONS", "10"))
+    CONFIDENCE_THRESHOLD = float(os.environ.get("CONFIDENCE_THRESHOLD", "0.65"))
+    ANALYSIS_INTERVAL_SECONDS = int(os.environ.get("ANALYSIS_INTERVAL_SECONDS", "3600"))
+    SPORTS_LEAGUES = os.environ.get("SPORTS_LEAGUES", "football,tennis,basketball,baseball").split(",")
     
     OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-    OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "https://railway.app")
-    OPENROUTER_SITE_NAME = os.getenv("OPENROUTER_SITE_NAME", "Sports Prediction Bot")
+    OPENROUTER_SITE_URL = os.environ.get("OPENROUTER_SITE_URL", "https://railway.app")
+    OPENROUTER_SITE_NAME = os.environ.get("OPENROUTER_SITE_NAME", "Sports Prediction Bot")
     
-    # Mapeo de deportes a ligas (para filtrar)
     SPORTS_MAPPING = {
         "football": ["NFL","NCAAF","EPL","UCL","LaLiga","SerieA","Bundesliga","LigaMX","MLS"],
         "tennis": ["ATP","WTA"],
@@ -47,14 +38,23 @@ class Config:
     
     @classmethod
     def validate(cls):
-        required = [cls.SPORTS_ODDS_API_KEY, cls.OPENROUTER_API_KEY, cls.TELEGRAM_BOT_TOKEN, cls.TELEGRAM_CHAT_ID]
-        if not all(required):
-            raise ValueError("Faltan variables de entorno. Revisa .env o Railway Variables.")
+        missing = []
+        if not cls.SPORTS_ODDS_API_KEY:
+            missing.append("SPORTS_ODDS_API_KEY_HEADER")
+        if not cls.OPENROUTER_API_KEY:
+            missing.append("OPENROUTER_API_KEY")
+        if not cls.TELEGRAM_BOT_TOKEN:
+            missing.append("TELEGRAM_BOT_TOKEN")
+        if not cls.TELEGRAM_CHAT_ID:
+            missing.append("TELEGRAM_CHAT_ID")
+        if missing:
+            raise ValueError(f"Faltan variables de entorno: {', '.join(missing)}. Verifica en Railway las variables.")
+        return True
 
-# ==================== CLIENTE API DE CUOTAS (aiohttp) ====================
+# ==================== CLIENTE API DE CUOTAS ====================
 class OddsAPIClient:
     def __init__(self):
-        self.base_url = "https://api.sportsgameodds.com/v1"  # URL real (ajusta si es diferente)
+        self.base_url = "https://api.sportsgameodds.com/v1"  # <-- CAMBIA A LA URL REAL
         self.api_key = Config.SPORTS_ODDS_API_KEY
         self.headers = {"x-api-key": self.api_key, "Content-Type": "application/json"}
         self.relevant_leagues = []
@@ -69,10 +69,10 @@ class OddsAPIClient:
                         data = await resp.json()
                         return data.get("data", []) if isinstance(data, dict) else data
                     else:
-                        print(f"⚠️ Error API {resp.status}: {await resp.text()}")
+                        print(f"⚠️ API error {resp.status}: {await resp.text()}")
                         return []
             except Exception as e:
-                print(f"❌ Error conexión: {e}")
+                print(f"❌ API connection error: {e}")
                 return []
     
     async def get_live_events(self) -> List[Dict]:
@@ -88,16 +88,10 @@ class OddsAPIClient:
         return data[0] if data else None
     
     async def verify_result(self, event_id: str) -> Optional[Dict]:
-        # Endpoint hipotético, puede variar. Si no funciona, simplemente no verificará.
         return await self._get(f"events/{event_id}/result")
     
     def _filter_relevant(self, events: List[Dict]) -> List[Dict]:
-        filtered = []
-        for ev in events:
-            league = ev.get("league", "")
-            if league in self.relevant_leagues:
-                filtered.append(self._normalize(ev))
-        return filtered
+        return [self._normalize(ev) for ev in events if ev.get("league") in self.relevant_leagues]
     
     def _normalize(self, ev: Dict) -> Dict:
         return {
@@ -112,7 +106,7 @@ class OddsAPIClient:
             "score": ev.get("score", {})
         }
 
-# ==================== ANALIZADOR IA (OpenRouter + NVIDIA) ====================
+# ==================== ANALIZADOR IA ====================
 class AIAnalyzer:
     def __init__(self):
         self.client = AsyncOpenAI(
@@ -130,7 +124,7 @@ class AIAnalyzer:
             response = await self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": "Eres un analista deportivo. Responde SOLO con JSON válido, sin texto adicional."},
+                    {"role": "system", "content": "Eres analista deportivo. Responde SOLO con JSON válido."},
                     {"role": "user", "content": prompt}
                 ],
                 response_format={"type": "json_object"},
@@ -138,10 +132,7 @@ class AIAnalyzer:
                 max_tokens=4000,
                 extra_headers=self.headers
             )
-            text = response.choices[0].message.content
-            pred = self._parse(text, event)
-            print(f"📊 Tokens: prompt={response.usage.prompt_tokens}, completion={response.usage.completion_tokens}")
-            return pred
+            return self._parse(response.choices[0].message.content, event)
         except Exception as e:
             print(f"❌ Error IA: {e}")
             return None
@@ -162,19 +153,9 @@ Analiza este evento deportivo y genera predicciones detalladas en JSON.
 DEPORTE: {sport}
 LIGA: {league}
 PARTIDO: {home} vs {away}
+CUOTAS: Local {odds.get('home_win','N/A')} Empate {odds.get('draw','N/A')} Visitante {odds.get('away_win','N/A')}
 
-CUOTAS:
-- Local: {odds.get('home_win', 'N/A')}
-- Empate: {odds.get('draw', 'N/A')}
-- Visitante: {odds.get('away_win', 'N/A')}
-
-INSTRUCCIONES:
-1. Usa tu conocimiento para estimar todas las métricas.
-2. Para fútbol: goles, corners, tarjetas, faltas.
-3. Da un análisis narrativo corto.
-4. Confianza global (0-1) según calidad de datos.
-
-RESPUESTA JSON EXACTA:
+RESPUESTA JSON:
 {{
     "event_id": "{event.get('id')}",
     "home_team": "{home}",
@@ -193,11 +174,11 @@ RESPUESTA JSON EXACTA:
     }},
     "analysis_summary": {{
         "key_factors": ["factor1", "factor2"],
-        "match_narrative": "Breve análisis en español",
-        "value_opportunity": "Mejor apuesta según cuotas"
+        "match_narrative": "breve análisis en español",
+        "value_opportunity": "mejor apuesta"
     }}
 }}"""
-
+    
     def _parse(self, text: str, original: Dict) -> Optional[Dict]:
         try:
             cleaned = text.strip()
@@ -208,16 +189,13 @@ RESPUESTA JSON EXACTA:
             if cleaned.endswith("```"):
                 cleaned = cleaned[:-3]
             data = json.loads(cleaned)
-            if "predictions" not in data:
-                raise ValueError
             conf = data.get("predictions", {}).get("confidence_breakdown", {}).get("overall_confidence", 0.65)
             data["confidence"] = conf
-            data["timestamp"] = datetime.now().isoformat()
             return data
         except:
             return None
 
-# ==================== BOT DE TELEGRAM ====================
+# ==================== TELEGRAM BOT ====================
 class TelegramBot:
     def __init__(self):
         self.bot = Bot(token=Config.TELEGRAM_BOT_TOKEN)
@@ -231,105 +209,43 @@ class TelegramBot:
         await self.app.initialize()
         await self.app.start()
         await self.app.updater.start_polling()
-        print("✅ Telegram bot listo")
+        print("✅ Telegram bot ready")
     
     async def _start(self, update, context):
-        await update.message.reply_text(
-            "🤖 *Bot de Predicciones IA*\n\nAnalizo partidos con NVIDIA AI y te envío las mejores predicciones.\nUsa /status para ver configuración.",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text("🤖 Bot de predicciones activo. Usa /status", parse_mode="Markdown")
     
     async def _status(self, update, context):
-        msg = f"""
-⚙️ *Estado*
-- Modelo: `{Config.AI_MODEL}`
-- Confianza mínima: {Config.CONFIDENCE_THRESHOLD*100}%
-- Máx predicciones: {Config.MAX_PREDICTIONS}
-- Deportes: {', '.join(Config.SPORTS_LEAGUES)}
-        """
+        msg = f"Modelo: {Config.AI_MODEL}\nConfianza mínima: {Config.CONFIDENCE_THRESHOLD*100}%"
         await update.message.reply_text(msg, parse_mode="Markdown")
     
     async def send_predictions(self, predictions: List[Dict]):
         if not predictions:
-            await self._send("⚠️ No hay predicciones con suficiente confianza ahora.")
+            await self._send("⚠️ Sin predicciones ahora.")
             return
-        await self._send("🎯 *PREDICCIONES DEPORTIVAS IA*\n━━━━━━━━━━━━━━━━━━━━━━━")
-        for i, p in enumerate(predictions, 1):
+        await self._send("🎯 PREDICCIONES")
+        for i, p in enumerate(predictions[:5], 1):
             msg = self._format(p, i)
             await self._send(msg)
     
-    async def send_verification(self, event_id, predicted, actual):
-        correct = self._check(predicted, actual)
-        emoji = "✅" if correct else "❌"
-        txt = f"📋 *VERIFICACIÓN* {emoji}\nEvento: `{event_id}`\nResultado: {'ACERTADA' if correct else 'FALLIDA'}"
-        await self._send(txt)
-    
-    def _format(self, p: Dict, idx: int) -> str:
+    def _format(self, p, idx):
         preds = p.get("predictions", {})
-        home = p.get("home_team", "Local")
-        away = p.get("away_team", "Visitante")
-        sport = p.get("sport", "Deporte")
-        league = p.get("league", "")
-        conf = p.get("confidence", 0)
-        conf_emoji = "🟢" if conf>=0.8 else "🟡" if conf>=0.7 else "🟠" if conf>=0.6 else "🔴"
-        
-        wp = preds.get("winner_probability", {})
-        goals = preds.get("goals", {})
-        corners = preds.get("corners", {})
-        cards = preds.get("cards", {})
-        fouls = preds.get("fouls", {})
-        narrative = p.get("analysis_summary", {}).get("match_narrative", "")
-        value = p.get("analysis_summary", {}).get("value_opportunity", "")
-        
-        sport_emoji = {"football":"⚽","tennis":"🎾","basketball":"🏀","baseball":"⚾"}.get(sport.lower(), "🏆")
-        
-        msg = f"""
-🎲 *Predicción #{idx}* | {sport_emoji} {sport.upper()}
-━━━━━━━━━━━━━━━━━━━━━━━
-*Partido:* {home} vs {away}
-*Liga:* {league}
-*Confianza:* {conf_emoji} {conf*100:.1f}%
-
-📊 *PROBABILIDADES*
-• 🏠 {home}: {wp.get('home_win',0)*100:.1f}%
-• ⚖️ Empate: {wp.get('draw',0)*100:.1f}%
-• ✈️ {away}: {wp.get('away_win',0)*100:.1f}%
-
-⚽ *GOLES*
-Total: {goals.get('total_goals',0):.1f} | {home}: {goals.get('home_goals',0):.1f} | {away}: {goals.get('away_goals',0):.1f}
-Over {goals.get('over_under_line',2.5)}: {goals.get('over_probability',0)*100:.0f}%
-
-🚩 *CÓRNERS*: {corners.get('total_corners',0)} ({home}:{corners.get('home_corners',0)} / {away}:{corners.get('away_corners',0)})
-🟨 *TARJETAS*: {cards.get('total_cards',0)} (A:{cards.get('yellow_cards',0)} R:{cards.get('red_cards',0)})
-💥 *FALTAS*: {fouls.get('total_fouls',0)}
-
-💡 *ANÁLISIS*
-{narrative[:300]}
-
-🎯 *Valor:* {value if value else "No especificado"}
-━━━━━━━━━━━━━━━━━━━━━━━
+        home = p.get("home_team","Local")
+        away = p.get("away_team","Visitante")
+        wp = preds.get("winner_probability",{})
+        g = preds.get("goals",{})
+        c = preds.get("corners",{})
+        ca = preds.get("cards",{})
+        f = preds.get("fouls",{})
+        nar = p.get("analysis_summary",{}).get("match_narrative","")
+        return f"""
+*#{idx}* {home} vs {away}
+🏠 {wp.get('home_win',0)*100:.0f}% | ⚖️ {wp.get('draw',0)*100:.0f}% | ✈️ {wp.get('away_win',0)*100:.0f}%
+⚽ Goles: {g.get('total_goals',0):.1f} | 🚩 Córners: {c.get('total_corners',0)} | 🟨 Tarjetas: {ca.get('total_cards',0)} | 💥 Faltas: {f.get('total_fouls',0)}
+📝 {nar[:150]}...
 """
-        return msg
     
     async def _send(self, text):
-        max_len = 4096
-        if len(text) <= max_len:
-            await self.bot.send_message(chat_id=self.chat_id, text=text, parse_mode="Markdown")
-        else:
-            for i in range(0, len(text), max_len):
-                await self.bot.send_message(chat_id=self.chat_id, text=text[i:i+max_len], parse_mode="Markdown")
-                await asyncio.sleep(0.5)
-    
-    def _check(self, predicted, actual):
-        bet = predicted.get("predictions", {}).get("recommended_bet", {})
-        bet_type = bet.get("type", "")
-        bet_sel = bet.get("selection", "")
-        actual_res = actual.get("result", "").lower()
-        if bet_type == "winner":
-            if bet_sel == "home" and "home" in actual_res: return True
-            if bet_sel == "away" and "away" in actual_res: return True
-            if bet_sel == "draw" and "draw" in actual_res: return True
-        return False
+        await self.bot.send_message(chat_id=self.chat_id, text=text, parse_mode="Markdown")
     
     async def shutdown(self):
         if self.app:
@@ -337,67 +253,49 @@ Over {goals.get('over_under_line',2.5)}: {goals.get('over_probability',0)*100:.0
             await self.app.stop()
             await self.app.shutdown()
 
-# ==================== VERIFICADOR DE RESULTADOS ====================
+# ==================== VERIFICADOR ====================
 class Verifier:
-    def __init__(self, api_client: OddsAPIClient, telegram_bot: TelegramBot):
+    def __init__(self, api_client, telegram_bot):
         self.api = api_client
         self.bot = telegram_bot
         self.pending = {}
     
-    def register(self, event_id: str, prediction: Dict):
+    def register(self, event_id, prediction):
         if event_id not in self.pending:
-            self.pending[event_id] = {"prediction": prediction, "status": "pending"}
-            print(f"📝 Registrada predicción para {event_id}")
-    
-    async def check_pending(self):
-        to_remove = []
-        for eid, data in self.pending.items():
-            if data["status"] != "pending":
-                to_remove.append(eid)
-                continue
-            result = await self.api.verify_result(eid)
-            if result and result.get("status") == "finished":
-                await self.bot.send_verification(eid, data["prediction"], result)
-                data["status"] = "verified"
-                to_remove.append(eid)
-        for eid in to_remove:
-            del self.pending[eid]
+            self.pending[event_id] = prediction
     
     async def run_loop(self, interval=3600):
         while True:
-            await self.check_pending()
             await asyncio.sleep(interval)
 
 # ==================== BOT PRINCIPAL ====================
 class PredictionBot:
     def __init__(self):
         self.running = True
-        self.api_client = OddsAPIClient()
+        self.api = OddsAPIClient()
         self.ai = AIAnalyzer()
         self.telegram = TelegramBot()
-        self.verifier = Verifier(self.api_client, self.telegram)
+        self.verifier = Verifier(self.api, self.telegram)
     
     async def start(self):
         Config.validate()
-        print("🚀 Iniciando bot en Railway...")
+        print("🚀 Bot iniciando en Railway...")
         await self.telegram.init()
         signal.signal(signal.SIGINT, self._stop)
         signal.signal(signal.SIGTERM, self._stop)
-        await asyncio.gather(self._analysis_loop(), self.verifier.run_loop())
+        await self._analysis_loop()
     
     async def _analysis_loop(self):
         while self.running:
             try:
-                print(f"\n📊 [{datetime.now()}] Analizando eventos...")
-                live = await self.api_client.get_live_events()
-                upcoming = await self.api_client.get_upcoming_events()
+                print(f"\n📊 [{datetime.now()}] Obteniendo eventos...")
+                live = await self.api.get_live_events()
+                upcoming = await self.api.get_upcoming_events()
                 all_events = live + upcoming
                 print(f"📡 Eventos: {len(all_events)} (vivos:{len(live)}, próximos:{len(upcoming)})")
-                
                 if not all_events:
                     await asyncio.sleep(60)
                     continue
-                
                 predictions = []
                 for ev in all_events[:20]:
                     print(f"🤖 Analizando {ev.get('home_team')} vs {ev.get('away_team')}")
@@ -405,24 +303,21 @@ class PredictionBot:
                     if pred:
                         predictions.append(pred)
                     await asyncio.sleep(2)
-                
                 ranked = await self.ai.rank(predictions)
-                print(f"🏆 Mejores: {len(ranked)}")
                 for p in ranked:
                     self.verifier.register(p.get("event_id"), p)
                 await self.telegram.send_predictions(ranked)
-                
                 wait = Config.ANALYSIS_INTERVAL_SECONDS
                 if live:
                     wait = min(wait, 1800)
                 print(f"⏳ Esperando {wait//60} minutos...")
                 await asyncio.sleep(wait)
             except Exception as e:
-                print(f"❌ Error en análisis: {e}")
+                print(f"❌ Error: {e}")
                 await asyncio.sleep(60)
     
     def _stop(self, *args):
-        print("🛑 Deteniendo bot...")
+        print("🛑 Apagando bot...")
         self.running = False
         asyncio.create_task(self.telegram.shutdown())
         sys.exit(0)
