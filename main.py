@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-"""
-Bot de predicciones deportivas con IA (NVIDIA vía OpenRouter)
-Usa API de SportsGameOdds V2 con filtro por las 8 ligas gratuitas (IDs corregidos).
-"""
-
 import asyncio
 import json
 import os
@@ -17,21 +12,14 @@ from openai import AsyncOpenAI
 from telegram import Bot
 from telegram.ext import Application, CommandHandler
 
-# ==================== CONFIGURACIÓN ====================
 class Config:
     SPORTS_ODDS_API_KEY = os.environ.get("SPORTS_ODDS_API_KEY_HEADER")
     OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
     TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
     TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-    # IDs reales que la API acepta (para plan gratuito)
-    DEFAULT_LEAGUES = [
-        "NFL", "NBA", "MLB", "NHL",
-        "NCAAF",      # College Football
-        "NCAAB",      # College Basketball
-        "UCL",        # Champions League
-        "MLS"
-    ]
+    # IDs válidos para el plan gratuito (sin UCL hasta confirmar ID correcto)
+    DEFAULT_LEAGUES = ["NFL", "NBA", "MLB", "NHL", "NCAAF", "NCAAB", "MLS"]
     SPORTS_LEAGUES = os.environ.get("SPORTS_LEAGUES", ",".join(DEFAULT_LEAGUES)).split(",")
 
     AI_MODEL = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
@@ -43,35 +31,22 @@ class Config:
     OPENROUTER_SITE_URL = os.environ.get("OPENROUTER_SITE_URL", "https://railway.app")
     OPENROUTER_SITE_NAME = os.environ.get("OPENROUTER_SITE_NAME", "Sports Prediction Bot")
 
-    # Mapeo de leagueID a deporte (para análisis y emojis)
     LEAGUE_TO_SPORT = {
-        "NFL": "football",
-        "NBA": "basketball",
-        "MLB": "baseball",
-        "NHL": "hockey",
-        "NCAAF": "football",
-        "NCAAB": "basketball",
-        "UCL": "football",
-        "MLS": "football"
+        "NFL": "football", "NBA": "basketball", "MLB": "baseball", "NHL": "hockey",
+        "NCAAF": "football", "NCAAB": "basketball", "MLS": "football"
     }
 
     @classmethod
     def validate(cls):
         missing = []
-        if not cls.SPORTS_ODDS_API_KEY:
-            missing.append("SPORTS_ODDS_API_KEY_HEADER")
-        if not cls.OPENROUTER_API_KEY:
-            missing.append("OPENROUTER_API_KEY")
-        if not cls.TELEGRAM_BOT_TOKEN:
-            missing.append("TELEGRAM_BOT_TOKEN")
-        if not cls.TELEGRAM_CHAT_ID:
-            missing.append("TELEGRAM_CHAT_ID")
+        if not cls.SPORTS_ODDS_API_KEY: missing.append("SPORTS_ODDS_API_KEY_HEADER")
+        if not cls.OPENROUTER_API_KEY: missing.append("OPENROUTER_API_KEY")
+        if not cls.TELEGRAM_BOT_TOKEN: missing.append("TELEGRAM_BOT_TOKEN")
+        if not cls.TELEGRAM_CHAT_ID: missing.append("TELEGRAM_CHAT_ID")
         if missing:
             raise ValueError(f"Faltan variables: {', '.join(missing)}")
         return True
 
-
-# ==================== CLIENTE API DE CUOTAS (V2 con paginación) ====================
 class OddsAPIClient:
     def __init__(self):
         self.base_url = "https://api.sportsgameodds.com/v2"
@@ -80,17 +55,12 @@ class OddsAPIClient:
         self.headers = {"x-api-key": self.api_key, "Content-Type": "application/json"}
 
     async def fetch_all_events(self, endpoint: str) -> List[Dict]:
-        """Obtiene eventos paginados con nextCursor."""
         all_events = []
         next_cursor = None
         leagues_param = ",".join(self.league_ids)
 
         while True:
-            params = {
-                "apiKey": self.api_key,
-                "leagueID": leagues_param,
-                "oddsAvailable": "true",
-            }
+            params = {"apiKey": self.api_key, "leagueID": leagues_param, "oddsAvailable": "true"}
             if next_cursor:
                 params["nextCursor"] = next_cursor
 
@@ -109,27 +79,25 @@ class OddsAPIClient:
 
                     page_events = data.get("data", [])
                     all_events.extend(page_events)
-
                     next_cursor = data.get("nextCursor")
                     if not next_cursor:
                         break
                     await asyncio.sleep(0.5)
 
-        # Filtro de seguridad (ya deberían venir filtradas por leagueID)
         return [e for e in all_events if e.get("leagueID") in self.league_ids]
 
-    async def get_live_events(self) -> List[Dict[str, Any]]:
+    async def get_live_events(self) -> List[Dict]:
         events = await self.fetch_all_events("events?status=live")
         return [self._normalize_event(e) for e in events]
 
-    async def get_upcoming_events(self) -> List[Dict[str, Any]]:
+    async def get_upcoming_events(self) -> List[Dict]:
         events = await self.fetch_all_events("events?status=upcoming")
         return [self._normalize_event(e) for e in events]
 
-    async def get_event_details(self, event_id: str) -> Optional[Dict[str, Any]]:
+    async def get_event_details(self, event_id: str) -> Optional[Dict]:
         return None
 
-    async def verify_result(self, event_id: str) -> Optional[Dict[str, Any]]:
+    async def verify_result(self, event_id: str) -> Optional[Dict]:
         return None
 
     def _normalize_event(self, event: Dict) -> Dict:
@@ -137,26 +105,18 @@ class OddsAPIClient:
         home_data = teams.get("home", {})
         away_data = teams.get("away", {})
 
-        home_name = (
-            home_data.get("names", {}).get("long") or
-            home_data.get("names", {}).get("medium") or
-            home_data.get("names", {}).get("short") or
-            "Unknown"
-        )
-        away_name = (
-            away_data.get("names", {}).get("long") or
-            away_data.get("names", {}).get("medium") or
-            away_data.get("names", {}).get("short") or
-            "Unknown"
-        )
+        home_name = (home_data.get("names", {}).get("long") or
+                     home_data.get("names", {}).get("medium") or
+                     home_data.get("names", {}).get("short") or "Unknown")
+        away_name = (away_data.get("names", {}).get("long") or
+                     away_data.get("names", {}).get("medium") or
+                     away_data.get("names", {}).get("short") or "Unknown")
 
         league_id = event.get("leagueID")
         sport = Config.LEAGUE_TO_SPORT.get(league_id, "deporte")
-
         status_info = event.get("status", {})
         odds_info = event.get("odds", {})
 
-        # Extracción básica de cuotas Moneyline
         home_odds = "N/A"
         away_odds = "N/A"
         draw_odds = "N/A"
@@ -177,16 +137,10 @@ class OddsAPIClient:
             "away_team": away_name,
             "start_time": status_info.get("startsAt"),
             "status": status_info.get("displayLong", ""),
-            "odds": {
-                "home_win": home_odds,
-                "draw": draw_odds,
-                "away_win": away_odds
-            },
+            "odds": {"home_win": home_odds, "draw": draw_odds, "away_win": away_odds},
             "score": {}
         }
 
-
-# ==================== ANALIZADOR IA (OpenRouter + NVIDIA) ====================
 class AIAnalyzer:
     def __init__(self):
         self.client = AsyncOpenAI(
@@ -275,8 +229,6 @@ RESPUESTA JSON:
         except:
             return None
 
-
-# ==================== TELEGRAM BOT (con manejo de conflicto) ====================
 class TelegramBot:
     def __init__(self):
         self.bot = Bot(token=Config.TELEGRAM_BOT_TOKEN)
@@ -285,10 +237,16 @@ class TelegramBot:
 
     async def init(self):
         self.app = Application.builder().token(Config.TELEGRAM_BOT_TOKEN).build()
-        # Eliminar webhook y esperar a que Telegram procese
-        await self.app.bot.delete_webhook(drop_pending_updates=True)
-        await asyncio.sleep(1)  # Pequeña pausa para evitar conflictos
-        # Descarta cualquier update pendiente manualmente
+        # Reintentar delete_webhook
+        for attempt in range(3):
+            try:
+                await self.app.bot.delete_webhook(drop_pending_updates=True)
+                print("Webhook eliminado")
+                break
+            except Exception as e:
+                print(f"Intento {attempt+1} falló: {e}")
+                await asyncio.sleep(2)
+        await asyncio.sleep(2)
         try:
             await self.app.bot.get_updates(offset=-1, timeout=1)
         except Exception:
@@ -298,13 +256,10 @@ class TelegramBot:
         await self.app.initialize()
         await self.app.start()
         await self.app.updater.start_polling(drop_pending_updates=True, allowed_updates=None)
-        print("✅ Telegram bot ready (conflicto resuelto)")
+        print("✅ Telegram bot ready")
 
     async def _start(self, update, context):
-        await update.message.reply_text(
-            "🤖 Bot de predicciones IA activo.\nUsa /status para ver configuración.",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text("🤖 Bot de predicciones IA activo.\nUsa /status para ver configuración.", parse_mode="Markdown")
 
     async def _status(self, update, context):
         msg = f"""
@@ -333,7 +288,6 @@ class TelegramBot:
         league = p.get("league", "")
         conf = p.get("confidence", 0)
         conf_emoji = "🟢" if conf >= 0.8 else "🟡" if conf >= 0.7 else "🟠" if conf >= 0.6 else "🔴"
-
         wp = preds.get("winner_probability", {})
         goals = preds.get("goals", {})
         corners = preds.get("corners", {})
@@ -341,16 +295,7 @@ class TelegramBot:
         fouls = preds.get("fouls", {})
         narrative = p.get("analysis_summary", {}).get("match_narrative", "")
         value = p.get("analysis_summary", {}).get("value_opportunity", "")
-
-        sport_emoji = {
-            "football": "⚽",
-            "soccer": "⚽",
-            "basketball": "🏀",
-            "baseball": "⚾",
-            "hockey": "🏒",
-            "deporte": "🏆"
-        }.get(sport.lower(), "🏆")
-
+        sport_emoji = {"football": "⚽", "basketball": "🏀", "baseball": "⚾", "hockey": "🏒", "deporte": "🏆"}.get(sport.lower(), "🏆")
         msg = f"""
 🎲 *Predicción #{idx}* | {sport_emoji} {sport.upper()}
 ━━━━━━━━━━━━━━━━━━━━━━━
@@ -394,8 +339,6 @@ Over {goals.get('over_under_line', 2.5)}: {goals.get('over_probability', 0)*100:
             await self.app.stop()
             await self.app.shutdown()
 
-
-# ==================== VERIFICADOR (placeholder) ====================
 class Verifier:
     def __init__(self, api_client: OddsAPIClient, telegram_bot: TelegramBot):
         self.api = api_client
@@ -410,8 +353,6 @@ class Verifier:
         while True:
             await asyncio.sleep(interval)
 
-
-# ==================== BOT PRINCIPAL ====================
 class PredictionBot:
     def __init__(self):
         self.running = True
@@ -424,6 +365,7 @@ class PredictionBot:
         Config.validate()
         print("🚀 Bot iniciando en Railway...")
         await self.telegram.init()
+        await asyncio.sleep(10)  # Estabilizar conexión con Telegram
         signal.signal(signal.SIGINT, self._stop)
         signal.signal(signal.SIGTERM, self._stop)
         await self._analysis_loop()
@@ -470,7 +412,6 @@ class PredictionBot:
         self.running = False
         asyncio.create_task(self.telegram.shutdown())
         sys.exit(0)
-
 
 async def main():
     bot = PredictionBot()
