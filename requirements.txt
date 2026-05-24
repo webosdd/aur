@@ -1,8 +1,6 @@
-python-telegram-bot==21.10
-google-generativeai==0.8.3
-sports-odds-api>=1.0.0
-python-dotenv==1.0.1
-pydantic==2.10.6
-aiohttp==3.11.12
-asyncio==3.4.3
-openrouter # 👈 AÑADE ESTA LÍNEA
+python-telegram-bot==20.7
+openai>=1.0.0
+aiohttp>=3.8.0
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+pytz>=2023.3
