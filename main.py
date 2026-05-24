@@ -12,7 +12,7 @@ from openai import AsyncOpenAI
 from telegram import Bot
 from telegram.ext import Application, CommandHandler
 
-# ==================== CONFIGURACIÓN (solo variables de entorno) ====================
+# ==================== CONFIGURACIÓN ====================
 class Config:
     SPORTS_ODDS_API_KEY = os.environ.get("SPORTS_ODDS_API_KEY_HEADER")
     OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
@@ -48,13 +48,14 @@ class Config:
         if not cls.TELEGRAM_CHAT_ID:
             missing.append("TELEGRAM_CHAT_ID")
         if missing:
-            raise ValueError(f"Faltan variables de entorno: {', '.join(missing)}. Verifica en Railway las variables.")
+            raise ValueError(f"Faltan variables: {', '.join(missing)}")
         return True
 
-# ==================== CLIENTE API DE CUOTAS ====================
+# ==================== CLIENTE API DE CUOTAS (VERSIÓN V2) ====================
 class OddsAPIClient:
     def __init__(self):
-        self.base_url = "https://api.sportsgameodds.com/v1"  # <-- CAMBIA A LA URL REAL
+        # CAMBIO IMPORTANTE: usar v2 en lugar de v1
+        self.base_url = "https://api.sportsgameodds.com/v2"
         self.api_key = Config.SPORTS_ODDS_API_KEY
         self.headers = {"x-api-key": self.api_key, "Content-Type": "application/json"}
         self.relevant_leagues = []
@@ -67,7 +68,10 @@ class OddsAPIClient:
                 async with session.get(f"{self.base_url}/{endpoint}", headers=self.headers, params=params) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        return data.get("data", []) if isinstance(data, dict) else data
+                        # Ajuste según la respuesta real de la API (puede ser data.resultados)
+                        if isinstance(data, dict):
+                            return data.get("data", []) or data.get("results", [])
+                        return data
                     else:
                         print(f"⚠️ API error {resp.status}: {await resp.text()}")
                         return []
@@ -106,7 +110,7 @@ class OddsAPIClient:
             "score": ev.get("score", {})
         }
 
-# ==================== ANALIZADOR IA ====================
+# ==================== ANALIZADOR IA (OpenRouter + NVIDIA) ====================
 class AIAnalyzer:
     def __init__(self):
         self.client = AsyncOpenAI(
@@ -195,7 +199,7 @@ RESPUESTA JSON:
         except:
             return None
 
-# ==================== TELEGRAM BOT ====================
+# ==================== TELEGRAM BOT (con drop_pending_updates) ====================
 class TelegramBot:
     def __init__(self):
         self.bot = Bot(token=Config.TELEGRAM_BOT_TOKEN)
@@ -203,13 +207,15 @@ class TelegramBot:
         self.app = None
     
     async def init(self):
+        # Solución al conflicto: drop_pending_updates=True y sin webhook previo
         self.app = Application.builder().token(Config.TELEGRAM_BOT_TOKEN).build()
+        await self.app.bot.delete_webhook(drop_pending_updates=True)  # <--- clave
         self.app.add_handler(CommandHandler("start", self._start))
         self.app.add_handler(CommandHandler("status", self._status))
         await self.app.initialize()
         await self.app.start()
-        await self.app.updater.start_polling()
-        print("✅ Telegram bot ready")
+        await self.app.updater.start_polling(drop_pending_updates=True)  # <--- clave
+        print("✅ Telegram bot ready (conflicto resuelto)")
     
     async def _start(self, update, context):
         await update.message.reply_text("🤖 Bot de predicciones activo. Usa /status", parse_mode="Markdown")
@@ -253,7 +259,7 @@ class TelegramBot:
             await self.app.stop()
             await self.app.shutdown()
 
-# ==================== VERIFICADOR ====================
+# ==================== VERIFICADOR (placeholder) ====================
 class Verifier:
     def __init__(self, api_client, telegram_bot):
         self.api = api_client
@@ -313,7 +319,7 @@ class PredictionBot:
                 print(f"⏳ Esperando {wait//60} minutos...")
                 await asyncio.sleep(wait)
             except Exception as e:
-                print(f"❌ Error: {e}")
+                print(f"❌ Error en análisis: {e}")
                 await asyncio.sleep(60)
     
     def _stop(self, *args):
