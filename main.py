@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Bot de predicciones deportivas con IA (NVIDIA vía OpenRouter)
-Usa la API de SportsGameOdds V2 con paginación y filtros por liga.
+Usa la API de SportsGameOdds V2 con filtrado por las 8 ligas gratuitas.
 """
 
 import asyncio
@@ -24,24 +24,34 @@ class Config:
     TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
     TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
+    # Las 8 ligas permitidas en el plan gratuito
+    DEFAULT_LEAGUES = [
+        "NFL", "NBA", "MLB", "NHL",
+        "College Football", "College Basketball",
+        "Champions League", "MLS"
+    ]
+    # Permitir al usuario sobrescribir con variable de entorno (opcional)
+    SPORTS_LEAGUES = os.environ.get("SPORTS_LEAGUES", ",".join(DEFAULT_LEAGUES)).split(",")
+
     AI_MODEL = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
     MAX_PREDICTIONS = int(os.environ.get("MAX_PREDICTIONS", "10"))
     CONFIDENCE_THRESHOLD = float(os.environ.get("CONFIDENCE_THRESHOLD", "0.65"))
     ANALYSIS_INTERVAL_SECONDS = int(os.environ.get("ANALYSIS_INTERVAL_SECONDS", "3600"))
-    SPORTS_LEAGUES = os.environ.get("SPORTS_LEAGUES", "NBA,NFL,MLB").split(",")
 
     OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
     OPENROUTER_SITE_URL = os.environ.get("OPENROUTER_SITE_URL", "https://railway.app")
     OPENROUTER_SITE_NAME = os.environ.get("OPENROUTER_SITE_NAME", "Sports Prediction Bot")
 
-    # Mapeo de nombres de ligas (para referencia, aunque usamos los IDs directamente)
-    SPORTS_MAPPING = {
-        "NBA": "basketball",
+    # Mapeo de leagueID a deporte (para el analizador y emojis)
+    LEAGUE_TO_SPORT = {
         "NFL": "football",
+        "NBA": "basketball",
         "MLB": "baseball",
-        "EPL": "football",
-        "UCL": "football",
-        "LaLiga": "football"
+        "NHL": "hockey",
+        "College Football": "football",
+        "College Basketball": "basketball",
+        "Champions League": "football",
+        "MLS": "football"
     }
 
     @classmethod
@@ -60,12 +70,13 @@ class Config:
         return True
 
 
-# ==================== CLIENTE API DE CUOTAS (V2 con paginación) ====================
+# ==================== CLIENTE API DE CUOTAS (V2 con paginación y filtro por ligas gratuitas) ====================
 class OddsAPIClient:
     def __init__(self):
         self.base_url = "https://api.sportsgameodds.com/v2"
         self.api_key = Config.SPORTS_ODDS_API_KEY
-        self.league_ids = Config.SPORTS_LEAGUES  # ej: ["NBA", "NFL", "MLB"]
+        # Usamos exactamente las ligas que el usuario definió (por defecto las 8)
+        self.league_ids = Config.SPORTS_LEAGUES
         self.headers = {"x-api-key": self.api_key, "Content-Type": "application/json"}
 
     async def fetch_all_events(self, endpoint: str) -> List[Dict]:
@@ -92,7 +103,7 @@ class OddsAPIClient:
                     if resp.status != 200:
                         error_text = await resp.text()
                         print(f"❌ API error {resp.status}: {error_text}")
-                        return []  # Salimos, no podemos continuar
+                        return []
 
                     data = await resp.json()
                     if not data.get("success"):
@@ -105,7 +116,7 @@ class OddsAPIClient:
                     next_cursor = data.get("nextCursor")
                     if not next_cursor:
                         break
-                    await asyncio.sleep(0.5)  # evitar rate limiting
+                    await asyncio.sleep(0.5)
 
         # Filtro de seguridad (aunque la query ya debería filtrar)
         return [e for e in all_events if e.get("leagueID") in self.league_ids]
@@ -119,11 +130,11 @@ class OddsAPIClient:
         return [self._normalize_event(e) for e in events]
 
     async def get_event_details(self, event_id: str) -> Optional[Dict[str, Any]]:
-        # Endpoint opcional; no se usa en el bucle principal
+        # No se usa en el bucle principal
         return None
 
     async def verify_result(self, event_id: str) -> Optional[Dict[str, Any]]:
-        # Endpoint opcional; no se usa en el bucle principal
+        # No se usa en el bucle principal
         return None
 
     def _normalize_event(self, event: Dict) -> Dict:
@@ -148,29 +159,33 @@ class OddsAPIClient:
             "Unknown"
         )
 
+        league_id = event.get("leagueID")
+        # Asignar deporte según el mapeo, o "deporte" genérico si no está
+        sport = Config.LEAGUE_TO_SPORT.get(league_id, "deporte")
+
         status_info = event.get("status", {})
         odds_info = event.get("odds", {})
 
         # Intentar extraer cuotas de Moneyline (h2h) para home/draw/away
-        # Buscamos un mercado que contenga "moneyline" o "h2h"
         home_odds = "N/A"
         away_odds = "N/A"
         draw_odds = "N/A"
         for odd_id, odd_val in odds_info.items():
             if "moneyline" in odd_id.lower() or "h2h" in odd_id.lower():
-                # Si la odd tiene home/away explícitos, extraemos.
-                # En la estructura real podría haber campos 'homeOdds', 'awayOdds'
-                # Esta es una simplificación; ajústala según la documentación real.
+                # Esta es una extracción genérica; puede que necesites ajustarla
+                # según la estructura real de la respuesta.
                 home_odds = odd_val.get("bookOdds", "N/A")
-                # Para el away, puede estar en otro objeto o en el mismo.
-                # Por ahora lo dejamos así.
+                # Algunas APIs tienen campos separados para home/away
+                if "homeOdds" in odd_val:
+                    home_odds = odd_val["homeOdds"]
+                if "awayOdds" in odd_val:
+                    away_odds = odd_val["awayOdds"]
                 break
 
-        # Devolvemos el formato esperado por el AIAnalyzer
         return {
             "id": event.get("eventID"),
-            "sport": event.get("sportID", "").lower(),
-            "league": event.get("leagueID"),
+            "sport": sport,
+            "league": league_id,
             "home_team": home_name,
             "away_team": away_name,
             "start_time": status_info.get("startsAt"),
@@ -274,7 +289,7 @@ RESPUESTA JSON:
             return None
 
 
-# ==================== TELEGRAM BOT (con drop_pending_updates) ====================
+# ==================== TELEGRAM BOT ====================
 class TelegramBot:
     def __init__(self):
         self.bot = Bot(token=Config.TELEGRAM_BOT_TOKEN)
@@ -289,7 +304,7 @@ class TelegramBot:
         await self.app.initialize()
         await self.app.start()
         await self.app.updater.start_polling(drop_pending_updates=True)
-        print("✅ Telegram bot ready (conflicto resuelto)")
+        print("✅ Telegram bot ready")
 
     async def _start(self, update, context):
         await update.message.reply_text(
@@ -333,7 +348,14 @@ class TelegramBot:
         narrative = p.get("analysis_summary", {}).get("match_narrative", "")
         value = p.get("analysis_summary", {}).get("value_opportunity", "")
 
-        sport_emoji = {"football": "⚽", "tennis": "🎾", "basketball": "🏀", "baseball": "⚾"}.get(sport.lower(), "🏆")
+        sport_emoji = {
+            "football": "⚽",
+            "soccer": "⚽",
+            "basketball": "🏀",
+            "baseball": "⚾",
+            "hockey": "🏒",
+            "deporte": "🏆"
+        }.get(sport.lower(), "🏆")
 
         msg = f"""
 🎲 *Predicción #{idx}* | {sport_emoji} {sport.upper()}
@@ -426,12 +448,12 @@ class PredictionBot:
                     continue
 
                 predictions = []
-                for ev in all_events[:20]:  # limitar a 20 por ciclo
+                for ev in all_events[:20]:
                     print(f"🤖 Analizando {ev.get('home_team')} vs {ev.get('away_team')}")
                     pred = await self.ai.analyze(ev)
                     if pred:
                         predictions.append(pred)
-                    await asyncio.sleep(2)  # pausa entre análisis
+                    await asyncio.sleep(2)
 
                 ranked = await self.ai.rank(predictions)
                 for p in ranked:
@@ -441,7 +463,7 @@ class PredictionBot:
 
                 wait = Config.ANALYSIS_INTERVAL_SECONDS
                 if live:
-                    wait = min(wait, 1800)  # si hay partidos en vivo, analizar cada 30 min
+                    wait = min(wait, 1800)
                 print(f"⏳ Esperando {wait//60} minutos...")
                 await asyncio.sleep(wait)
 
