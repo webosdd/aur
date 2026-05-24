@@ -12,13 +12,14 @@ from openai import AsyncOpenAI
 from telegram import Bot
 from telegram.ext import Application, CommandHandler
 
+# ==================== CONFIGURACIÓN ====================
 class Config:
     SPORTS_ODDS_API_KEY = os.environ.get("SPORTS_ODDS_API_KEY_HEADER")
     OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
     TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
     TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-    # IDs válidos para el plan gratuito (sin UCL hasta confirmar ID correcto)
+    # IDs correctos para plan gratuito (UCL no funciona, lo quitamos)
     DEFAULT_LEAGUES = ["NFL", "NBA", "MLB", "NHL", "NCAAF", "NCAAB", "MLS"]
     SPORTS_LEAGUES = os.environ.get("SPORTS_LEAGUES", ",".join(DEFAULT_LEAGUES)).split(",")
 
@@ -47,12 +48,30 @@ class Config:
             raise ValueError(f"Faltan variables: {', '.join(missing)}")
         return True
 
+# ==================== CLIENTE API CON RATE LIMIT ====================
 class OddsAPIClient:
     def __init__(self):
         self.base_url = "https://api.sportsgameodds.com/v2"
         self.api_key = Config.SPORTS_ODDS_API_KEY
         self.league_ids = Config.SPORTS_LEAGUES
         self.headers = {"x-api-key": self.api_key, "Content-Type": "application/json"}
+        self.request_delay = 1.5  # segundos entre peticiones
+
+    async def _request_with_retry(self, url: str, params: dict, max_retries: int = 3) -> Optional[Dict]:
+        for attempt in range(max_retries):
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=self.headers, params=params) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+                    elif resp.status == 429:
+                        wait = 2 ** attempt  # 1, 2, 4 segundos
+                        print(f"⚠️ Rate limit. Reintentando en {wait}s...")
+                        await asyncio.sleep(wait)
+                    else:
+                        error_text = await resp.text()
+                        print(f"❌ API error {resp.status}: {error_text}")
+                        return None
+        return None
 
     async def fetch_all_events(self, endpoint: str) -> List[Dict]:
         all_events = []
@@ -65,32 +84,26 @@ class OddsAPIClient:
                 params["nextCursor"] = next_cursor
 
             url = f"{self.base_url}/{endpoint}"
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=self.headers, params=params) as resp:
-                    if resp.status != 200:
-                        error_text = await resp.text()
-                        print(f"❌ API error {resp.status}: {error_text}")
-                        return []
+            data = await self._request_with_retry(url, params)
+            if not data or not data.get("success"):
+                break
 
-                    data = await resp.json()
-                    if not data.get("success"):
-                        print(f"⚠️ API error: {data.get('error')}")
-                        return []
-
-                    page_events = data.get("data", [])
-                    all_events.extend(page_events)
-                    next_cursor = data.get("nextCursor")
-                    if not next_cursor:
-                        break
-                    await asyncio.sleep(0.5)
+            page_events = data.get("data", [])
+            all_events.extend(page_events)
+            next_cursor = data.get("nextCursor")
+            if not next_cursor:
+                break
+            await asyncio.sleep(self.request_delay)
 
         return [e for e in all_events if e.get("leagueID") in self.league_ids]
 
-    async def get_live_events(self) -> List[Dict]:
+    async def get_live_events(self) -> List[Dict[str, Any]]:
+        await asyncio.sleep(0.5)
         events = await self.fetch_all_events("events?status=live")
         return [self._normalize_event(e) for e in events]
 
-    async def get_upcoming_events(self) -> List[Dict]:
+    async def get_upcoming_events(self) -> List[Dict[str, Any]]:
+        await asyncio.sleep(self.request_delay)
         events = await self.fetch_all_events("events?status=upcoming")
         return [self._normalize_event(e) for e in events]
 
@@ -117,9 +130,7 @@ class OddsAPIClient:
         status_info = event.get("status", {})
         odds_info = event.get("odds", {})
 
-        home_odds = "N/A"
-        away_odds = "N/A"
-        draw_odds = "N/A"
+        home_odds = away_odds = draw_odds = "N/A"
         for odd_id, odd_val in odds_info.items():
             if "moneyline" in odd_id.lower() or "h2h" in odd_id.lower():
                 home_odds = odd_val.get("bookOdds", "N/A")
@@ -141,6 +152,7 @@ class OddsAPIClient:
             "score": {}
         }
 
+# ==================== ANALIZADOR IA ====================
 class AIAnalyzer:
     def __init__(self):
         self.client = AsyncOpenAI(
@@ -229,6 +241,7 @@ RESPUESTA JSON:
         except:
             return None
 
+# ==================== TELEGRAM BOT ====================
 class TelegramBot:
     def __init__(self):
         self.bot = Bot(token=Config.TELEGRAM_BOT_TOKEN)
@@ -237,7 +250,6 @@ class TelegramBot:
 
     async def init(self):
         self.app = Application.builder().token(Config.TELEGRAM_BOT_TOKEN).build()
-        # Reintentar delete_webhook
         for attempt in range(3):
             try:
                 await self.app.bot.delete_webhook(drop_pending_updates=True)
@@ -339,6 +351,7 @@ Over {goals.get('over_under_line', 2.5)}: {goals.get('over_probability', 0)*100:
             await self.app.stop()
             await self.app.shutdown()
 
+# ==================== VERIFICADOR ====================
 class Verifier:
     def __init__(self, api_client: OddsAPIClient, telegram_bot: TelegramBot):
         self.api = api_client
@@ -353,6 +366,7 @@ class Verifier:
         while True:
             await asyncio.sleep(interval)
 
+# ==================== BOT PRINCIPAL ====================
 class PredictionBot:
     def __init__(self):
         self.running = True
@@ -365,7 +379,7 @@ class PredictionBot:
         Config.validate()
         print("🚀 Bot iniciando en Railway...")
         await self.telegram.init()
-        await asyncio.sleep(10)  # Estabilizar conexión con Telegram
+        await asyncio.sleep(10)  # Estabilizar Telegram
         signal.signal(signal.SIGINT, self._stop)
         signal.signal(signal.SIGTERM, self._stop)
         await self._analysis_loop()
@@ -404,7 +418,7 @@ class PredictionBot:
                 await asyncio.sleep(wait)
 
             except Exception as e:
-                print(f"❌ Error en ciclo de análisis: {e}")
+                print(f"❌ Error en ciclo: {e}")
                 await asyncio.sleep(60)
 
     def _stop(self, *args):
