@@ -5,5 +5,4 @@ python-dotenv==1.0.1
 pydantic==2.10.6
 aiohttp==3.11.12
 asyncio==3.4.3
-pytz==2024.2
-requests==2.32.3
+openrouter # 👈 AÑADE ESTA LÍNEA
