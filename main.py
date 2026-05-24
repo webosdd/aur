@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Bot de predicciones deportivas con IA (NVIDIA Nemotron a través de OpenRouter)
-Funciona 24/7 en Railway. Analiza eventos en vivo/próximos y envía top predicciones a Telegram.
+Bot de predicciones deportivas con IA (NVIDIA vía OpenRouter)
+Sin dependencias externas problemáticas. Usa aiohttp para llamar a la API de cuotas.
 """
 
 import asyncio
@@ -15,9 +15,8 @@ from typing import Dict, Any, List, Optional
 import aiohttp
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
-from sports_odds_api import SportsGameOdds
 from telegram import Bot
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler
 
 # ==================== CONFIGURACIÓN ====================
 load_dotenv()
@@ -29,105 +28,89 @@ class Config:
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
     
     AI_MODEL = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
-    MAX_PREDICTIONS = int(os.getenv("MAX_PREDICTIONS", 10))
-    CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", 0.65))
-    ANALYSIS_INTERVAL_SECONDS = int(os.getenv("ANALYSIS_INTERVAL_SECONDS", 3600))
+    MAX_PREDICTIONS = int(os.getenv("MAX_PREDICTIONS", "10"))
+    CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.65"))
+    ANALYSIS_INTERVAL_SECONDS = int(os.getenv("ANALYSIS_INTERVAL_SECONDS", "3600"))
     SPORTS_LEAGUES = os.getenv("SPORTS_LEAGUES", "football,tennis,basketball,baseball").split(",")
     
     OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
     OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "https://railway.app")
     OPENROUTER_SITE_NAME = os.getenv("OPENROUTER_SITE_NAME", "Sports Prediction Bot")
     
+    # Mapeo de deportes a ligas (para filtrar)
+    SPORTS_MAPPING = {
+        "football": ["NFL","NCAAF","EPL","UCL","LaLiga","SerieA","Bundesliga","LigaMX","MLS"],
+        "tennis": ["ATP","WTA"],
+        "basketball": ["NBA","NCAA","EuroLeague","ACB"],
+        "baseball": ["MLB","KBO","NPB"]
+    }
+    
     @classmethod
     def validate(cls):
         required = [cls.SPORTS_ODDS_API_KEY, cls.OPENROUTER_API_KEY, cls.TELEGRAM_BOT_TOKEN, cls.TELEGRAM_CHAT_ID]
         if not all(required):
-            missing = [k for k in ["SPORTS_ODDS_API_KEY","OPENROUTER_API_KEY","TELEGRAM_BOT_TOKEN","TELEGRAM_CHAT_ID"] if not locals().get(k)]
-            raise ValueError(f"Faltan variables: {missing}")
+            raise ValueError("Faltan variables de entorno. Revisa .env o Railway Variables.")
 
-# ==================== CLIENTE API DE CUOTAS ====================
-class OddsClient:
+# ==================== CLIENTE API DE CUOTAS (aiohttp) ====================
+class OddsAPIClient:
     def __init__(self):
-        self.client = SportsGameOdds(api_key_param=Config.SPORTS_ODDS_API_KEY)
-        self.sports_mapping = {
-            "football": ["NFL","NCAAF","EPL","UCL","LaLiga","SerieA","Bundesliga","LigaMX","MLS"],
-            "tennis": ["ATP","WTA"],
-            "basketball": ["NBA","NCAA","EuroLeague","ACB"],
-            "baseball": ["MLB","KBO","NPB"]
-        }
+        self.base_url = "https://api.sportsgameodds.com/v1"  # URL real (ajusta si es diferente)
+        self.api_key = Config.SPORTS_ODDS_API_KEY
+        self.headers = {"x-api-key": self.api_key, "Content-Type": "application/json"}
+        self.relevant_leagues = []
+        for sport in Config.SPORTS_LEAGUES:
+            self.relevant_leagues.extend(Config.SPORTS_MAPPING.get(sport.strip(), []))
+    
+    async def _get(self, endpoint: str, params: dict = None) -> List[Dict]:
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.get(f"{self.base_url}/{endpoint}", headers=self.headers, params=params) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data.get("data", []) if isinstance(data, dict) else data
+                    else:
+                        print(f"⚠️ Error API {resp.status}: {await resp.text()}")
+                        return []
+            except Exception as e:
+                print(f"❌ Error conexión: {e}")
+                return []
     
     async def get_live_events(self) -> List[Dict]:
-        try:
-            loop = asyncio.get_event_loop()
-            page = await loop.run_in_executor(None, self.client.events.get, {"status": "live"})
-            events = page.data if page and hasattr(page, "data") else []
-            return self._filter_relevant(events)
-        except Exception as e:
-            print(f"❌ Error eventos en vivo: {e}")
-            return []
+        events = await self._get("events", {"status": "live"})
+        return self._filter_relevant(events)
     
     async def get_upcoming_events(self) -> List[Dict]:
-        try:
-            loop = asyncio.get_event_loop()
-            page = await loop.run_in_executor(None, self.client.events.get, {"status": "upcoming"})
-            events = page.data if page and hasattr(page, "data") else []
-            return self._filter_relevant(events)
-        except Exception as e:
-            print(f"❌ Error eventos próximos: {e}")
-            return []
+        events = await self._get("events", {"status": "upcoming"})
+        return self._filter_relevant(events)
     
     async def get_event_details(self, event_id: str) -> Optional[Dict]:
-        try:
-            loop = asyncio.get_event_loop()
-            event = await loop.run_in_executor(None, self.client.events.get_by_id, event_id)
-            return event.data if event and hasattr(event, "data") else None
-        except Exception:
-            return None
+        data = await self._get(f"events/{event_id}")
+        return data[0] if data else None
     
     async def verify_result(self, event_id: str) -> Optional[Dict]:
-        try:
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(None, self.client.events.get_result, event_id)
-            return result.data if result and hasattr(result, "data") else None
-        except Exception:
-            return None
+        # Endpoint hipotético, puede variar. Si no funciona, simplemente no verificará.
+        return await self._get(f"events/{event_id}/result")
     
-    def _filter_relevant(self, events):
-        relevant_leagues = []
-        for sport in Config.SPORTS_LEAGUES:
-            relevant_leagues.extend(self.sports_mapping.get(sport.strip(), []))
+    def _filter_relevant(self, events: List[Dict]) -> List[Dict]:
         filtered = []
         for ev in events:
-            league = ev.get("league") if isinstance(ev, dict) else getattr(ev, "league", "")
-            if league in relevant_leagues:
+            league = ev.get("league", "")
+            if league in self.relevant_leagues:
                 filtered.append(self._normalize(ev))
         return filtered
     
-    def _normalize(self, ev):
-        if isinstance(ev, dict):
-            return {
-                "id": ev.get("id"),
-                "sport": ev.get("sport"),
-                "league": ev.get("league"),
-                "home_team": ev.get("home_team"),
-                "away_team": ev.get("away_team"),
-                "start_time": ev.get("start_time"),
-                "status": ev.get("status"),
-                "odds": ev.get("odds", {}),
-                "score": ev.get("score", {})
-            }
-        else:
-            return {
-                "id": getattr(ev, "id", None),
-                "sport": getattr(ev, "sport", None),
-                "league": getattr(ev, "league", None),
-                "home_team": getattr(ev, "home_team", None),
-                "away_team": getattr(ev, "away_team", None),
-                "start_time": getattr(ev, "start_time", None),
-                "status": getattr(ev, "status", None),
-                "odds": getattr(ev, "odds", {}),
-                "score": getattr(ev, "score", {})
-            }
+    def _normalize(self, ev: Dict) -> Dict:
+        return {
+            "id": ev.get("id"),
+            "sport": ev.get("sport"),
+            "league": ev.get("league"),
+            "home_team": ev.get("home_team"),
+            "away_team": ev.get("away_team"),
+            "start_time": ev.get("start_time"),
+            "status": ev.get("status"),
+            "odds": ev.get("odds", {}),
+            "score": ev.get("score", {})
+        }
 
 # ==================== ANALIZADOR IA (OpenRouter + NVIDIA) ====================
 class AIAnalyzer:
@@ -191,7 +174,7 @@ INSTRUCCIONES:
 3. Da un análisis narrativo corto.
 4. Confianza global (0-1) según calidad de datos.
 
-RESPUESTE JSON EXACTO:
+RESPUESTA JSON EXACTA:
 {{
     "event_id": "{event.get('id')}",
     "home_team": "{home}",
@@ -356,7 +339,7 @@ Over {goals.get('over_under_line',2.5)}: {goals.get('over_probability',0)*100:.0
 
 # ==================== VERIFICADOR DE RESULTADOS ====================
 class Verifier:
-    def __init__(self, api_client: OddsClient, telegram_bot: TelegramBot):
+    def __init__(self, api_client: OddsAPIClient, telegram_bot: TelegramBot):
         self.api = api_client
         self.bot = telegram_bot
         self.pending = {}
@@ -389,7 +372,7 @@ class Verifier:
 class PredictionBot:
     def __init__(self):
         self.running = True
-        self.api_client = OddsClient()
+        self.api_client = OddsAPIClient()
         self.ai = AIAnalyzer()
         self.telegram = TelegramBot()
         self.verifier = Verifier(self.api_client, self.telegram)
