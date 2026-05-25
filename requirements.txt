@@ -3,8 +3,6 @@ numpy
 pybit
 requests
 matplotlib
-pillow
-python-telegram-bot
-openai
-json-repair
 ta
+openai
+python-dotenv
