@@ -1,4 +1,4 @@
-# BOT TRADING CON CLAUDE SONNET 4.5 - IA CON REGLAS EXPLÍCITAS DE TRADING
+# BOT TRADING CON CLAUDE SONNET 4.5 - IA CON LIBERTAD TOTAL
 # Temporalidades: 10m (ejecución) y 1h (tendencia)
 # ==============================================================================
 import os, time, requests, json, numpy as np, pandas as pd
@@ -16,7 +16,6 @@ import hashlib
 import hmac
 import logging
 import re
-from collections import OrderedDict
 from ta.momentum import RSIIndicator
 from ta.trend import MACD
 
@@ -71,7 +70,7 @@ PAPER_TRADE = True   # Cambiar a False para real
 SYMBOL = "BTCUSDT"
 INTERVAL_LTF = "10"   # 10 minutos
 INTERVAL_HTF = "60"   # 1 hora
-SLEEP_SECONDS = 120   # 2 minutos entre ciclos (temporalidades más largas)
+SLEEP_SECONDS = 120   # 2 minutos entre ciclos
 GRAFICO_VELAS_LIMIT = 80  # 80 velas de 10m = ~13 horas
 MAX_CONCURRENT_TRADES = 3
 MIN_MARGIN_PER_TRADE = 3.0
@@ -98,7 +97,7 @@ LOSS_COUNT = 0
 TOTAL_TRADES = 0
 TRADE_HISTORY = []
 
-# =================== FUNCIONES BYBIT (idénticas) ===================
+# =================== FUNCIONES BYBIT ===================
 def bybit_request(endpoint, method="GET", params=None, body=None):
     timestamp = str(int(time.time() * 1000))
     recv_window = "5000"
@@ -449,32 +448,35 @@ def pil_to_base64(img):
     img.save(buffered, format="PNG")
     return f"data:image/png;base64,{base64.b64encode(buffered.getvalue()).decode()}"
 
-# =================== PROMPT CON REGLAS EXPLÍCITAS DE TRADING ===================
+# =================== PROMPT CORREGIDO (LIBRE Y SIN DOGMAS) ===================
 PROMPT_TRADING = """
-Eres un trader profesional con décadas de experiencia. Tu tarea es analizar los gráficos de BTC/USDT en dos temporalidades:
+Eres un trader profesional con décadas de experiencia. Analiza los gráficos de BTC/USDT:
 - Gráfico 1: Velas de 10 minutos (ejecución)
 - Gráfico 2: Velas de 1 hora (tendencia)
 
-Debes aplicar las siguientes reglas de trading (son principios, no filtros rígidos, pero debes considerarlos):
-1. **Soportes y resistencias**: Nunca vendas justo en un soporte claro (el precio tiende a rebotar). Nunca compres justo en una resistencia clara (el precio tiende a rechazar). Si el soporte es muy fuerte, espera una confirmación de ruptura antes de vender.
-2. **EMAs**: Cuando el precio cruza una EMA, esta puede cambiar de rol: si estaba actuando como soporte y se rompe, puede convertirse en resistencia. Lo mismo al revés. Observa las EMAs 20 y 50.
-3. **Patrones de velas**: Busca patrones de reversión (martillo, estrella fugaz, engulfing, doji) en zonas clave. También patrones de continuación.
-4. **Trampas de liquidez**: A veces el precio rompe un nivel brevemente (liquidez) y luego vuelve. No confundas una ruptura falsa con una verdadera. Espera velas de cierre fuera del nivel.
-5. **Confirmación de tendencia**: Usa el gráfico de 1h para determinar la tendencia principal. Opera a favor de ella siempre que sea posible. Si la tendencia es alcista, prioriza compras en soportes. Si es bajista, prioriza ventas en resistencias.
-6. **RSI y MACD**: Úsalos como confirmación, no como señal principal. Divergencias entre precio e indicador son importantes.
-7. **Gestión de riesgo**: Coloca el stop loss justo detrás del último pivote o nivel relevante. El take profit 1 debe ser alcanzable (no demasiado lejano).
-8. **No sobreoperes**: Si no hay una setup clara con alta probabilidad, decide Hold.
+Interpreta libremente todo lo que ves: velas, niveles de soporte/resistencia (estáticos o dinámicos), EMAs 20/50, RSI, MACD, volumen implícito, patrones, estructura de mercado.
+
+Principios generales (son guías, no reglas fijas):
+- Un soporte puede actuar como rebote o ser roto. Observa la fuerza de las velas, las mechas, el cierre.
+- Una resistencia puede rechazar o ser superada. Lo mismo.
+- Las EMAs cambian de rol según el precio: si se rompen pueden pasar de soporte a resistencia o viceversa.
+- Los patrones de velas (martillo, engulfing, doji, etc.) ganan importancia en zonas clave.
+- Las trampas de liquidez son comunes: rupturas falsas que luego revierten. Confirma con cierres fuera del nivel.
+- La tendencia de 1h da sesgo principal, pero el precio puede tener microestructura contraria.
+- RSI y MACD son confirmación, no señales primarias. Busca divergencias.
+- Coloca el stop loss detrás del último pivote o nivel relevante. El take profit 1 debe ser alcanzable.
+- Si no ves una setup clara con buena relación riesgo/recompensa, no operes.
 
 Tu decisión debe ser COMPRAR (Buy), VENDER (Sell) o NO HACER NADA (Hold).
-Si decides Buy o Sell, debes proporcionar:
-- entry_price: precio exacto de entrada (normalmente el precio actual o un nivel límite)
-- sl_price: stop loss (nivel donde la operación se invalida)
-- tp1_price: primer objetivo parcial (idealmente un 50% del tamaño)
+Si decides Buy o Sell, proporciona:
+- entry_price: precio exacto o nivel límite
+- sl_price: stop loss
+- tp1_price: primer objetivo parcial (puede ser un 50% del tamaño)
 Además, una breve razón (máx 150 caracteres) y un análisis completo en español.
 
-Recuerda: eres libre de interpretar, pero debes evitar errores básicos como vender en un soporte evidente o comprar en una resistencia evidente.
+Eres libre de interpretar cualquier situación. No hay reglas prohibidas. Evalúa cada caso con criterio.
 
-Responde ÚNICAMENTE con un JSON válido con esta estructura:
+Responde ÚNICAMENTE con un JSON válido:
 {"decision": "Buy/Sell/Hold", "entry_price": 0.0, "sl_price": 0.0, "tp1_price": 0.0, "razon": "...", "analisis": "..."}
 Si Hold, precios 0.0.
 """
@@ -524,7 +526,7 @@ def analizar_con_claude(img_ltf, img_htf, reintentos=2):
             time.sleep(2)
     return "Hold", "Error crítico", "", 0.0, 0.0, 0.0
 
-# =================== APERTURA DE POSICIÓN (con mensaje enriquecido) ===================
+# =================== APERTURA DE POSICIÓN ===================
 def abrir_posicion(decision, precio_actual, razon, analisis, entry_ia, sl_ia, tp1_ia, df_ltf, soporte, resistencia, slope, intercept):
     global paper_balance, paper_positions, paper_trade_counter, REAL_BALANCE, TRADE_COUNTER, REAL_ACTIVE_TRADES
 
@@ -623,10 +625,8 @@ def abrir_posicion(decision, precio_actual, razon, analisis, entry_ia, sl_ia, tp
         modo = "REAL"
         balance_mostrar = REAL_BALANCE
 
-    # Enviar mensaje detallado a Telegram
     enviar_mensaje_trade(trade_id, decision, entrada, sl, tp1, qty_btc, razon, analisis, modo, balance_mostrar)
 
-    # Enviar gráfico
     img = generar_grafico(df_ltf, f"{modo} #{trade_id} {decision}", soporte, resistencia, slope, intercept,
                           entry=entrada, sl=sl, tp1=tp1, side=decision)
     if img:
@@ -722,7 +722,7 @@ def gestionar_trades_simulado(df):
     guardar_memoria()
 
 def gestionar_trades_real(df):
-    # Similar pero con órdenes reales (por implementar si se necesita)
+    # Implementar si se necesita
     pass
 
 # =================== LOOP PRINCIPAL ===================
@@ -730,8 +730,8 @@ def run_bot():
     global REAL_BALANCE, paper_balance, ultima_vela
     cargar_memoria()
     set_leverage()
-    telegram_mensaje("🤖 Bot de Trading Iniciado - Claude Sonnet 4.5\n📊 Temporalidades: 10m / 1h\n📜 Reglas de trading activas")
-    logger.info("Bot iniciado con temporalidades 10m/1h y reglas de trading explícitas")
+    telegram_mensaje("🤖 Bot de Trading Iniciado - Claude Sonnet 4.5\n📊 Temporalidades: 10m / 1h\n📜 Principios generales, sin reglas fijas")
+    logger.info("Bot iniciado con temporalidades 10m/1h y prompt libre")
     if PAPER_TRADE:
         logger.info(f"Saldo paper: {paper_balance:.2f}")
         telegram_mensaje(f"📄 Modo PAPER TRADE - Saldo inicial: {paper_balance:.2f} USDT")
@@ -755,7 +755,6 @@ def run_bot():
 
             if ultima_vela is None or ultima_vela != vela_actual:
                 ultima_vela = vela_actual
-                # Detectar zonas y tendencia
                 sop10, res10, slope10, inter10, _, _ = detectar_zonas_mercado(df10)
                 sop60, res60, slope60, inter60, _, _ = detectar_zonas_mercado(df60)
 
@@ -772,7 +771,6 @@ def run_bot():
                 else:
                     logger.error("No se generaron gráficos")
 
-            # Gestionar trades activos
             if PAPER_TRADE and paper_positions:
                 gestionar_trades_simulado(df10)
 
