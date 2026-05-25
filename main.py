@@ -430,7 +430,6 @@ class DecisionCache:
         self.cache = OrderedDict()
         self.max_size = max_size
     def get_key(self, df_ltf, df_htf):
-        # Usar último precio y RSI/MACD como hash
         last_close = df_ltf['close'].iloc[-1]
         last_rsi = df_ltf['rsi'].iloc[-1] if 'rsi' in df_ltf else 50
         last_macd = df_ltf['macd'].iloc[-1] if 'macd' in df_ltf else 0
@@ -452,45 +451,59 @@ class DecisionCache:
         logger.debug(f"Guardado en caché: {key}")
 decision_cache = DecisionCache()
 
-# =================== IA (LIBERTAD TOTAL) ===================
-def analizar_con_claude(img_ltf, img_htf):
-    try:
-        img_ltf_b64 = pil_to_base64(img_ltf)
-        img_htf_b64 = pil_to_base64(img_htf)
-        prompt = """
-Eres un trader profesional con décadas de experiencia. Analiza los gráficos de BTC/USDT en 3m y 30m.
-Dispones de velas, EMAs (20 y 50), RSI, MACD, líneas de soporte/resistencia y tendencia.
-Tienes libertad total para interpretar lo que ves. No hay reglas fijas. Eres un humano observando el mercado.
-Decide si COMPRAR (Buy), VENDER (Sell) o NO HACER NADA (Hold).
-Si decides Buy o Sell, proporciona:
-- entry_price (precio exacto de entrada, normalmente el actual o un nivel específico)
-- sl_price (stop loss, nivel donde la operación se invalida)
-- tp1_price (primer objetivo parcial)
-Además, una breve razón (máx 150 caracteres) y un análisis completo en español (sin límite).
-Respuesta ÚNICAMENTE en JSON (sin texto adicional):
+# =================== IA (LIBERTAD TOTAL, PARSING ROBUSTO) ===================
+def analizar_con_claude(img_ltf, img_htf, reintentos=2):
+    for intento in range(reintentos + 1):
+        try:
+            img_ltf_b64 = pil_to_base64(img_ltf)
+            img_htf_b64 = pil_to_base64(img_htf)
+            prompt = """Eres un trader profesional. Analiza los gráficos de BTC/USDT en 3m y 30m.
+Decide COMPRAR (Buy), VENDER (Sell) o NO HACER NADA (Hold).
+Debes responder ÚNICAMENTE con un objeto JSON válido, sin texto adicional antes o después.
+El JSON debe tener exactamente esta estructura:
 {"decision": "Buy/Sell/Hold", "entry_price": 0.0, "sl_price": 0.0, "tp1_price": 0.0, "razon": "...", "analisis": "..."}
-Si es Hold, los precios deben ser 0.0.
-"""
-        response = client.chat.completions.create(
-            model=MODELO_VISION,
-            messages=[{"role": "user", "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": img_ltf_b64}},
-                {"type": "image_url", "image_url": {"url": img_htf_b64}}
-            ]}],
-            temperature=0.3,
-            timeout=60
-        )
-        contenido = response.choices[0].message.content
-        match = re.search(r'\{.*\}(?=\s*$)', contenido, re.DOTALL)
-        if match:
-            data = json.loads(match.group())
-        else:
-            data = json.loads(contenido)
-        return data.get("decision", "Hold"), data.get("razon", ""), data.get("analisis", ""), data.get("entry_price", 0.0), data.get("sl_price", 0.0), data.get("tp1_price", 0.0)
-    except Exception as e:
-        logger.error(f"Error IA: {e}")
-        return "Hold", f"Error: {e}", "", 0.0, 0.0, 0.0
+Si la decisión es Hold, los precios deben ser 0.0.
+No incluyas markdown, ni comillas triples, ni explicaciones. Solo el JSON."""
+            response = client.chat.completions.create(
+                model=MODELO_VISION,
+                messages=[{"role": "user", "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": img_ltf_b64}},
+                    {"type": "image_url", "image_url": {"url": img_htf_b64}}
+                ]}],
+                temperature=0.2,
+                timeout=60
+            )
+            raw = response.choices[0].message.content
+            logger.debug(f"Respuesta cruda (intento {intento+1}): {raw[:300]}")
+            # Limpiar markdown
+            clean = re.sub(r'^```json\s*', '', raw, flags=re.IGNORECASE)
+            clean = re.sub(r'\s*```$', '', clean)
+            # Buscar JSON
+            match = re.search(r'\{.*?"decision"\s*:\s*"(?:Buy|Sell|Hold)".*?\}', clean, re.DOTALL)
+            if not match:
+                match = re.search(r'\{.*\}', clean, re.DOTALL)
+            if match:
+                json_str = match.group()
+                try:
+                    data = json.loads(json_str)
+                except:
+                    data = json_repair.repair_json(json_str, return_objects=True)
+                decision = data.get("decision", "Hold")
+                razon = data.get("razon", "")[:150]
+                analisis = data.get("analisis", "")
+                entry = float(data.get("entry_price", 0.0))
+                sl = float(data.get("sl_price", 0.0))
+                tp1 = float(data.get("tp1_price", 0.0))
+                return decision, razon, analisis, entry, sl, tp1
+            else:
+                raise ValueError("No se encontró JSON en la respuesta")
+        except Exception as e:
+            logger.error(f"Intento {intento+1} falló: {e}")
+            if intento == reintentos:
+                return "Hold", f"Error: {str(e)[:50]}", "", 0.0, 0.0, 0.0
+            time.sleep(2)
+    return "Hold", "Error crítico", "", 0.0, 0.0, 0.0
 
 # =================== APERTURA DE POSICIÓN (SIN FILTROS) ===================
 def abrir_posicion(decision, precio_actual, razon, analisis, entry_ia, sl_ia, tp1_ia, df_ltf, soporte, resistencia, slope, intercept):
@@ -691,7 +704,7 @@ def gestionar_trades_simulado(df):
     guardar_memoria()
 
 def gestionar_trades_real(df):
-    # Similar a simulado pero usando órdenes reales (por implementar si se necesita)
+    # Similar a simulado pero con órdenes reales (pendiente de implementar si se necesita)
     pass
 
 # =================== LOOP PRINCIPAL (SIN FILTROS) ===================
@@ -722,16 +735,14 @@ def run_bot():
 
             if ultima_vela is None or ultima_vela != vela_actual:
                 ultima_vela = vela_actual
-                # Detectar zonas y tendencia (solo para mostrarlas en el gráfico, no para filtrar)
+                # Detectar zonas y tendencia (solo para mostrarlas en el gráfico)
                 sop3, res3, slope3, inter3, _, _ = detectar_zonas_mercado(df3)
                 sop30, res30, slope30, inter30, _, _ = detectar_zonas_mercado(df30)
 
-                # Generar gráficos con toda la información
                 img3 = generar_grafico(df3, "BTC 3m", soporte=sop3, resistencia=res3, slope=slope3, intercept=inter3, excluir_actual=True)
                 img30 = generar_grafico(df30, "BTC 30m", soporte=sop30, resistencia=res30, slope=slope30, intercept=inter30, excluir_actual=True)
 
                 if img3 and img30:
-                    # Usar caché para evitar repetir decisiones similares
                     cached = decision_cache.get(df3, df30)
                     if cached:
                         dec, razon, analisis, entry, sl, tp1 = cached
@@ -740,7 +751,6 @@ def run_bot():
                         dec, razon, analisis, entry, sl, tp1 = analizar_con_claude(img3, img30)
                         decision_cache.set(df3, df30, (dec, razon, analisis, entry, sl, tp1))
                         logger.info(f"IA decide: {dec} - {razon[:100]}")
-
                     # SIN NINGÚN FILTRO: si la IA dice Buy o Sell, se ejecuta
                     if dec in ["Buy", "Sell"]:
                         abrir_posicion(dec, precio_actual, razon, analisis, entry, sl, tp1, df3, sop3, res3, slope3, inter3)
@@ -749,10 +759,8 @@ def run_bot():
                 else:
                     logger.error("No se generaron gráficos")
 
-            # Gestionar trades activos
             if PAPER_TRADE and paper_positions:
                 gestionar_trades_simulado(df3)
-            # Aquí se puede añadir gestión para real
 
             time.sleep(SLEEP_SECONDS)
         except Exception as e:
