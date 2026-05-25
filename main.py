@@ -98,30 +98,57 @@ def generar_grafico_equity(trades, equity_curve, titulo):
     plt.close(fig)
     return buf
 
-# =================== CARGAR DATOS ===================
+# =================== CARGAR DATOS (VERSIÓN ROBUSTA) ===================
 def cargar_datos():
     log(f"📥 Descargando datos desde: {DATA_URL}")
     try:
         df = pd.read_csv(DATA_URL, compression='zip')
     except Exception as e:
         raise Exception(f"Error al cargar el archivo: {e}")
-    rename_map = {
-        'Open time': 'timestamp', 'Open': 'open', 'High': 'high',
-        'Low': 'low', 'Close': 'close', 'Volume': 'volume'
+
+    # Mostrar columnas originales para depuración (útil si aún falla)
+    log(f"Columnas originales en el CSV: {df.columns.tolist()}")
+
+    # Mapeo flexible: nombre estándar -> lista de posibles nombres en el CSV
+    posibles_nombres = {
+        'timestamp': ['timestamp', 'time', 'date', 'open_time', 'Open time', 'openTime', 'datetime', 'Date'],
+        'open': ['open', 'Open', 'OPEN', 'o', 'price_open'],
+        'high': ['high', 'High', 'HIGH', 'h', 'price_high'],
+        'low': ['low', 'Low', 'LOW', 'l', 'price_low'],
+        'close': ['close', 'Close', 'CLOSE', 'c', 'price_close'],
+        'volume': ['volume', 'Volume', 'VOLUME', 'vol', 'quote_volume', 'base_volume']
     }
-    for old, new in rename_map.items():
-        if old in df.columns:
-            df.rename(columns={old: new}, inplace=True)
+
+    rename_map = {}
+    for std_name, posibles in posibles_nombres.items():
+        for col in df.columns:
+            if col in posibles or col.lower() in [p.lower() for p in posibles]:
+                rename_map[col] = std_name
+                break
+
+    if rename_map:
+        df.rename(columns=rename_map, inplace=True)
+        log(f"Columnas renombradas: {rename_map}")
+    else:
+        log("⚠️ No se pudo renombrar ninguna columna, se usarán las originales")
+
+    # Verificar que las columnas requeridas existan
     required = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
     missing = [col for col in required if col not in df.columns]
     if missing:
-        raise KeyError(f"Faltan columnas: {missing}")
+        raise KeyError(f"Faltan columnas requeridas después del mapeo: {missing}. "
+                       f"Columnas disponibles: {df.columns.tolist()}")
+
+    # Convertir timestamp a datetime
     df['timestamp'] = pd.to_datetime(df['timestamp'])
     df.set_index('timestamp', inplace=True)
-    for col in required:
+
+    # Asegurar tipos numéricos
+    for col in ['open', 'high', 'low', 'close', 'volume']:
         df[col] = pd.to_numeric(df[col], errors='coerce')
+
     df = df.sort_index()
-    log(f"✅ Datos cargados: {len(df)} velas")
+    log(f"✅ Datos cargados: {len(df)} velas desde {df.index[0]} hasta {df.index[-1]}")
     return df
 
 # =================== CONDICIONES ATÓMICAS INICIALES ===================
