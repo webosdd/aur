@@ -1,6 +1,7 @@
 # BOT TRADING CON CLAUDE SONNET 4.5 - IA CON AUTORIDAD ABSOLUTA
 # ==============================================================================
 import os, time, requests, json, numpy as np, pandas as pd
+from scipy.stats import linregress
 from datetime import datetime, timezone
 import matplotlib
 matplotlib.use('Agg')
@@ -235,18 +236,33 @@ def close_position_qty_confirm(qty, side_to_close, max_wait=5):
     logger.error("No se confirmó cierre")
     return None
 
-# =================== MEMORIA ===================
+# =================== MEMORIA PERSISTENTE ===================
 MEMORY_FILE = "memoria_bot_paper.json" if PAPER_TRADE else "memoria_bot_real.json"
 
 def guardar_memoria():
     data = {}
     if PAPER_TRADE:
-        data = {"balance": paper_balance, "win": paper_win_count, "loss": paper_loss_count, "total": paper_total_trades, "history": paper_trade_history, "positions": {tid: {k: v for k, v in t.items() if k != 'analisis_ia'} for tid, t in paper_positions.items()}}
+        data = {
+            "balance": paper_balance,
+            "win": paper_win_count,
+            "loss": paper_loss_count,
+            "total": paper_total_trades,
+            "history": paper_trade_history,
+            "positions": {tid: {k: v for k, v in t.items() if k != 'analisis_ia'} for tid, t in paper_positions.items()}
+        }
     else:
-        data = {"balance": REAL_BALANCE, "win": WIN_COUNT, "loss": LOSS_COUNT, "total": TOTAL_TRADES, "history": TRADE_HISTORY, "positions": {tid: {k: v for k, v in t.items() if k != 'analisis_ia'} for tid, t in REAL_ACTIVE_TRADES.items()}}
+        data = {
+            "balance": REAL_BALANCE,
+            "win": WIN_COUNT,
+            "loss": LOSS_COUNT,
+            "total": TOTAL_TRADES,
+            "history": TRADE_HISTORY,
+            "positions": {tid: {k: v for k, v in t.items() if k != 'analisis_ia'} for tid, t in REAL_ACTIVE_TRADES.items()}
+        }
     try:
         with open(MEMORY_FILE, "w") as f:
             json.dump(data, f, indent=4)
+        logger.info("Memoria guardada")
     except Exception as e:
         logger.error(f"Error guardando: {e}")
 
@@ -297,7 +313,7 @@ def telegram_enviar_imagen(ruta, caption=""):
     except Exception as e:
         logger.error(f"Imagen error: {e}")
 
-# =================== DATOS E INDICADORES ===================
+# =================== INDICADORES Y ANÁLISIS TÉCNICO ===================
 def obtener_velas(interval, limit=150):
     try:
         r = requests.get(f"{BASE_URL}/v5/market/kline", params={"category": "linear", "symbol": SYMBOL, "interval": interval, "limit": limit}, timeout=20)
@@ -327,7 +343,21 @@ def calcular_indicadores(df):
     df['macd_diff'] = macd.macd_diff()
     return df
 
-def generar_grafico(df, titulo, entrada=None, sl=None, tp1=None, side=None, excluir_actual=False):
+def detectar_zonas_mercado(df, idx=-2):
+    if df.empty or len(df) < 20:
+        return 0, 0, 0, 0, "LATERAL", "LATERAL"
+    df_eval = df if idx == -1 else df.iloc[:idx+1]
+    soporte = df_eval['low'].rolling(20).min().iloc[-1]
+    resistencia = df_eval['high'].rolling(20).max().iloc[-1]
+    y = df_eval['close'].values[-120:]
+    slope, intercept, _, _, _ = linregress(np.arange(len(y)), y)
+    micro_slope, _, _, _, _ = linregress(np.arange(8), df_eval['close'].values[-8:])
+    tend = 'ALCISTA' if slope > 0.01 else 'BAJISTA' if slope < -0.01 else 'LATERAL'
+    micro = 'SUBIENDO' if micro_slope > 0.2 else 'CAYENDO' if micro_slope < -0.2 else 'LATERAL'
+    return soporte, resistencia, slope, intercept, tend, micro
+
+def generar_grafico(df, titulo, soporte=None, resistencia=None, slope=None, intercept=None,
+                    entry=None, sl=None, tp1=None, side=None, excluir_actual=False):
     if df.empty:
         return None
     if excluir_actual and len(df) > 1:
@@ -343,16 +373,27 @@ def generar_grafico(df, titulo, entrada=None, sl=None, tp1=None, side=None, excl
         color = '#00ff00' if c >= o else '#ff0000'
         ax1.vlines(x[i], l, h, color=color, linewidth=1.5)
         ax1.add_patch(plt.Rectangle((x[i]-0.35, min(o,c)), 0.7, max(abs(c-o), 0.1), color=color, alpha=0.9))
-    if 'ema20' in df_plot:
+    if soporte:
+        ax1.axhline(soporte, color='cyan', ls='--', lw=2, label='Soporte')
+    if resistencia:
+        ax1.axhline(resistencia, color='magenta', ls='--', lw=2, label='Resistencia')
+    if 'ema20' in df_plot.columns:
         ax1.plot(x, df_plot['ema20'], 'yellow', lw=2, label='EMA20')
-    if entrada:
-        ax1.axhline(entrada, color='orange', ls=':', lw=1.5, label='Entry')
+    if 'ema50' in df_plot.columns:
+        ax1.plot(x, df_plot['ema50'], 'orange', lw=2, label='EMA50')
+    if slope is not None and intercept is not None and slope != 0:
+        x_trend = np.array([0, len(df_plot)-1])
+        y_trend = intercept + slope * x_trend
+        ax1.plot(x_trend, y_trend, color='white', linestyle='-.', lw=2, label='Tendencia', alpha=0.7)
+    if entry:
+        ax1.axhline(entry, color='orange', ls=':', lw=1.5, label='Entry')
+        ax1.scatter(x[-1], entry, color='lime' if side == 'Buy' else 'red', s=100, edgecolors='white', zorder=5)
     if sl:
         ax1.axhline(sl, color='red', ls='--', lw=1.5, label='SL')
     if tp1:
         ax1.axhline(tp1, color='lime', ls='--', lw=1.5, label='TP1')
     ax1.set_title(sanitize_for_matplotlib(titulo), color='white')
-    ax1.set_ylabel('Precio', color='white')
+    ax1.set_ylabel('Precio (USDT)', color='white')
     ax1.tick_params(colors='white')
     ax1.set_facecolor('#121212')
     # RSI
@@ -360,14 +401,16 @@ def generar_grafico(df, titulo, entrada=None, sl=None, tp1=None, side=None, excl
     ax2.axhline(70, color='red', ls='--', alpha=0.5)
     ax2.axhline(30, color='green', ls='--', alpha=0.5)
     ax2.set_ylabel('RSI', color='white')
+    ax2.set_ylim(0, 100)
     ax2.set_facecolor('#121212')
     # MACD
     ax3.plot(x, df_plot['macd'], 'blue', lw=1, label='MACD')
     ax3.plot(x, df_plot['macd_signal'], 'red', lw=1, label='Signal')
-    ax3.bar(x, df_plot['macd_diff'], color='gray', alpha=0.5)
+    ax3.bar(x, df_plot['macd_diff'], color='gray', alpha=0.5, label='Histogram')
     ax3.set_ylabel('MACD', color='white')
     ax3.set_facecolor('#121212')
     fig.patch.set_facecolor('#121212')
+    ax1.legend(loc='upper left', bbox_to_anchor=(1, 1), framealpha=0.5, facecolor='black', edgecolor='white', labelcolor='white')
     plt.tight_layout()
     buf = io.BytesIO()
     plt.savefig(buf, format='png', dpi=100)
@@ -381,23 +424,52 @@ def pil_to_base64(img):
     img.save(buffered, format="PNG")
     return f"data:image/png;base64,{base64.b64encode(buffered.getvalue()).decode()}"
 
-# =================== IA (AUTORIDAD ABSOLUTA) ===================
+# =================== CACHÉ DE DECISIONES ===================
+class DecisionCache:
+    def __init__(self, max_size=10):
+        self.cache = OrderedDict()
+        self.max_size = max_size
+    def get_key(self, df_ltf, df_htf):
+        # Usar último precio y RSI/MACD como hash
+        last_close = df_ltf['close'].iloc[-1]
+        last_rsi = df_ltf['rsi'].iloc[-1] if 'rsi' in df_ltf else 50
+        last_macd = df_ltf['macd'].iloc[-1] if 'macd' in df_ltf else 0
+        close_bin = round(last_close / 100) * 100
+        rsi_bin = round(last_rsi / 5) * 5
+        macd_bin = round(last_macd / 50) * 50
+        return f"{close_bin}_{rsi_bin}_{macd_bin}"
+    def get(self, df_ltf, df_htf):
+        key = self.get_key(df_ltf, df_htf)
+        if key in self.cache:
+            logger.info(f"Usando caché para clave {key}")
+            return self.cache[key]
+        return None
+    def set(self, df_ltf, df_htf, value):
+        key = self.get_key(df_ltf, df_htf)
+        self.cache[key] = value
+        if len(self.cache) > self.max_size:
+            self.cache.popitem(last=False)
+        logger.debug(f"Guardado en caché: {key}")
+decision_cache = DecisionCache()
+
+# =================== IA (LIBERTAD TOTAL) ===================
 def analizar_con_claude(img_ltf, img_htf):
     try:
         img_ltf_b64 = pil_to_base64(img_ltf)
         img_htf_b64 = pil_to_base64(img_htf)
         prompt = """
-Eres un trader profesional con experiencia. Analiza los gráficos de BTC/USDT en 3m y 30m.
-Decide si COMPRAR, VENDER o NO HACER NADA.
-No tienes restricciones: usa tu criterio total (velas, tendencias, RSI, MACD, estructura de mercado, patrones, mechas, etc.).
-Si decides Buy o Sell, indica:
-- entry_price (precio de entrada, normalmente el actual o un nivel exacto)
-- sl_price (stop loss)
+Eres un trader profesional con décadas de experiencia. Analiza los gráficos de BTC/USDT en 3m y 30m.
+Dispones de velas, EMAs (20 y 50), RSI, MACD, líneas de soporte/resistencia y tendencia.
+Tienes libertad total para interpretar lo que ves. No hay reglas fijas. Eres un humano observando el mercado.
+Decide si COMPRAR (Buy), VENDER (Sell) o NO HACER NADA (Hold).
+Si decides Buy o Sell, proporciona:
+- entry_price (precio exacto de entrada, normalmente el actual o un nivel específico)
+- sl_price (stop loss, nivel donde la operación se invalida)
 - tp1_price (primer objetivo parcial)
-Además, una breve razón (máx 150 caracteres) y un análisis completo (sin límite).
-Respuesta ÚNICAMENTE en JSON:
+Además, una breve razón (máx 150 caracteres) y un análisis completo en español (sin límite).
+Respuesta ÚNICAMENTE en JSON (sin texto adicional):
 {"decision": "Buy/Sell/Hold", "entry_price": 0.0, "sl_price": 0.0, "tp1_price": 0.0, "razon": "...", "analisis": "..."}
-Si es Hold, precios 0.0.
+Si es Hold, los precios deben ser 0.0.
 """
         response = client.chat.completions.create(
             model=MODELO_VISION,
@@ -410,7 +482,6 @@ Si es Hold, precios 0.0.
             timeout=60
         )
         contenido = response.choices[0].message.content
-        # Extraer JSON
         match = re.search(r'\{.*\}(?=\s*$)', contenido, re.DOTALL)
         if match:
             data = json.loads(match.group())
@@ -421,8 +492,8 @@ Si es Hold, precios 0.0.
         logger.error(f"Error IA: {e}")
         return "Hold", f"Error: {e}", "", 0.0, 0.0, 0.0
 
-# =================== APERTURA DE ORDEN (SIN FILTROS) ===================
-def abrir_posicion(decision, precio_actual, razon, analisis, entry_ia, sl_ia, tp1_ia, df_ltf):
+# =================== APERTURA DE POSICIÓN (SIN FILTROS) ===================
+def abrir_posicion(decision, precio_actual, razon, analisis, entry_ia, sl_ia, tp1_ia, df_ltf, soporte, resistencia, slope, intercept):
     global paper_balance, paper_positions, paper_trade_counter, REAL_BALANCE, TRADE_COUNTER, REAL_ACTIVE_TRADES
 
     if decision not in ["Buy", "Sell"]:
@@ -452,7 +523,6 @@ def abrir_posicion(decision, precio_actual, razon, analisis, entry_ia, sl_ia, tp
         logger.error("Margen libre insuficiente")
         return
 
-    # Usar precios de IA o por defecto
     entrada = entry_ia if entry_ia and entry_ia > 0 else precio_actual
     sl = sl_ia if sl_ia and sl_ia > 0 else (entrada * 0.995 if decision == "Buy" else entrada * 1.005)
     tp1 = tp1_ia if tp1_ia and tp1_ia > 0 else (entrada * 1.005 if decision == "Buy" else entrada * 0.995)
@@ -469,7 +539,7 @@ def abrir_posicion(decision, precio_actual, razon, analisis, entry_ia, sl_ia, tp
         if tp1 >= entrada:
             tp1 = entrada * 0.995
 
-    riesgo_usdt = min(3.0, free_margin * 0.1)  # máx 3 USDT de riesgo por trade
+    riesgo_usdt = min(3.0, free_margin * 0.1)
     distancia_sl = abs(entrada - sl)
     if distancia_sl <= 0:
         distancia_sl = entrada * 0.002
@@ -523,8 +593,8 @@ def abrir_posicion(decision, precio_actual, razon, analisis, entry_ia, sl_ia, tp
     logger.info(msg)
     telegram_mensaje(msg)
 
-    # Enviar gráfico con niveles
-    img = generar_grafico(df_ltf, f"{modo} #{trade_id} {decision}", entrada=entrada, sl=sl, tp1=tp1, side=decision)
+    img = generar_grafico(df_ltf, f"{modo} #{trade_id} {decision}", soporte, resistencia, slope, intercept,
+                          entry=entrada, sl=sl, tp1=tp1, side=decision)
     if img:
         img.save("/tmp/entrada.png")
         telegram_enviar_imagen("/tmp/entrada.png", caption=f"#{trade_id} Entry {entrada:.2f} SL {sl:.2f} TP1 {tp1:.2f}")
@@ -599,7 +669,7 @@ def gestionar_trades_simulado(df):
                     cerrar.append(tid)
                     logger.info(f"Trailing close #{tid} PnL {total:.2f}")
                     telegram_mensaje(f"Trailing close #{tid} PnL {total:.2f}")
-        # Stop loss inicial si no TP1
+        # Stop loss inicial (solo si no se ha tocado TP1)
         if not t.get('tp1_ejecutado', False) and t['qty_restante'] > 0:
             if (t['decision']=="Buy" and l <= t['sl_actual']) or (t['decision']=="Sell" and h >= t['sl_actual']):
                 qty = t['qty_restante']
@@ -620,13 +690,17 @@ def gestionar_trades_simulado(df):
         del paper_positions[tid]
     guardar_memoria()
 
-# =================== LOOP PRINCIPAL ===================
+def gestionar_trades_real(df):
+    # Similar a simulado pero usando órdenes reales (por implementar si se necesita)
+    pass
+
+# =================== LOOP PRINCIPAL (SIN FILTROS) ===================
 def run_bot():
     global REAL_BALANCE, paper_balance, ultima_vela
     cargar_memoria()
     set_leverage()
-    telegram_mensaje("Bot iniciado con Claude Sonnet 4.5 (IA absoluta)")
-    logger.info("Bot iniciado")
+    telegram_mensaje("Bot iniciado con Claude Sonnet 4.5 - IA con autoridad total")
+    logger.info("Bot iniciado - Sin filtros de mercado, la IA decide todo")
     if PAPER_TRADE:
         logger.info(f"Saldo paper: {paper_balance:.2f}")
     else:
@@ -648,21 +722,37 @@ def run_bot():
 
             if ultima_vela is None or ultima_vela != vela_actual:
                 ultima_vela = vela_actual
-                # Análisis con IA (sin filtros)
-                img3 = generar_grafico(df3, "BTC 3m", excluir_actual=True)
-                img30 = generar_grafico(df30, "BTC 30m", excluir_actual=True)
+                # Detectar zonas y tendencia (solo para mostrarlas en el gráfico, no para filtrar)
+                sop3, res3, slope3, inter3, _, _ = detectar_zonas_mercado(df3)
+                sop30, res30, slope30, inter30, _, _ = detectar_zonas_mercado(df30)
+
+                # Generar gráficos con toda la información
+                img3 = generar_grafico(df3, "BTC 3m", soporte=sop3, resistencia=res3, slope=slope3, intercept=inter3, excluir_actual=True)
+                img30 = generar_grafico(df30, "BTC 30m", soporte=sop30, resistencia=res30, slope=slope30, intercept=inter30, excluir_actual=True)
+
                 if img3 and img30:
-                    dec, razon, analisis, entry, sl, tp1 = analizar_con_claude(img3, img30)
-                    logger.info(f"IA decide: {dec} - {razon[:100]}")
+                    # Usar caché para evitar repetir decisiones similares
+                    cached = decision_cache.get(df3, df30)
+                    if cached:
+                        dec, razon, analisis, entry, sl, tp1 = cached
+                        logger.info(f"Usando decisión en caché: {dec}")
+                    else:
+                        dec, razon, analisis, entry, sl, tp1 = analizar_con_claude(img3, img30)
+                        decision_cache.set(df3, df30, (dec, razon, analisis, entry, sl, tp1))
+                        logger.info(f"IA decide: {dec} - {razon[:100]}")
+
+                    # SIN NINGÚN FILTRO: si la IA dice Buy o Sell, se ejecuta
                     if dec in ["Buy", "Sell"]:
-                        abrir_posicion(dec, precio_actual, razon, analisis, entry, sl, tp1, df3)
+                        abrir_posicion(dec, precio_actual, razon, analisis, entry, sl, tp1, df3, sop3, res3, slope3, inter3)
+                    else:
+                        logger.info(f"IA decidió Hold. Razón: {razon[:100]}")
                 else:
                     logger.error("No se generaron gráficos")
 
             # Gestionar trades activos
             if PAPER_TRADE and paper_positions:
                 gestionar_trades_simulado(df3)
-            # Aquí se puede añadir gestión para real (similar)
+            # Aquí se puede añadir gestión para real
 
             time.sleep(SLEEP_SECONDS)
         except Exception as e:
