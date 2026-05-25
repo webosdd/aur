@@ -1,5 +1,6 @@
 # BOT TRADING CON CLAUDE SONNET 4.5 - IA CON LIBERTAD TOTAL
 # Temporalidades: 10m (ejecución) y 1h (tendencia)
+# Mensajes de Telegram con todos los detalles del trade
 # ==============================================================================
 import os, time, requests, json, numpy as np, pandas as pd
 from scipy.stats import linregress
@@ -292,7 +293,7 @@ def cargar_memoria():
     except Exception as e:
         logger.error(f"Error cargando: {e}")
 
-# =================== TELEGRAM (con emojis) ===================
+# =================== TELEGRAM (con emojis y todos los detalles) ===================
 def telegram_mensaje(texto):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -313,21 +314,23 @@ def telegram_enviar_imagen(ruta, caption=""):
     except Exception as e:
         logger.error(f"Imagen error: {e}")
 
-def enviar_mensaje_trade(trade_id, decision, entrada, sl, tp1, qty, razon, analisis, modo, balance):
+def enviar_mensaje_trade(trade_id, decision, entrada, sl, tp1, qty, razon, analisis, modo, balance,
+                         setup, patron_velas, niveles_clave, tendencia_1h, rsi_macd_info, riesgo_recompensa):
     emoji_decision = "✅ COMPRAR" if decision == "Buy" else "🔴 VENDER"
-    emoji_entry = "🚪"
-    emoji_sl = "🛑"
-    emoji_tp = "🎯"
-    emoji_qty = "📊"
-    emoji_balance = "💰"
     msg = (
         f"{emoji_decision} *{modo} #{trade_id}*\n"
-        f"{emoji_entry} *Entrada:* {entrada:.2f} USDT\n"
-        f"{emoji_sl} *Stop Loss:* {sl:.2f} USDT\n"
-        f"{emoji_tp} *Take Profit 1:* {tp1:.2f} USDT\n"
-        f"{emoji_qty} *Cantidad:* {qty:.3f} BTC\n"
-        f"{emoji_balance} *Balance:* {balance:.2f} USDT\n"
-        f"📝 *Razón:* {razon[:200]}\n"
+        f"🚪 *Entrada:* {entrada:.2f} USDT\n"
+        f"🛑 *Stop Loss:* {sl:.2f} USDT\n"
+        f"🎯 *Take Profit 1:* {tp1:.2f} USDT\n"
+        f"📊 *Cantidad:* {qty:.3f} BTC\n"
+        f"💰 *Balance:* {balance:.2f} USDT\n\n"
+        f"📌 *Setup detectado:* {setup}\n"
+        f"🕯️ *Patrón de velas:* {patron_velas}\n"
+        f"📈 *Niveles clave:* {niveles_clave}\n"
+        f"🌍 *Tendencia 1h:* {tendencia_1h}\n"
+        f"📊 *RSI/MACD:* {rsi_macd_info}\n"
+        f"⚖️ *Riesgo/Recompensa:* {riesgo_recompensa:.2f}\n\n"
+        f"📝 *Razón:* {razon}\n"
         f"🔍 *Análisis:* {analisis[:300]}..."
     )
     telegram_mensaje(msg)
@@ -448,7 +451,7 @@ def pil_to_base64(img):
     img.save(buffered, format="PNG")
     return f"data:image/png;base64,{base64.b64encode(buffered.getvalue()).decode()}"
 
-# =================== PROMPT CORREGIDO (LIBRE Y SIN DOGMAS) ===================
+# =================== PROMPT MEJORADO (con todos los campos solicitados) ===================
 PROMPT_TRADING = """
 Eres un trader profesional con décadas de experiencia. Analiza los gráficos de BTC/USDT:
 - Gráfico 1: Velas de 10 minutos (ejecución)
@@ -468,17 +471,38 @@ Principios generales (son guías, no reglas fijas):
 - Si no ves una setup clara con buena relación riesgo/recompensa, no operes.
 
 Tu decisión debe ser COMPRAR (Buy), VENDER (Sell) o NO HACER NADA (Hold).
-Si decides Buy o Sell, proporciona:
+Si decides Buy o Sell, debes proporcionar los siguientes campos en el JSON:
+
 - entry_price: precio exacto o nivel límite
 - sl_price: stop loss
-- tp1_price: primer objetivo parcial (puede ser un 50% del tamaño)
-Además, una breve razón (máx 150 caracteres) y un análisis completo en español.
+- tp1_price: primer objetivo parcial
+- razon: breve razón (max 150 caracteres)
+- analisis: análisis completo en español
+- setup: descripción del setup detectado (ej: "rebote en soporte histórico", "ruptura de resistencia con vela fuerte", "divergencia RSI")
+- patron_velas: patrón de velas observado (ej: "martillo", "engulfing alcista", "estrella fugaz")
+- niveles_clave: string con los niveles involucrados y sus precios (ej: "Soporte en 85000, Resistencia en 87000, EMA20 en 86000")
+- tendencia_1h: tendencia principal (alcista/bajista/lateral) basada en el gráfico de 1h
+- rsi_macd_info: valores relevantes de RSI y MACD, y si hay divergencia (ej: "RSI 28 (sobrevendido), MACD cruce alcista, divergencia alcista")
+- riesgo_recompensa: número decimal (relación distancia SL / distancia TP1, ej: 2.5)
 
-Eres libre de interpretar cualquier situación. No hay reglas prohibidas. Evalúa cada caso con criterio.
+Eres libre de interpretar cualquier situación. No hay reglas prohibidas.
 
-Responde ÚNICAMENTE con un JSON válido:
-{"decision": "Buy/Sell/Hold", "entry_price": 0.0, "sl_price": 0.0, "tp1_price": 0.0, "razon": "...", "analisis": "..."}
-Si Hold, precios 0.0.
+Responde ÚNICAMENTE con un JSON válido con la siguiente estructura:
+{
+  "decision": "Buy/Sell/Hold",
+  "entry_price": 0.0,
+  "sl_price": 0.0,
+  "tp1_price": 0.0,
+  "razon": "...",
+  "analisis": "...",
+  "setup": "...",
+  "patron_velas": "...",
+  "niveles_clave": "...",
+  "tendencia_1h": "...",
+  "rsi_macd_info": "...",
+  "riesgo_recompensa": 0.0
+}
+Si la decisión es Hold, los precios deben ser 0.0 y los demás campos pueden ser cadenas vacías o "N/A".
 """
 
 def analizar_con_claude(img_ltf, img_htf, reintentos=2):
@@ -497,8 +521,7 @@ def analizar_con_claude(img_ltf, img_htf, reintentos=2):
                 timeout=60
             )
             raw = response.choices[0].message.content
-            logger.debug(f"Respuesta cruda (intento {intento+1}): {raw[:300]}")
-            # Limpiar markdown
+            logger.debug(f"Respuesta cruda: {raw[:500]}")
             clean = re.sub(r'^```json\s*', '', raw, flags=re.IGNORECASE)
             clean = re.sub(r'\s*```$', '', clean)
             match = re.search(r'\{.*?"decision"\s*:\s*"(?:Buy|Sell|Hold)".*?\}', clean, re.DOTALL)
@@ -516,18 +539,26 @@ def analizar_con_claude(img_ltf, img_htf, reintentos=2):
                 entry = float(data.get("entry_price", 0.0))
                 sl = float(data.get("sl_price", 0.0))
                 tp1 = float(data.get("tp1_price", 0.0))
-                return decision, razon, analisis, entry, sl, tp1
+                setup = data.get("setup", "N/A")
+                patron_velas = data.get("patron_velas", "N/A")
+                niveles_clave = data.get("niveles_clave", "N/A")
+                tendencia_1h = data.get("tendencia_1h", "N/A")
+                rsi_macd_info = data.get("rsi_macd_info", "N/A")
+                riesgo_recompensa = float(data.get("riesgo_recompensa", 0.0))
+                return decision, razon, analisis, entry, sl, tp1, setup, patron_velas, niveles_clave, tendencia_1h, rsi_macd_info, riesgo_recompensa
             else:
                 raise ValueError("No se encontró JSON")
         except Exception as e:
             logger.error(f"Intento {intento+1} falló: {e}")
             if intento == reintentos:
-                return "Hold", f"Error: {str(e)[:50]}", "", 0.0, 0.0, 0.0
+                return "Hold", f"Error: {str(e)[:50]}", "", 0.0, 0.0, 0.0, "N/A", "N/A", "N/A", "N/A", "N/A", 0.0
             time.sleep(2)
-    return "Hold", "Error crítico", "", 0.0, 0.0, 0.0
+    return "Hold", "Error crítico", "", 0.0, 0.0, 0.0, "N/A", "N/A", "N/A", "N/A", "N/A", 0.0
 
 # =================== APERTURA DE POSICIÓN ===================
-def abrir_posicion(decision, precio_actual, razon, analisis, entry_ia, sl_ia, tp1_ia, df_ltf, soporte, resistencia, slope, intercept):
+def abrir_posicion(decision, precio_actual, razon, analisis, entry_ia, sl_ia, tp1_ia, df_ltf,
+                   soporte, resistencia, slope, intercept,
+                   setup, patron_velas, niveles_clave, tendencia_1h, rsi_macd_info, riesgo_recompensa):
     global paper_balance, paper_positions, paper_trade_counter, REAL_BALANCE, TRADE_COUNTER, REAL_ACTIVE_TRADES
 
     if decision not in ["Buy", "Sell"]:
@@ -603,6 +634,8 @@ def abrir_posicion(decision, precio_actual, razon, analisis, entry_ia, sl_ia, tp
             "qty_original": qty_btc, "qty_restante": round(qty_btc - qty_btc * TP1_PERCENT, 3),
             "tp1_ejecutado": False, "pnl_parcial": 0.0,
             "razon": razon, "analisis": analisis,
+            "setup": setup, "patron_velas": patron_velas, "niveles_clave": niveles_clave,
+            "tendencia_1h": tendencia_1h, "rsi_macd_info": rsi_macd_info, "riesgo_recompensa": riesgo_recompensa,
             "trailing_activado": False, "best_price": entrada, "trailing_stop": None
         }
         modo = "PAPER"
@@ -620,13 +653,18 @@ def abrir_posicion(decision, precio_actual, razon, analisis, entry_ia, sl_ia, tp
             "qty_original": qty_btc, "qty_restante": round(qty_btc - qty_btc * TP1_PERCENT, 3),
             "tp1_ejecutado": False, "pnl_parcial": 0.0,
             "razon": razon, "analisis": analisis,
+            "setup": setup, "patron_velas": patron_velas, "niveles_clave": niveles_clave,
+            "tendencia_1h": tendencia_1h, "rsi_macd_info": rsi_macd_info, "riesgo_recompensa": riesgo_recompensa,
             "trailing_activado": False, "best_price": entrada, "trailing_stop": None
         }
         modo = "REAL"
         balance_mostrar = REAL_BALANCE
 
-    enviar_mensaje_trade(trade_id, decision, entrada, sl, tp1, qty_btc, razon, analisis, modo, balance_mostrar)
+    # Enviar mensaje a Telegram con todos los detalles
+    enviar_mensaje_trade(trade_id, decision, entrada, sl, tp1, qty_btc, razon, analisis, modo, balance_mostrar,
+                         setup, patron_velas, niveles_clave, tendencia_1h, rsi_macd_info, riesgo_recompensa)
 
+    # Enviar gráfico
     img = generar_grafico(df_ltf, f"{modo} #{trade_id} {decision}", soporte, resistencia, slope, intercept,
                           entry=entrada, sl=sl, tp1=tp1, side=decision)
     if img:
@@ -722,16 +760,15 @@ def gestionar_trades_simulado(df):
     guardar_memoria()
 
 def gestionar_trades_real(df):
-    # Implementar si se necesita
-    pass
+    pass  # Similar pero con órdenes reales (se puede implementar después)
 
 # =================== LOOP PRINCIPAL ===================
 def run_bot():
     global REAL_BALANCE, paper_balance, ultima_vela
     cargar_memoria()
     set_leverage()
-    telegram_mensaje("🤖 Bot de Trading Iniciado - Claude Sonnet 4.5\n📊 Temporalidades: 10m / 1h\n📜 Principios generales, sin reglas fijas")
-    logger.info("Bot iniciado con temporalidades 10m/1h y prompt libre")
+    telegram_mensaje("🤖 Bot de Trading Iniciado - Claude Sonnet 4.5\n📊 Temporalidades: 10m / 1h\n📜 Análisis completo con todos los detalles")
+    logger.info("Bot iniciado con temporalidades 10m/1h y prompt detallado")
     if PAPER_TRADE:
         logger.info(f"Saldo paper: {paper_balance:.2f}")
         telegram_mensaje(f"📄 Modo PAPER TRADE - Saldo inicial: {paper_balance:.2f} USDT")
@@ -762,10 +799,12 @@ def run_bot():
                 img60 = generar_grafico(df60, "BTC 1h", soporte=sop60, resistencia=res60, slope=slope60, intercept=inter60, excluir_actual=True)
 
                 if img10 and img60:
-                    dec, razon, analisis, entry, sl, tp1 = analizar_con_claude(img10, img60)
+                    dec, razon, analisis, entry, sl, tp1, setup, patron, niveles, tendencia, rsi_macd, rr = analizar_con_claude(img10, img60)
                     logger.info(f"🤖 IA decide: {dec} - {razon[:100]}")
                     if dec in ["Buy", "Sell"]:
-                        abrir_posicion(dec, precio_actual, razon, analisis, entry, sl, tp1, df10, sop10, res10, slope10, inter10)
+                        abrir_posicion(dec, precio_actual, razon, analisis, entry, sl, tp1, df10,
+                                       sop10, res10, slope10, inter10,
+                                       setup, patron, niveles, tendencia, rsi_macd, rr)
                     else:
                         logger.info(f"Hold. Razón: {razon[:100]}")
                 else:
