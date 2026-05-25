@@ -1,7 +1,8 @@
 import os
 import time
-import base64
 import json
+import itertools
+import base64
 import requests
 import pandas as pd
 import numpy as np
@@ -26,9 +27,12 @@ DATA_DIR = "data"
 SAMPLES_DIR = "samples"
 INITIAL_BALANCE = 1000.0
 COMMISSION = 0.001
-MIN_MOVE_PERCENT = 1.2        # Movimiento mínimo para considerar muestra
-LOOKAHEAD_VELAS = 10           # Velas adelante para calcular movimiento
-MAX_SAMPLES = 50               # Máximo de muestras a generar
+MIN_MOVE_PERCENT = 1.2
+LOOKAHEAD_VELAS = 10
+MAX_SAMPLES = 50
+MAX_TRADES_BACKTEST = 50          # Límite de trades en backtest
+RISK_PERCENT = 0.02               # 2% del balance por trade
+MAX_POSITION_PCT = 0.10           # Máx 10% del balance en una posición
 
 # =================== FUNCIONES AUXILIARES ===================
 def send_telegram(text, parse_mode="Markdown"):
@@ -92,7 +96,7 @@ def generar_grafico(df, titulo, entry_price=None):
     plt.close()
     return buf
 
-# =================== 1. DESCARGA DE DATOS (BYBIT) ===================
+# =================== 1. DESCARGA DE DATOS ===================
 def fetch_klines(interval):
     os.makedirs(DATA_DIR, exist_ok=True)
     filepath = f"{DATA_DIR}/{SYMBOL}_{interval}m_{START_DATE}_{END_DATE}.csv"
@@ -153,7 +157,6 @@ def generar_muestras(df_10m):
     print(f"Movimientos detectados: {len(movimientos)}")
     muestras = []
     for idx, direction, change in movimientos[:MAX_SAMPLES]:
-        # ventana de 100 velas alrededor
         start_idx = max(0, df_10m.index.get_loc(idx) - 80)
         end_idx = df_10m.index.get_loc(idx)
         df_window = df_10m.iloc[start_idx:end_idx+1].copy()
@@ -174,15 +177,14 @@ def generar_muestras(df_10m):
     return muestras
 
 # =================== 3. (OPCIONAL) EXTRAER REGLAS CON IA ===================
-# Solo ejecutar si se desea y se tiene OPENROUTER_API_KEY
 def extraer_reglas_con_ia(muestras, max_imagenes=20):
     if not OPENROUTER_API_KEY:
-        print("❌ OPENROUTER_API_KEY no configurada, no se extraerán reglas con IA")
+        print("❌ OPENROUTER_API_KEY no configurada, omitiendo extracción de reglas")
         return
     client = OpenAI(
         base_url="https://openrouter.ai/api/v1",
         api_key=OPENROUTER_API_KEY,
-        default_headers={"HTTP-Referer": "https://railway.app", "X-Title": "Backtest Rule Extractor"}
+        default_headers={"HTTP-Referer": "https://railway.app", "X-Title": "Rule Extractor"}
     )
     prompt = """
 Eres un trader profesional. Analiza este gráfico de BTC/USDT (velas de 10 minutos).
@@ -217,49 +219,31 @@ Responde como lista de condiciones objetivas y programables (ej: "RSI < 30", "pr
         f.write("\n\n".join(reglas))
     print("✅ Reglas guardadas en reglas_extraidas.txt")
 
-# =================== 4. BACKTEST CON REGLAS CODIFICADAS ===================
-# Aquí debes codificar las reglas que extrajiste manualmente
-def es_buy(df_10m, df_60m, idx):
+# =================== 4. BACKTEST CON MÚLTIPLES REGLAS ===================
+def backtest_con_regla(df_10m, df_60m, condicion_buy):
     """
-    Ejemplo de regla: compra si RSI < 30 y precio está cerca de EMA20 (rebote).
-    Reemplaza con tus propias reglas basadas en el archivo reglas_extraidas.txt.
+    Ejecuta backtest con una condición de compra (función que recibe df_10m, df_60m, índice).
+    Devuelve lista de trades y balance final.
     """
-    close = df_10m['close'].iloc[idx]
-    rsi = df_10m['rsi'].iloc[idx]
-    ema20 = df_10m['ema20'].iloc[idx]
-    # Regla 1: RSI en sobreventa y precio por debajo de EMA20?
-    if rsi < 30 and close < ema20:
-        return True
-    # Regla 2: MACD cruce alcista
-    macd = df_10m['macd'].iloc[idx]
-    signal = df_10m['macd_signal'].iloc[idx]
-    macd_prev = df_10m['macd'].iloc[idx-1]
-    signal_prev = df_10m['macd_signal'].iloc[idx-1]
-    if macd > signal and macd_prev <= signal_prev:
-        return True
-    return False
-
-def es_sell(df_10m, df_60m, idx):
-    # Similar para ventas (puedes implementar si quieres)
-    return False
-
-def backtest(df_10m, df_60m):
     balance = INITIAL_BALANCE
     in_position = False
     position = None
     trades = []
-    for i in range(100, len(df_10m)):  # empezar con suficientes velas
+    for i in range(100, len(df_10m)):
         if not in_position:
-            if es_buy(df_10m, df_60m, i):
+            if condicion_buy(df_10m, df_60m, i):
                 entry = df_10m['close'].iloc[i]
-                sl = entry * 0.995  # -0.5%
-                tp1 = entry * 1.005  # +0.5%
-                qty = (balance * 0.02) / entry  # riesgo 2%
-                if qty * entry > balance * 0.1:  # no arriesgar más del 10% del balance
-                    qty = (balance * 0.1) / entry
+                sl = entry * 0.995      # -0.5%
+                tp1 = entry * 1.005     # +0.5%
+                qty = (balance * RISK_PERCENT) / (entry - sl) if (entry - sl) > 0 else 0
+                max_qty = (balance * MAX_POSITION_PCT) / entry
+                qty = min(qty, max_qty)
+                if qty * entry > balance * MAX_POSITION_PCT:
+                    qty = (balance * MAX_POSITION_PCT) / entry
+                if qty < 0.0001:   # mínimo BTC
+                    continue
                 in_position = True
                 position = {
-                    'entry_idx': i,
                     'entry': entry,
                     'sl': sl,
                     'tp1': tp1,
@@ -268,49 +252,113 @@ def backtest(df_10m, df_60m):
                 }
         else:
             current = df_10m['close'].iloc[i]
-            if position['direction'] == 'BUY':
-                if current >= position['tp1']:
-                    pnl = (position['tp1'] - position['entry']) * position['qty']
-                    pnl -= abs(pnl) * COMMISSION
-                    balance += pnl
-                    trades.append({'pnl': pnl, 'exit': 'TP1'})
-                    in_position = False
-                elif current <= position['sl']:
-                    pnl = (position['sl'] - position['entry']) * position['qty']
-                    pnl -= abs(pnl) * COMMISSION
-                    balance += pnl
-                    trades.append({'pnl': pnl, 'exit': 'SL'})
-                    in_position = False
+            if current >= position['tp1']:
+                pnl = (position['tp1'] - position['entry']) * position['qty']
+                pnl -= abs(pnl) * COMMISSION
+                balance += pnl
+                trades.append({'pnl': pnl, 'exit': 'TP1'})
+                in_position = False
+            elif current <= position['sl']:
+                pnl = (position['sl'] - position['entry']) * position['qty']
+                pnl -= abs(pnl) * COMMISSION
+                balance += pnl
+                trades.append({'pnl': pnl, 'exit': 'SL'})
+                in_position = False
+            if len(trades) >= MAX_TRADES_BACKTEST:
+                break
     return trades, balance
 
-# =================== 5. REPORTE A TELEGRAM (RESUMEN + 20 IMÁGENES) ===================
-def enviar_resumen_y_graficos(trades, final_balance, muestras):
-    total = len(trades)
-    wins = sum(1 for t in trades if t['pnl'] > 0)
-    losses = total - wins
-    pnl_total = sum(t['pnl'] for t in trades)
-    winrate = (wins / total * 100) if total else 0
-    resumen = f"""📊 *BACKTEST COMPLETADO*
-Trades totales: {total}
-✅ Ganados: {wins}
-❌ Perdidos: {losses}
-📈 Winrate: {winrate:.1f}%
-💰 PnL total: {pnl_total:+.2f} USDT
-💵 Balance final: {final_balance:.2f} USDT
-"""
-    send_telegram(resumen)
+def evaluar_reglas(df_10m, df_60m):
+    """
+    Define condiciones atómicas y prueba combinaciones en AND.
+    Retorna la mejor combinación (tupla de condiciones) y sus métricas.
+    """
+    # Condiciones atómicas (todas reciben df_10m, idx)
+    def cond_rsi_sobreventa(df, _, idx):
+        return df['rsi'].iloc[idx] < 30
+    def cond_rsi_sobrecompra(df, _, idx):
+        return df['rsi'].iloc[idx] > 70
+    def cond_precio_debajo_ema20(df, _, idx):
+        return df['close'].iloc[idx] < df['ema20'].iloc[idx]
+    def cond_precio_encima_ema20(df, _, idx):
+        return df['close'].iloc[idx] > df['ema20'].iloc[idx]
+    def cond_macd_cruce_alcista(df, _, idx):
+        return (df['macd'].iloc[idx] > df['macd_signal'].iloc[idx]) and \
+               (df['macd'].iloc[idx-1] <= df['macd_signal'].iloc[idx-1])
+    def cond_macd_cruce_bajista(df, _, idx):
+        return (df['macd'].iloc[idx] < df['macd_signal'].iloc[idx]) and \
+               (df['macd'].iloc[idx-1] >= df['macd_signal'].iloc[idx-1])
+    def cond_precio_cerca_soporte(df, _, idx):
+        # soporte simple: mínimo de últimas 20 velas
+        soporte = df['low'].iloc[max(0,idx-20):idx+1].min()
+        return abs(df['close'].iloc[idx] - soporte) / df['close'].iloc[idx] < 0.002
+    def cond_precio_cerca_resistencia(df, _, idx):
+        resistencia = df['high'].iloc[max(0,idx-20):idx+1].max()
+        return abs(resistencia - df['close'].iloc[idx]) / df['close'].iloc[idx] < 0.002
 
-    # Enviar hasta 20 imágenes de las muestras (señales generadas)
+    condiciones = [
+        ('RSI < 30', cond_rsi_sobreventa),
+        ('RSI > 70', cond_rsi_sobrecompra),
+        ('Precio < EMA20', cond_precio_debajo_ema20),
+        ('Precio > EMA20', cond_precio_encima_ema20),
+        ('MACD cruce alcista', cond_macd_cruce_alcista),
+        ('MACD cruce bajista', cond_macd_cruce_bajista),
+        ('Precio cerca de soporte', cond_precio_cerca_soporte),
+        ('Precio cerca de resistencia', cond_precio_cerca_resistencia),
+    ]
+
+    resultados = []
+    # Probar combinaciones de 2 condiciones en AND
+    for (nombre1, c1), (nombre2, c2) in itertools.combinations(condiciones, 2):
+        regla = lambda df, _, i: c1(df, _, i) and c2(df, _, i)
+        trades, balance_final = backtest_con_regla(df_10m, df_60m, regla)
+        if not trades:
+            continue
+        pnl_total = sum(t['pnl'] for t in trades)
+        wins = sum(1 for t in trades if t['pnl'] > 0)
+        winrate = wins / len(trades) * 100 if trades else 0
+        resultados.append({
+            'regla': f"{nombre1} AND {nombre2}",
+            'trades': len(trades),
+            'winrate': winrate,
+            'pnl_total': pnl_total,
+            'balance_final': balance_final
+        })
+    # Ordenar por winrate descendente
+    resultados.sort(key=lambda x: x['winrate'], reverse=True)
+    if resultados:
+        mejor = resultados[0]
+        # Construir función para la mejor regla (necesitamos la función real para backtest final)
+        # Pero para este resumen, solo enviamos el texto.
+        return mejor, resultados[:5]  # top 5
+    else:
+        return None, []
+
+# =================== 5. REPORTE A TELEGRAM (RESUMEN + GRÁFICOS) ===================
+def enviar_resumen_y_graficos(mejor_regla, top_resultados, muestras):
+    if mejor_regla:
+        msg = f"🏆 *MEJOR REGLA ENCONTRADA*\n{mejor_regla['regla']}\n\n📊 Rendimiento:\n"
+        msg += f"Trades: {mejor_regla['trades']}\n"
+        msg += f"Winrate: {mejor_regla['winrate']:.1f}%\n"
+        msg += f"PnL total: {mejor_regla['pnl_total']:+.2f} USDT\n"
+        msg += f"Balance final: {mejor_regla['balance_final']:.2f} USDT\n\n"
+        msg += "📈 *TOP 5 REGLAS*:\n"
+        for r in top_resultados:
+            msg += f"- {r['regla']}: {r['winrate']:.1f}% ({r['trades']} trades)\n"
+        send_telegram(msg)
+    else:
+        send_telegram("❌ No se encontraron combinaciones de reglas con trades.")
+
+    # Enviar hasta 20 imágenes de las muestras (primeras 20)
     for idx, m in enumerate(muestras[:20]):
         caption = f"🔔 Señal #{idx+1}: {m['direction']} {m['cambio']:.1f}%\n{m['timestamp'].strftime('%Y-%m-%d %H:%M')}"
-        # reutilizar el buffer de imagen guardado
         with open(m['image_path'], 'rb') as f:
             img_buf = BytesIO(f.read())
         send_telegram_image(img_buf, caption)
 
 # =================== MAIN ===================
 def main():
-    print("🚀 Iniciando pipeline de backtest...")
+    print("🚀 Iniciando pipeline de optimización de reglas...")
     # 1. Descargar datos
     ltf_path = fetch_klines(10)
     htf_path = fetch_klines(60)
@@ -326,18 +374,21 @@ def main():
     # 2. Generar muestras
     muestras = generar_muestras(df_10m)
 
-    # 3. (Opcional) Extraer reglas con IA - descomentar si se tiene API key
+    # 3. (Opcional) Extraer reglas con IA - Comentar si no se quiere usar
     # extraer_reglas_con_ia(muestras, max_imagenes=20)
 
-    # 4. Backtest con reglas codificadas
-    trades, final_balance = backtest(df_10m, df_60m)
+    # 4. Evaluar combinaciones de reglas
+    mejor_regla, top_resultados = evaluar_reglas(df_10m, df_60m)
 
-    # 5. Reportar a Telegram
+    # 5. Enviar a Telegram
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-        enviar_resumen_y_graficos(trades, final_balance, muestras)
+        enviar_resumen_y_graficos(mejor_regla, top_resultados, muestras)
     else:
-        print("⚠️ Telegram no configurado. Resultados:")
-        print(f"Trades: {len(trades)}, PnL: {sum(t['pnl'] for t in trades):.2f}")
+        print("⚠️ Telegram no configurado. Resultados impresos:")
+        if mejor_regla:
+            print(mejor_regla)
+        else:
+            print("No se encontraron reglas con trades.")
 
     print("✅ Pipeline finalizado")
 
