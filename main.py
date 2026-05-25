@@ -1,6 +1,5 @@
 # ======================================================
-# BOT TRADING V90.2 BYBIT – IA GEMINI + PAPER TRADING
-# Modelo: google/gemini-3.1-flash-image-preview (OpenRouter)
+# BOT TRADING V90.2 BYBIT – IA GEMINI 3.1 FLASH IMAGE PREVIEW
 # ======================================================
 
 import os
@@ -9,6 +8,7 @@ import io
 import hmac
 import hashlib
 import json
+import re
 import requests
 import numpy as np
 import pandas as pd
@@ -25,10 +25,10 @@ plt.rcParams['figure.figsize'] = (12, 6)
 SYMBOL = "BTCUSDT"
 INTERVAL = "5"                # 5 minutos
 RISK_PER_TRADE = 0.0025       # 0.25% del balance por operación
-MAX_SIMULTANEOUS_POSITIONS = 3  # hasta 3 operaciones abiertas a la vez
-MAX_DRAWDOWN_PERCENT = 20.0   # 20% drawdown máximo desde el pico
-PAUSE_ON_DRAWDOWN_SECONDS = 3600  # 1 hora
-SLEEP_SECONDS = 60            # revisar cada 60 segundos
+MAX_SIMULTANEOUS_POSITIONS = 3
+MAX_DRAWDOWN_PERCENT = 20.0
+PAUSE_ON_DRAWDOWN_SECONDS = 3600
+SLEEP_SECONDS = 60
 
 # Papel (simulación)
 PAPER_BALANCE_INICIAL = 100.0
@@ -64,6 +64,7 @@ client = OpenAI(
     default_headers={"HTTP-Referer": "https://railway.app", "X-Title": "BTC Trading Bot"}
 )
 
+# Ruta CORRECTA del modelo, verificada en la documentación de OpenRouter
 MODELO_IA = "google/gemini-3.1-flash-image-preview"
 
 # ======================================================
@@ -110,14 +111,12 @@ def obtener_velas(limit=300):
 
 def calcular_indicadores(df):
     df['ema20'] = df['close'].ewm(span=20).mean()
-    # ATR
     tr = pd.concat([
         df['high'] - df['low'],
         (df['high'] - df['close'].shift()).abs(),
         (df['low'] - df['close'].shift()).abs()
     ], axis=1).max(axis=1)
     df['atr'] = tr.rolling(14).mean()
-    # RSI
     delta = df['close'].diff()
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
@@ -145,7 +144,7 @@ def detectar_tendencia(df, ventana=80):
     return slope, intercept, direccion
 
 # ======================================================
-# IA GEMINI (vía OpenRouter) con modelo corregido
+# IA GEMINI CORREGIDA (con la ruta correcta y manejo de errores)
 # ======================================================
 
 def obtener_decision_ia(df, soporte, resistencia, slope, tendencia):
@@ -160,7 +159,7 @@ def obtener_decision_ia(df, soporte, resistencia, slope, tendencia):
     prompt = f"""
 Eres un trader algorítmico experto en BTC/USDT en timeframe de {INTERVAL} minutos.
 Analiza la siguiente situación y decide si comprar (BUY), vender (SELL) o no hacer nada (HOLD).
-Devuelve ÚNICAMENTE un JSON con este formato:
+Devuelve ÚNICAMENTE un JSON válido con este formato exacto (sin texto adicional, solo el JSON):
 {{"decision": "BUY/SELL/HOLD", "razones": ["razón1", "razón2", ...]}}
 
 Datos actuales:
@@ -175,30 +174,48 @@ Datos actuales:
 {velas_texto}
 
 Reglas:
-- BUY solo si confluencia alcista (precio cerca de soporte, tendencia alcista, RSI > 30).
-- SELL solo si confluencia bajista (precio cerca de resistencia, tendencia bajista, RSI < 70).
+- BUY solo si hay confluencia alcista (precio cerca de soporte, tendencia alcista, RSI > 30).
+- SELL solo si hay confluencia bajista (precio cerca de resistencia, tendencia bajista, RSI < 70).
 - HOLD si no está claro.
 """
     try:
         response = client.chat.completions.create(
-            model=MODELO_IA,
+            model=MODELO_IA,  # Ruta correcta
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
-            max_tokens=300,
-            response_format={"type": "json_object"}
+            max_tokens=300
         )
-        data = json.loads(response.choices[0].message.content)
+        contenido = response.choices[0].message.content
+        print(f"Respuesta IA cruda: {contenido[:200]}...")  # Depuración
+        
+        if not contenido:
+            raise Exception("Respuesta vacía de la IA")
+
+        # Intentar extraer JSON de la respuesta (por si el modelo añade texto adicional)
+        json_match = re.search(r'\{.*\}', contenido, re.DOTALL)
+        if json_match:
+            json_str = json_match.group(0)
+            data = json.loads(json_str)
+        else:
+            # Si no hay JSON, intentar parsear directamente
+            data = json.loads(contenido)
+        
         decision = data.get("decision", "HOLD").upper()
-        razones = data.get("razones", ["Sin razones"])
+        razones = data.get("razones", ["Sin razones específicas"])
         if decision not in ["BUY", "SELL", "HOLD"]:
             decision = "HOLD"
         return decision, razones
+
+    except json.JSONDecodeError as e:
+        print(f"Error JSON: {e} - Contenido: {contenido}")
+        # En caso de error, asumimos HOLD para no operar con datos corruptos
+        return "HOLD", [f"Error parseando JSON: {e}, se asume HOLD"]
     except Exception as e:
         print(f"Error IA: {e}")
-        return None, [f"Error: {e}"]
+        return "HOLD", [f"Error en llamada IA: {e}, se asume HOLD"]
 
 # ======================================================
-# PAPER TRADING (múltiples posiciones)
+# PAPER TRADING (sin cambios)
 # ======================================================
 
 def paper_abrir_posicion(decision, precio, atr, razones, tiempo):
@@ -284,7 +301,6 @@ def paper_revisar_sl_tp(precio_actual, tiempo_actual):
             PAPER_POSICIONES_ACTIVAS.remove(pos)
             cerradas.append(pos_cerrada)
 
-            # Actualizar pico y drawdown
             if PAPER_BALANCE > PAPER_PEAK_BALANCE:
                 PAPER_PEAK_BALANCE = PAPER_BALANCE
             drawdown_pct = (PAPER_PEAK_BALANCE - PAPER_BALANCE) / PAPER_PEAK_BALANCE * 100
@@ -335,7 +351,7 @@ def generar_grafico_entrada(df, decision, soporte, resistencia, slope, intercept
         texto = f"{decision}\nPrecio: {precio_entrada:.2f}\nBalance: {PAPER_BALANCE:.2f} USD\nPnL Global: {PAPER_PNL_GLOBAL:.4f}\nRazones:\n" + "\n".join(razones[:4])
         ax.text(0.02, 0.98, texto, transform=ax.transAxes, fontsize=10, verticalalignment='top',
                 bbox=dict(facecolor='black', alpha=0.7, boxstyle='round'), color='white')
-        ax.set_title(f"{SYMBOL} - Entrada {decision} (IA Gemini) - {INTERVAL}m")
+        ax.set_title(f"{SYMBOL} - Entrada {decision} (IA Gemini 3.1 Flash) - {INTERVAL}m")
         ax.set_xlabel("Velas")
         ax.set_ylabel("Precio")
         ax.grid(True, alpha=0.2)
@@ -403,7 +419,7 @@ def log_estado(df, tendencia, slope, soporte, resistencia, decision, razones):
 
 def run_bot():
     global PAPER_PEAK_BALANCE, PAPER_DRAWDOWN_PAUSED_UNTIL
-    telegram_mensaje("🤖 BOT V90.2 INICIADO (Gemini 3.1, 5m, max 3 posiciones, drawdown 20%)")
+    telegram_mensaje("🤖 BOT V90.2 INICIADO (Gemini 3.1 Flash Image Preview, 5m, max 3 posiciones, drawdown 20%)")
     while True:
         try:
             ahora = datetime.now(timezone.utc)
@@ -453,7 +469,7 @@ def run_bot():
                 abierta = paper_abrir_posicion(decision, precio_actual, atr_actual, razones, tiempo_actual)
                 if abierta:
                     msg = (
-                        f"📌 ENTRADA PAPER {decision} (IA Gemini)\n"
+                        f"📌 ENTRADA PAPER {decision} (IA Gemini 3.1 Flash)\n"
                         f"Precio: {precio_actual:.2f}\n"
                         f"SL: {PAPER_POSICIONES_ACTIVAS[-1]['sl']:.2f} | TP: {PAPER_POSICIONES_ACTIVAS[-1]['tp']:.2f}\n"
                         f"Size USD: {PAPER_POSICIONES_ACTIVAS[-1]['size_usd']:.2f}\n"
