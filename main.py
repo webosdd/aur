@@ -14,6 +14,7 @@ from ta.momentum import RSIIndicator
 from ta.trend import MACD
 from openai import OpenAI
 from dotenv import load_dotenv
+import mplfinance as mpf  # PARA GRÁFICOS DE VELAS JAPONESAS
 
 # =================== CONFIGURACIÓN ===================
 load_dotenv()
@@ -25,10 +26,13 @@ INITIAL_BALANCE = 1000.0
 COMMISSION = 0.001
 MIN_MOVE_PERCENT = 1.2
 LOOKAHEAD_VELAS = 10
-MAX_SAMPLES = 20                 
-MAX_TRADES_BACKTEST = 30          
+MAX_TRADES_BACKTEST = 50
 RISK_PERCENT = 0.02
 MAX_POSITION_PCT = 0.10
+MIN_WINRATE = 55.0          # Mínimo winrate para considerar un setup
+MIN_TRADES = 10             # Mínimo número de trades
+MAX_ITERATIONS = 30         # Máximo de iteraciones
+DESIRED_SETUPS = 20         # Buscar hasta 20 setups
 
 # URL del archivo CSV comprimido en GitHub (RAW)
 DATA_URL = "https://github.com/webosdd/aur/raw/refs/heads/main/BTCUSDT_15m_data.zip"
@@ -70,35 +74,76 @@ def calcular_indicadores(df):
     df['macd_diff'] = macd.macd_diff()
     return df
 
-def generar_grafico(df, titulo, entry_price=None):
-    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(16, 10), sharex=True, gridspec_kw={'height_ratios': [3,1,1]})
-    ax1.plot(df.index, df['close'], 'black', linewidth=1, label='Close')
-    if 'ema20' in df:
-        ax1.plot(df.index, df['ema20'], 'orange', linewidth=1, label='EMA20')
-    if 'ema50' in df:
-        ax1.plot(df.index, df['ema50'], 'blue', linewidth=1, label='EMA50')
-    if entry_price:
-        ax1.axhline(entry_price, color='green', linestyle='--', label='Entry')
-    ax1.legend()
-    ax1.set_title(titulo)
+def generar_grafico_velas(df, titulo, soporte=None, resistencia=None, entry=None, sl=None, tp1=None):
+    """
+    Genera gráfico de velas japonesas con EMAs, soporte/resistencia, RSI y MACD.
+    Retorna un objeto BytesIO con la imagen PNG.
+    """
+    # Preparar datos para mplfinance
+    df_plot = df[['open', 'high', 'low', 'close', 'volume']].copy()
+    df_plot.index = pd.to_datetime(df_plot.index)
+    df_plot.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+    
+    # Añadir EMAs
+    ema20 = df['ema20'].values
+    ema50 = df['ema50'].values
+    
+    # Crear panel adicional para RSI y MACD
+    apds = []
+    # RSI
     if 'rsi' in df:
-        ax2.plot(df.index, df['rsi'], 'purple')
-        ax2.axhline(70, color='red', linestyle='--')
-        ax2.axhline(30, color='green', linestyle='--')
-        ax2.set_ylabel('RSI')
+        rsi = df['rsi'].values
+        apds.append(mpf.make_addplot(rsi, panel=1, color='purple', ylabel='RSI', ylim=(0,100)))
+        # Líneas de sobrecompra/sobreventa
+        apds.append(mpf.make_addplot([70]*len(df), panel=1, color='red', linestyle='--', secondary_y=False))
+        apds.append(mpf.make_addplot([30]*len(df), panel=1, color='green', linestyle='--', secondary_y=False))
+    # MACD
     if 'macd' in df:
-        ax3.plot(df.index, df['macd'], label='MACD')
-        ax3.plot(df.index, df['macd_signal'], label='Signal')
-        ax3.bar(df.index, df['macd_diff'], label='Histogram')
-        ax3.legend()
-    plt.tight_layout()
+        macd_line = df['macd'].values
+        signal_line = df['macd_signal'].values
+        histogram = df['macd_diff'].values
+        apds.append(mpf.make_addplot(macd_line, panel=2, color='blue', ylabel='MACD'))
+        apds.append(mpf.make_addplot(signal_line, panel=2, color='red'))
+        apds.append(mpf.make_addplot(histogram, panel=2, type='bar', color='gray', alpha=0.5))
+    
+    # Líneas de soporte y resistencia
+    if soporte:
+        apds.append(mpf.make_addplot([soporte]*len(df), panel=0, color='cyan', linestyle='--', linewidth=1.5))
+    if resistencia:
+        apds.append(mpf.make_addplot([resistencia]*len(df), panel=0, color='magenta', linestyle='--', linewidth=1.5))
+    
+    # Líneas de entrada, SL, TP1
+    if entry:
+        apds.append(mpf.make_addplot([entry]*len(df), panel=0, color='orange', linestyle=':', linewidth=1.5))
+    if sl:
+        apds.append(mpf.make_addplot([sl]*len(df), panel=0, color='red', linestyle='--', linewidth=1.5))
+    if tp1:
+        apds.append(mpf.make_addplot([tp1]*len(df), panel=0, color='lime', linestyle='--', linewidth=1.5))
+    
+    # Configurar estilo
+    mc = mpf.make_marketcolors(up='#00ff00', down='#ff0000', inherit=True)
+    s = mpf.make_mpf_style(marketcolors=mc, gridcolor='gray', facecolor='#121212', edgecolor='white')
+    
+    # Crear figura
+    fig, axes = mpf.plot(df_plot,
+                         type='candle',
+                         style=s,
+                         addplot=apds,
+                         volume=False,
+                         title=titulo,
+                         ylabel='Price (USDT)',
+                         figsize=(16, 12),
+                         panel_ratios=(3, 1, 1),
+                         returnfig=True)
+    
+    # Guardar a BytesIO
     buf = BytesIO()
-    plt.savefig(buf, format='png')
+    fig.savefig(buf, format='png', dpi=100)
     buf.seek(0)
-    plt.close()
+    plt.close(fig)
     return buf
 
-# =================== 1. CARGAR DATOS DESDE GITHUB (CORREGIDO) ===================
+# =================== 1. CARGAR DATOS DESDE GITHUB ===================
 def cargar_datos():
     log(f"📥 Descargando datos desde: {DATA_URL}")
     try:
@@ -137,46 +182,7 @@ def cargar_datos():
     log(f"✅ Datos cargados: {len(df)} velas desde {df.index[0]} hasta {df.index[-1]}")
     return df
 
-# =================== 2. GENERAR MUESTRAS ===================
-def detectar_movimientos(df):
-    movimientos = []
-    for i in range(len(df) - LOOKAHEAD_VELAS):
-        precio_actual = df['close'].iloc[i]
-        precio_futuro = df['close'].iloc[i + LOOKAHEAD_VELAS]
-        cambio = (precio_futuro - precio_actual) / precio_actual * 100
-        if cambio > MIN_MOVE_PERCENT:
-            movimientos.append((df.index[i], 'BUY', cambio))
-        elif cambio < -MIN_MOVE_PERCENT:
-            movimientos.append((df.index[i], 'SELL', -cambio))
-    return movimientos
-
-def generar_muestras(df, timeframe="15"):
-    sample_dir = f"samples/{timeframe}m"
-    os.makedirs(sample_dir, exist_ok=True)
-    movimientos = detectar_movimientos(df)
-    log(f"Movimientos detectados: {len(movimientos)}")
-    muestras = []
-    for idx, direction, change in movimientos[:MAX_SAMPLES]:
-        start_idx = max(0, df.index.get_loc(idx) - 80)
-        end_idx = df.index.get_loc(idx)
-        df_window = df.iloc[start_idx:end_idx+1].copy()
-        if len(df_window) < 30:
-            continue
-        img_buf = generar_grafico(df_window, f"{direction} {change:.1f}%", entry_price=df.loc[idx]['close'])
-        img_path = f"{sample_dir}/{idx.strftime('%Y%m%d_%H%M')}_{direction}_{change:.1f}.png"
-        with open(img_path, 'wb') as f:
-            f.write(img_buf.getvalue())
-        muestras.append({
-            'timestamp': idx,
-            'direction': direction,
-            'cambio': change,
-            'image_path': img_path,
-            'image_buf': img_buf
-        })
-    log(f"✅ Generadas {len(muestras)} muestras")
-    return muestras
-
-# =================== 3. CONDICIONES ATÓMICAS ===================
+# =================== 2. CONDICIONES ATÓMICAS (predefinidas) ===================
 CONDICIONES_ATOMICAS = {}
 
 def definir_condiciones_atomicas():
@@ -205,6 +211,11 @@ def definir_condiciones_atomicas():
         return df['close'].iloc[idx] > df['ema50'].iloc[idx]
     def price_below_ema50(df, idx):
         return df['close'].iloc[idx] < df['ema50'].iloc[idx]
+    def volume_spike(df, idx):
+        avg_vol = df['volume'].iloc[max(0,idx-20):idx].mean()
+        return df['volume'].iloc[idx] > avg_vol * 1.5
+    def close_up_prev(df, idx):
+        return df['close'].iloc[idx] > df['close'].iloc[idx-1]
     CONDICIONES_ATOMICAS = {
         "rsi_lt_30": rsi_lt_30,
         "rsi_gt_70": rsi_gt_70,
@@ -216,10 +227,12 @@ def definir_condiciones_atomicas():
         "close_near_resistance": close_near_resistance,
         "price_above_ema50": price_above_ema50,
         "price_below_ema50": price_below_ema50,
+        "volume_spike": volume_spike,
+        "close_up_prev": close_up_prev,
     }
 definir_condiciones_atomicas()
 
-# =================== 4. BACKTEST CON COMBINACIONES ===================
+# =================== 3. BACKTEST CON UNA REGLA ===================
 def backtest_con_regla(df, condicion_func):
     balance = INITIAL_BALANCE
     in_position = False
@@ -256,93 +269,196 @@ def backtest_con_regla(df, condicion_func):
                 break
     return trades, balance
 
-def evaluar_combinaciones(df, lista_condiciones):
-    if not lista_condiciones:
-        return None, []
-    cond_funcs = [(nombre, CONDICIONES_ATOMICAS[nombre]) for nombre in lista_condiciones]
+def evaluar_lista_condiciones(df, lista_nombres):
+    """Prueba todas las combinaciones de 2, 3 y 4 condiciones en AND y devuelve la mejor."""
+    if not lista_nombres:
+        return None
+    cond_funcs = [(nombre, CONDICIONES_ATOMICAS[nombre]) for nombre in lista_nombres if nombre in CONDICIONES_ATOMICAS]
+    if len(cond_funcs) < 2:
+        return None
     resultados = []
-    # Combinaciones de 2
-    for (nom1, f1), (nom2, f2) in itertools.combinations(cond_funcs, 2):
-        regla = lambda df, i, f1=f1, f2=f2: f1(df, i) and f2(df, i)
-        trades, balance_final = backtest_con_regla(df, regla)
-        if not trades:
-            continue
-        pnl_total = sum(t['pnl'] for t in trades)
-        wins = sum(1 for t in trades if t['pnl'] > 0)
-        winrate = wins / len(trades) * 100
-        resultados.append({
-            'regla': f"{nom1} AND {nom2}",
-            'trades': len(trades),
-            'winrate': winrate,
-            'pnl_total': pnl_total,
-            'balance_final': balance_final
-        })
-    # Combinaciones de 3
-    for (nom1, f1), (nom2, f2), (nom3, f3) in itertools.combinations(cond_funcs, 3):
-        regla = lambda df, i, f1=f1, f2=f2, f3=f3: f1(df, i) and f2(df, i) and f3(df, i)
-        trades, balance_final = backtest_con_regla(df, regla)
-        if not trades:
-            continue
-        pnl_total = sum(t['pnl'] for t in trades)
-        wins = sum(1 for t in trades if t['pnl'] > 0)
-        winrate = wins / len(trades) * 100
-        resultados.append({
-            'regla': f"{nom1} AND {nom2} AND {nom3}",
-            'trades': len(trades),
-            'winrate': winrate,
-            'pnl_total': pnl_total,
-            'balance_final': balance_final
-        })
+    # Combinaciones de 2,3,4
+    for r in range(2, min(5, len(cond_funcs)+1)):
+        for combo in itertools.combinations(cond_funcs, r):
+            nombres = [c[0] for c in combo]
+            regla = lambda df, i, fns=combo: all(f(df, i) for _, f in fns)
+            trades, balance_final = backtest_con_regla(df, regla)
+            if not trades:
+                continue
+            pnl_total = sum(t['pnl'] for t in trades)
+            wins = sum(1 for t in trades if t['pnl'] > 0)
+            winrate = wins / len(trades) * 100
+            resultados.append({
+                'regla': ' AND '.join(nombres),
+                'trades': len(trades),
+                'winrate': winrate,
+                'pnl_total': pnl_total,
+                'balance_final': balance_final,
+                'combo': combo
+            })
     if not resultados:
-        return None, []
-    resultados.sort(key=lambda x: x['winrate'], reverse=True)
-    return resultados[0], resultados[:5]
+        return None
+    # Filtrar por winrate mínimo y número mínimo de trades
+    resultados = [r for r in resultados if r['winrate'] >= MIN_WINRATE and r['trades'] >= MIN_TRADES]
+    if not resultados:
+        return None
+    resultados.sort(key=lambda x: (x['winrate'], x['pnl_total']), reverse=True)
+    return resultados[0]
 
-# =================== 5. PROCESAR DATOS ===================
-def procesar(df):
-    log("Calculando indicadores...")
-    df = calcular_indicadores(df)
-    muestras = generar_muestras(df, timeframe="15")
-    todas_condiciones = list(CONDICIONES_ATOMICAS.keys())
-    log(f"Probando {len(todas_condiciones)} condiciones en combinaciones de 2 y 3...")
-    mejor, top = evaluar_combinaciones(df, todas_condiciones)
-    if mejor:
-        log(f"✅ Mejor regla: {mejor['regla']} -> winrate {mejor['winrate']:.1f}%")
+# =================== 4. IA PARA SUGERIR NUEVAS CONDICIONES ===================
+def obtener_sugerencias_ia(historial_setups, iteration):
+    if not OPENROUTER_API_KEY:
+        return None
+    client = OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=OPENROUTER_API_KEY,
+        default_headers={"HTTP-Referer": "https://railway.app", "X-Title": "Setups Optimizer"}
+    )
+    # Construir prompt con historial
+    historial_texto = ""
+    if historial_setups:
+        historial_texto = "Historial de setups encontrados hasta ahora:\n"
+        for i, s in enumerate(historial_setups[-5:], 1):
+            historial_texto += f"{i}. {s['regla']} -> winrate {s['winrate']:.1f}% ({s['trades']} trades)\n"
     else:
-        log("⚠️ No se encontraron reglas con trades")
-    return mejor, top, muestras
+        historial_texto = "Aún no se ha encontrado ningún setup rentable.\n"
+    
+    prompt = f"""
+Eres un experto en trading algorítmico. Estás ayudando a optimizar un bot de trading para BTC/USDT en temporalidad 15 minutos.
+Hasta ahora hemos probado combinaciones de las siguientes condiciones atómicas:
+{list(CONDICIONES_ATOMICAS.keys())}
 
-# =================== 6. REPORTE A TELEGRAM ===================
-def enviar_resumen(mejor, muestras):
-    if not mejor:
-        send_telegram("❌ No se encontró ninguna regla con trades para los datos proporcionados.")
-        return
-    msg = f"📊 *RESULTADO BACKTEST (15m)*\n\n"
-    msg += f"🏆 Mejor regla:\n{mejor['regla']}\n"
-    msg += f"📈 Winrate: {mejor['winrate']:.1f}% ({mejor['trades']} trades)\n"
-    msg += f"💰 PnL total: {mejor['pnl_total']:+.2f} USDT\n"
-    msg += f"💵 Balance final: {mejor['balance_final']:.2f} USDT\n"
-    send_telegram(msg)
+{historial_texto}
 
-    # Enviar gráficos de las muestras (hasta 15)
-    for idx, m in enumerate(muestras[:15]):
-        caption = f"🔔 Señal #{idx+1}: {m['direction']} {m['cambio']:.1f}%\n{m['timestamp'].strftime('%Y-%m-%d %H:%M')}"
-        with open(m['image_path'], 'rb') as f:
-            img_buf = BytesIO(f.read())
-        send_telegram_image(img_buf, caption)
+Basándote en el conocimiento del mercado, sugiere **nuevas condiciones atómicas** (entre 3 y 6) que podrían mejorar el rendimiento. Las condiciones deben ser objetivas y programables, usando datos de velas (open, high, low, close, volume, EMAs, RSI, MACD, etc.). Cada condición debe ser una expresión corta, como por ejemplo: "close < low.shift(1)" o "high - close < close * 0.002".
 
-# =================== MAIN ===================
+Responde ÚNICAMENTE con un JSON que contenga un array de strings, sin texto adicional. Ejemplo:
+["condicion1", "condicion2", "condicion3"]
+"""
+    try:
+        response = client.chat.completions.create(
+            model="anthropic/claude-sonnet-4.5",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            max_tokens=500,
+            response_format={"type": "json_object"}
+        )
+        data = json.loads(response.choices[0].message.content)
+        if isinstance(data, list):
+            return data
+        else:
+            return None
+    except Exception as e:
+        log(f"Error llamando a IA: {e}")
+        return None
+
+def agregar_nuevas_condiciones(nuevas_condiciones):
+    """Agrega nuevas condiciones atómicas al diccionario global, convirtiendo las expresiones en funciones."""
+    global CONDICIONES_ATOMICAS
+    for expr in nuevas_condiciones:
+        # Evitar duplicados
+        if expr in CONDICIONES_ATOMICAS:
+            continue
+        # Crear una función lambda que evalúe la expresión usando pandas
+        # ADVERTENCIA: eval es peligroso, pero aquí solo se usan expresiones de pandas con seguridad relativa
+        # Limitamos los símbolos permitidos para minimizar riesgos
+        try:
+            # Compilar la expresión en una función que tome df e idx
+            # Permitimos acceso a variables: df, idx, y funciones de pandas/numpy
+            # Usamos un entorno de evaluación restringido
+            allowed_globals = {
+                'df': pd.DataFrame,
+                'pd': pd,
+                'np': np,
+                'abs': abs,
+                'max': max,
+                'min': min,
+            }
+            # Compilar la condición
+            code = compile(expr, '<string>', 'eval')
+            def cond_func(df, idx):
+                # El contexto local incluye df y idx
+                local_env = {'df': df, 'idx': idx, 'pd': pd, 'np': np}
+                return eval(code, allowed_globals, local_env)
+            # Probar la función con un índice válido para verificar que no de error
+            cond_func(None, 0)  # Solo para comprobar sintaxis; luego se usará con datos reales
+            CONDICIONES_ATOMICAS[expr] = cond_func
+            log(f"➕ Nueva condición añadida: {expr}")
+        except Exception as e:
+            log(f"❌ No se pudo añadir condición '{expr}': {e}")
+
+# =================== 5. EJECUCIÓN PRINCIPAL ITERATIVA ===================
 def main():
-    log("🚀 Iniciando backtest con datos desde GitHub")
+    log("🚀 Iniciando optimización iterativa de setups con IA")
     df = cargar_datos()
-    mejor, top, muestras = procesar(df)
-    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-        enviar_resumen(mejor, muestras)
-    else:
-        log("⚠️ Telegram no configurado. Resultados en consola:")
+    df = calcular_indicadores(df)
+    
+    setups_encontrados = []
+    iteration = 0
+    while len(setups_encontrados) < DESIRED_SETUPS and iteration < MAX_ITERATIONS:
+        iteration += 1
+        log(f"\n🔁 Iteración {iteration}/{MAX_ITERATIONS} - Setups encontrados: {len(setups_encontrados)}/{DESIRED_SETUPS}")
+        
+        # Obtener lista actual de condiciones (todas las existentes)
+        condiciones_actuales = list(CONDICIONES_ATOMICAS.keys())
+        log(f"Probando {len(condiciones_actuales)} condiciones...")
+        mejor = evaluar_lista_condiciones(df, condiciones_actuales)
+        
         if mejor:
-            print(mejor)
-    log("✅ Pipeline finalizado")
+            log(f"✅ Mejor regla encontrada: {mejor['regla']} -> winrate {mejor['winrate']:.1f}% ({mejor['trades']} trades)")
+            # Enviar a Telegram el setup encontrado con su gráfico
+            # Para el gráfico, necesitamos un ejemplo de señal. Buscamos el primer evento de compra que cumple la regla.
+            # Para simplificar, usamos la regla para encontrar un índice donde se cumple.
+            # Construimos la función de regla a partir de la combinación
+            combo = mejor['combo']
+            regla_func = lambda df, i: all(f(df, i) for _, f in combo)
+            # Buscar un índice donde se cumpla la regla y haya una entrada en el backtest (usamos el primer índice después de 100)
+            sample_idx = None
+            for i in range(100, len(df)):
+                if regla_func(df, i):
+                    sample_idx = i
+                    break
+            if sample_idx:
+                # Obtener soporte y resistencia en ese momento (ventana de 20 velas)
+                sop = df['low'].iloc[max(0,sample_idx-20):sample_idx+1].min()
+                res = df['high'].iloc[max(0,sample_idx-20):sample_idx+1].max()
+                entry = df['close'].iloc[sample_idx]
+                sl = entry * 0.995
+                tp1 = entry * 1.005
+                # Ventana de 80 velas alrededor
+                start = max(0, sample_idx - 80)
+                end = min(len(df), sample_idx + 20)
+                df_window = df.iloc[start:end].copy()
+                img_buf = generar_grafico_velas(df_window, f"Iter {iteration}: {mejor['regla'][:50]}", sop, res, entry, sl, tp1)
+                caption = f"🔔 *Setup #{len(setups_encontrados)+1}* (Iter {iteration})\nRegla: `{mejor['regla']}`\nWinrate: {mejor['winrate']:.1f}% ({mejor['trades']} trades)\nPnL: {mejor['pnl_total']:+.2f} USDT"
+                send_telegram_image(img_buf, caption)
+            else:
+                send_telegram(f"🔔 *Setup #{len(setups_encontrados)+1}* (Iter {iteration})\nRegla: {mejor['regla']}\nWinrate: {mejor['winrate']:.1f}% ({mejor['trades']} trades)\nPnL: {mejor['pnl_total']:+.2f} USDT")
+            setups_encontrados.append(mejor)
+        else:
+            log("⚠️ No se encontró ningún setup con winrate >= {}% y al menos {} trades.".format(MIN_WINRATE, MIN_TRADES))
+            send_telegram(f"⚠️ Iteración {iteration}: no se encontró setup rentable. Se pedirán nuevas condiciones a la IA.")
+        
+        # Pedir a la IA nuevas condiciones (si no hemos alcanzado el objetivo)
+        if len(setups_encontrados) < DESIRED_SETUPS:
+            nuevas = obtener_sugerencias_ia(setups_encontrados, iteration)
+            if nuevas and isinstance(nuevas, list):
+                agregar_nuevas_condiciones(nuevas)
+            else:
+                log("No se recibieron sugerencias de IA o no son válidas.")
+        
+        time.sleep(2)  # Pequeña pausa entre iteraciones
+    
+    # Resumen final
+    if setups_encontrados:
+        resumen = "🏆 *RESUMEN DE SETUPS RENTABLES ENCONTRADOS*\n\n"
+        for i, s in enumerate(setups_encontrados, 1):
+            resumen += f"{i}. {s['regla']}\n   Winrate: {s['winrate']:.1f}% ({s['trades']} trades) | PnL: {s['pnl_total']:+.2f} USDT\n\n"
+        send_telegram(resumen)
+    else:
+        send_telegram("❌ No se encontró ningún setup rentable después de las iteraciones.")
+    
+    log("✅ Proceso finalizado")
 
 if __name__ == "__main__":
     main()
