@@ -7,6 +7,7 @@ import requests
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 from io import BytesIO
 from datetime import datetime
 from pybit.unified_trading import HTTP
@@ -14,7 +15,6 @@ from ta.momentum import RSIIndicator
 from ta.trend import MACD
 from openai import OpenAI
 from dotenv import load_dotenv
-import mplfinance as mpf  # PARA GRÁFICOS DE VELAS JAPONESAS
 
 # =================== CONFIGURACIÓN ===================
 load_dotenv()
@@ -76,69 +76,81 @@ def calcular_indicadores(df):
 
 def generar_grafico_velas(df, titulo, soporte=None, resistencia=None, entry=None, sl=None, tp1=None):
     """
-    Genera gráfico de velas japonesas con EMAs, soporte/resistencia, RSI y MACD.
+    Genera gráfico de velas japonesas con matplotlib puro.
     Retorna un objeto BytesIO con la imagen PNG.
     """
-    # Preparar datos para mplfinance
-    df_plot = df[['open', 'high', 'low', 'close', 'volume']].copy()
-    df_plot.index = pd.to_datetime(df_plot.index)
-    df_plot.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+    if df.empty:
+        return None
+    # Crear figura con 3 subplots (precio, RSI, MACD)
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(16, 12), sharex=True, gridspec_kw={'height_ratios': [3, 1, 1]})
     
-    # Añadir EMAs
-    ema20 = df['ema20'].values
-    ema50 = df['ema50'].values
+    # Dibujar velas japonesas
+    x = np.arange(len(df))
+    for i, (idx, row) in enumerate(df.iterrows()):
+        o, h, l, c = row['open'], row['high'], row['low'], row['close']
+        color = '#00ff00' if c >= o else '#ff0000'
+        # Línea vertical (mecha)
+        ax1.vlines(x[i], l, h, color=color, linewidth=1.5)
+        # Cuerpo de la vela
+        body_bottom = min(o, c)
+        body_height = abs(c - o)
+        if body_height < 0.01:
+            body_height = 0.01  # evita que desaparezcan velas muy pequeñas
+        ax1.add_patch(Rectangle((x[i]-0.35, body_bottom), 0.7, body_height, color=color, alpha=0.9))
     
-    # Crear panel adicional para RSI y MACD
-    apds = []
-    # RSI
-    if 'rsi' in df:
-        rsi = df['rsi'].values
-        apds.append(mpf.make_addplot(rsi, panel=1, color='purple', ylabel='RSI', ylim=(0,100)))
-        # Líneas de sobrecompra/sobreventa
-        apds.append(mpf.make_addplot([70]*len(df), panel=1, color='red', linestyle='--', secondary_y=False))
-        apds.append(mpf.make_addplot([30]*len(df), panel=1, color='green', linestyle='--', secondary_y=False))
-    # MACD
-    if 'macd' in df:
-        macd_line = df['macd'].values
-        signal_line = df['macd_signal'].values
-        histogram = df['macd_diff'].values
-        apds.append(mpf.make_addplot(macd_line, panel=2, color='blue', ylabel='MACD'))
-        apds.append(mpf.make_addplot(signal_line, panel=2, color='red'))
-        apds.append(mpf.make_addplot(histogram, panel=2, type='bar', color='gray', alpha=0.5))
+    # EMAs
+    if 'ema20' in df:
+        ax1.plot(x, df['ema20'], 'orange', linewidth=2, label='EMA20')
+    if 'ema50' in df:
+        ax1.plot(x, df['ema50'], 'blue', linewidth=2, label='EMA50')
     
-    # Líneas de soporte y resistencia
+    # Soporte y resistencia
     if soporte:
-        apds.append(mpf.make_addplot([soporte]*len(df), panel=0, color='cyan', linestyle='--', linewidth=1.5))
+        ax1.axhline(soporte, color='cyan', linestyle='--', linewidth=1.5, label='Soporte')
     if resistencia:
-        apds.append(mpf.make_addplot([resistencia]*len(df), panel=0, color='magenta', linestyle='--', linewidth=1.5))
+        ax1.axhline(resistencia, color='magenta', linestyle='--', linewidth=1.5, label='Resistencia')
     
     # Líneas de entrada, SL, TP1
     if entry:
-        apds.append(mpf.make_addplot([entry]*len(df), panel=0, color='orange', linestyle=':', linewidth=1.5))
+        ax1.axhline(entry, color='orange', linestyle=':', linewidth=1.5, label='Entry')
     if sl:
-        apds.append(mpf.make_addplot([sl]*len(df), panel=0, color='red', linestyle='--', linewidth=1.5))
+        ax1.axhline(sl, color='red', linestyle='--', linewidth=1.5, label='SL')
     if tp1:
-        apds.append(mpf.make_addplot([tp1]*len(df), panel=0, color='lime', linestyle='--', linewidth=1.5))
+        ax1.axhline(tp1, color='lime', linestyle='--', linewidth=1.5, label='TP1')
     
-    # Configurar estilo
-    mc = mpf.make_marketcolors(up='#00ff00', down='#ff0000', inherit=True)
-    s = mpf.make_mpf_style(marketcolors=mc, gridcolor='gray', facecolor='#121212', edgecolor='white')
+    ax1.set_title(titulo, color='white')
+    ax1.set_ylabel('Precio (USDT)', color='white')
+    ax1.tick_params(colors='white')
+    ax1.set_facecolor('#121212')
+    ax1.legend(loc='upper left', framealpha=0.5, facecolor='black', edgecolor='white', labelcolor='white')
     
-    # Crear figura
-    fig, axes = mpf.plot(df_plot,
-                         type='candle',
-                         style=s,
-                         addplot=apds,
-                         volume=False,
-                         title=titulo,
-                         ylabel='Price (USDT)',
-                         figsize=(16, 12),
-                         panel_ratios=(3, 1, 1),
-                         returnfig=True)
+    # RSI
+    if 'rsi' in df:
+        ax2.plot(x, df['rsi'], 'purple', linewidth=1)
+        ax2.axhline(70, color='red', linestyle='--', alpha=0.5)
+        ax2.axhline(30, color='green', linestyle='--', alpha=0.5)
+        ax2.set_ylabel('RSI', color='white')
+        ax2.set_ylim(0, 100)
+        ax2.set_facecolor('#121212')
+        ax2.tick_params(colors='white')
     
-    # Guardar a BytesIO
+    # MACD
+    if 'macd' in df:
+        ax3.plot(x, df['macd'], 'blue', linewidth=1, label='MACD')
+        ax3.plot(x, df['macd_signal'], 'red', linewidth=1, label='Signal')
+        # Histograma
+        diff = df['macd_diff']
+        colors = ['green' if v > 0 else 'red' for v in diff]
+        ax3.bar(x, diff, color=colors, alpha=0.5, label='Histogram')
+        ax3.set_ylabel('MACD', color='white')
+        ax3.set_facecolor('#121212')
+        ax3.tick_params(colors='white')
+        ax3.legend(loc='upper left', framealpha=0.5, facecolor='black', edgecolor='white', labelcolor='white')
+    
+    fig.patch.set_facecolor('#121212')
+    plt.tight_layout()
     buf = BytesIO()
-    fig.savefig(buf, format='png', dpi=100)
+    plt.savefig(buf, format='png', dpi=100)
     buf.seek(0)
     plt.close(fig)
     return buf
@@ -360,28 +372,23 @@ def agregar_nuevas_condiciones(nuevas_condiciones):
         if expr in CONDICIONES_ATOMICAS:
             continue
         # Crear una función lambda que evalúe la expresión usando pandas
-        # ADVERTENCIA: eval es peligroso, pero aquí solo se usan expresiones de pandas con seguridad relativa
-        # Limitamos los símbolos permitidos para minimizar riesgos
+        # Permitimos acceso a variables: df, idx, pd, np
         try:
-            # Compilar la expresión en una función que tome df e idx
-            # Permitimos acceso a variables: df, idx, y funciones de pandas/numpy
-            # Usamos un entorno de evaluación restringido
-            allowed_globals = {
-                'df': pd.DataFrame,
-                'pd': pd,
-                'np': np,
-                'abs': abs,
-                'max': max,
-                'min': min,
-            }
             # Compilar la condición
             code = compile(expr, '<string>', 'eval')
-            def cond_func(df, idx):
-                # El contexto local incluye df y idx
+            def cond_func(df, idx, expr=expr):
+                # El contexto local incluye df e idx, y las series de pandas en el momento idx
+                # Necesitamos acceder a los valores en el índice idx
+                # Esto es complejo porque la expresión puede ser como "df['close'].iloc[idx] < df['ema20'].iloc[idx]"
+                # La forma más segura es evaluar la expresión con las series ya indexadas.
+                # Para simplificar, evaluamos la expresión en un entorno donde df es el DataFrame y idx es el índice.
+                # Pero la expresión puede contener .shift(1) etc., que requieren un DataFrame completo.
+                # Usamos eval con df e idx en el entorno.
                 local_env = {'df': df, 'idx': idx, 'pd': pd, 'np': np}
-                return eval(code, allowed_globals, local_env)
+                # La expresión debe referirse a df y idx
+                return eval(expr, globals(), local_env)
             # Probar la función con un índice válido para verificar que no de error
-            cond_func(None, 0)  # Solo para comprobar sintaxis; luego se usará con datos reales
+            # No podemos probar aquí porque necesitamos un DataFrame real. Lo dejamos para el backtest.
             CONDICIONES_ATOMICAS[expr] = cond_func
             log(f"➕ Nueva condición añadida: {expr}")
         except Exception as e:
@@ -407,11 +414,9 @@ def main():
         if mejor:
             log(f"✅ Mejor regla encontrada: {mejor['regla']} -> winrate {mejor['winrate']:.1f}% ({mejor['trades']} trades)")
             # Enviar a Telegram el setup encontrado con su gráfico
-            # Para el gráfico, necesitamos un ejemplo de señal. Buscamos el primer evento de compra que cumple la regla.
-            # Para simplificar, usamos la regla para encontrar un índice donde se cumple.
             # Construimos la función de regla a partir de la combinación
             combo = mejor['combo']
-            regla_func = lambda df, i: all(f(df, i) for _, f in combo)
+            regla_func = lambda df, i, fns=combo: all(f(df, i) for _, f in fns)
             # Buscar un índice donde se cumpla la regla y haya una entrada en el backtest (usamos el primer índice después de 100)
             sample_idx = None
             for i in range(100, len(df)):
@@ -430,8 +435,11 @@ def main():
                 end = min(len(df), sample_idx + 20)
                 df_window = df.iloc[start:end].copy()
                 img_buf = generar_grafico_velas(df_window, f"Iter {iteration}: {mejor['regla'][:50]}", sop, res, entry, sl, tp1)
-                caption = f"🔔 *Setup #{len(setups_encontrados)+1}* (Iter {iteration})\nRegla: `{mejor['regla']}`\nWinrate: {mejor['winrate']:.1f}% ({mejor['trades']} trades)\nPnL: {mejor['pnl_total']:+.2f} USDT"
-                send_telegram_image(img_buf, caption)
+                if img_buf:
+                    caption = f"🔔 *Setup #{len(setups_encontrados)+1}* (Iter {iteration})\nRegla: `{mejor['regla']}`\nWinrate: {mejor['winrate']:.1f}% ({mejor['trades']} trades)\nPnL: {mejor['pnl_total']:+.2f} USDT"
+                    send_telegram_image(img_buf, caption)
+                else:
+                    send_telegram(f"🔔 *Setup #{len(setups_encontrados)+1}* (Iter {iteration})\nRegla: {mejor['regla']}\nWinrate: {mejor['winrate']:.1f}% ({mejor['trades']} trades)\nPnL: {mejor['pnl_total']:+.2f} USDT")
             else:
                 send_telegram(f"🔔 *Setup #{len(setups_encontrados)+1}* (Iter {iteration})\nRegla: {mejor['regla']}\nWinrate: {mejor['winrate']:.1f}% ({mejor['trades']} trades)\nPnL: {mejor['pnl_total']:+.2f} USDT")
             setups_encontrados.append(mejor)
