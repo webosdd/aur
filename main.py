@@ -1,11 +1,6 @@
 # ======================================================
 # BOT TRADING V90.2 BYBIT – IA GEMINI + PAPER TRADING
-# ======================================================
-# - Timeframe 5 minutos
-# - Hasta 3 posiciones simultáneas (sin límite diario)
-# - Drawdown máximo 20% → pausa 1 hora
-# - Gráficos detallados con velas, soporte/resistencia, tendencia, EMA20
-# - IA Gemini (OpenRouter) decide BUY/SELL/HOLD
+# (Sin scipy, solo numpy)
 # ======================================================
 
 import os
@@ -19,7 +14,6 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from openai import OpenAI
-from scipy.stats import linregress
 from datetime import datetime, timezone
 
 plt.rcParams['figure.figsize'] = (12, 6)
@@ -139,7 +133,8 @@ def detectar_soportes_resistencias(df, ventana=50):
 def detectar_tendencia(df, ventana=80):
     y = df['close'].values[-ventana:]
     x = np.arange(len(y))
-    slope, intercept, r, _, _ = linregress(x, y)
+    # Usamos numpy.polyfit en lugar de scipy.stats.linregress
+    slope, intercept = np.polyfit(x, y, 1)
     if slope > 0.02:
         direccion = 'ALCISTA'
     elif slope < -0.02:
@@ -245,14 +240,6 @@ def paper_calcular_pnl_posicion(pos, precio_actual):
     else:
         return (pos["entry_price"] - precio_actual) * pos["size_btc"]
 
-def paper_actualizar_drawdown():
-    global PAPER_PEAK_BALANCE, PAPER_DRAWDOWN_PAUSED_UNTIL
-    # Actualizar balance sumando PnL flotante de todas las posiciones
-    # El balance "real" en papel se actualiza solo al cerrar, pero para drawdown consideramos balance + PnL flotante
-    # Para simplificar, usamos el balance ajustado con PnL flotante.
-    # Obtener precio actual de la última vela (se pasa desde fuera)
-    pass  # Se llama desde el loop principal con precio actual
-
 def paper_revisar_sl_tp(precio_actual, tiempo_actual):
     global PAPER_BALANCE, PAPER_PNL_GLOBAL, PAPER_WIN, PAPER_LOSS, PAPER_TRADES_CERRADOS, PAPER_POSICIONES_ACTIVAS
     global PAPER_PEAK_BALANCE, PAPER_DRAWDOWN_PAUSED_UNTIL
@@ -305,7 +292,7 @@ def paper_revisar_sl_tp(precio_actual, tiempo_actual):
     return cerradas, False
 
 # ======================================================
-# GRÁFICO DE VELAS DETALLADO
+# GRÁFICO DE VELAS DETALLADO (sin scipy)
 # ======================================================
 
 def generar_grafico_entrada(df, decision, soporte, resistencia, slope, intercept, razones, precio_entrada=None):
@@ -329,9 +316,10 @@ def generar_grafico_entrada(df, decision, soporte, resistencia, slope, intercept
         ax.axhline(resistencia, color='magenta', linestyle='--', linewidth=2, label=f"Resistencia {resistencia:.2f}")
         if 'ema20' in df_plot.columns:
             ax.plot(x, df_plot['ema20'].values, color='yellow', linewidth=2, label='EMA20')
+        # Tendencia con numpy.polyfit
         y_plot = df_plot['close'].values
         x_plot = np.arange(len(y_plot))
-        slope_plot, intercept_plot, _, _, _ = linregress(x_plot, y_plot)
+        slope_plot, intercept_plot = np.polyfit(x_plot, y_plot, 1)
         tendencia_linea = intercept_plot + slope_plot * x_plot
         ax.plot(x_plot, tendencia_linea, color='white', linewidth=2, linestyle='-', label=f"Tendencia slope {slope_plot:.4f}")
         entrada_index = len(df_plot) - 1
@@ -428,7 +416,6 @@ def run_bot():
                 else:
                     PAPER_DRAWDOWN_PAUSED_UNTIL = None
                     telegram_mensaje("✅ Pausa por drawdown finalizada. Bot reanudado.")
-                    # Resetear peak balance para nuevo ciclo?
                     PAPER_PEAK_BALANCE = PAPER_BALANCE  # empezar nuevo pico
 
             df = obtener_velas(limit=200)
@@ -470,7 +457,6 @@ def run_bot():
                 abierta = paper_abrir_posicion(decision, precio_actual, atr_actual, razones, tiempo_actual)
                 if abierta:
                     # Enviar mensaje y gráfico
-                    pnl_flotante_total = sum(paper_calcular_pnl_posicion(p, precio_actual) for p in PAPER_POSICIONES_ACTIVAS)
                     msg = (
                         f"📌 ENTRADA PAPER {decision} (IA Gemini)\n"
                         f"Precio: {precio_actual:.2f}\n"
