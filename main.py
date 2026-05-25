@@ -21,25 +21,25 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SYMBOL = "BTCUSDT"
-START_DATE = "2024-01-01"
-END_DATE = "2024-06-30"          # 6 meses
+START_DATE = "2024-04-01"          # 3 meses
+END_DATE = "2024-06-30"
 DATA_DIR = "data"
 SAMPLES_DIR = "samples"
 INITIAL_BALANCE = 1000.0
 COMMISSION = 0.001
 MIN_MOVE_PERCENT = 1.2
 LOOKAHEAD_VELAS = 10
-MAX_SAMPLES = 30                 # menos muestras para acelerar
-MAX_TRADES_BACKTEST = 50
+MAX_SAMPLES = 20                   # menos muestras por timeframe
+MAX_TRADES_BACKTEST = 30           # menos trades para acelerar
 RISK_PERCENT = 0.02
 MAX_POSITION_PCT = 0.10
 
-# Lista de temporalidades a probar (en minutos)
-TIMEFRAMES = [3, 5, 10, 30]
+# Solo probamos temporalidad 5 minutos
+TIMEFRAMES = [5]                   # 5 minutos
+HTF_TIMEFRAME = 60                 # 1 hora para tendencia (no se usa realmente, pero se descarga)
 
 # =================== FUNCIONES AUXILIARES ===================
 def log(msg):
-    """Imprime con timestamp y fuerza flush para Railway."""
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 def send_telegram(text, parse_mode="Markdown"):
@@ -185,58 +185,108 @@ def generar_muestras(df_ltf, timeframe):
     log(f"✅ Generadas {len(muestras)} muestras para {timeframe}m")
     return muestras
 
-# =================== 3. (OPCIONAL) EXTRAER REGLAS CON IA ===================
-def extraer_reglas_con_ia(muestras, timeframe, max_imagenes=10):
+# =================== 3. CONDICIONES ATÓMICAS PREDEFINIDAS ===================
+CONDICIONES_ATOMICAS = {}
+
+def definir_condiciones_atomicas():
+    global CONDICIONES_ATOMICAS
+    def rsi_lt_30(df, idx):
+        return df['rsi'].iloc[idx] < 30
+    def rsi_gt_70(df, idx):
+        return df['rsi'].iloc[idx] > 70
+    def price_lt_ema20(df, idx):
+        return df['close'].iloc[idx] < df['ema20'].iloc[idx]
+    def price_gt_ema20(df, idx):
+        return df['close'].iloc[idx] > df['ema20'].iloc[idx]
+    def macd_cross_above(df, idx):
+        return (df['macd'].iloc[idx] > df['macd_signal'].iloc[idx]) and \
+               (df['macd'].iloc[idx-1] <= df['macd_signal'].iloc[idx-1])
+    def macd_cross_below(df, idx):
+        return (df['macd'].iloc[idx] < df['macd_signal'].iloc[idx]) and \
+               (df['macd'].iloc[idx-1] >= df['macd_signal'].iloc[idx-1])
+    def close_near_support(df, idx):
+        soporte = df['low'].iloc[max(0,idx-20):idx+1].min()
+        return abs(df['close'].iloc[idx] - soporte) / df['close'].iloc[idx] < 0.002
+    def close_near_resistance(df, idx):
+        resistencia = df['high'].iloc[max(0,idx-20):idx+1].max()
+        return abs(resistencia - df['close'].iloc[idx]) / df['close'].iloc[idx] < 0.002
+    def price_above_ema50(df, idx):
+        return df['close'].iloc[idx] > df['ema50'].iloc[idx]
+    def price_below_ema50(df, idx):
+        return df['close'].iloc[idx] < df['ema50'].iloc[idx]
+    CONDICIONES_ATOMICAS = {
+        "rsi_lt_30": rsi_lt_30,
+        "rsi_gt_70": rsi_gt_70,
+        "price_lt_ema20": price_lt_ema20,
+        "price_gt_ema20": price_gt_ema20,
+        "macd_cross_above": macd_cross_above,
+        "macd_cross_below": macd_cross_below,
+        "close_near_support": close_near_support,
+        "close_near_resistance": close_near_resistance,
+        "price_above_ema50": price_above_ema50,
+        "price_below_ema50": price_below_ema50,
+    }
+definir_condiciones_atomicas()
+
+# =================== 4. EXTRAER CONDICIONES CON IA ===================
+def extraer_condiciones_con_ia(muestras, timeframe, max_muestras=8):
     if not OPENROUTER_API_KEY:
-        log("OPENROUTER_API_KEY no configurada, omitiendo extracción de reglas")
-        return
+        log("❌ OPENROUTER_API_KEY no configurada, omitiendo extracción por IA")
+        return []
     client = OpenAI(
         base_url="https://openrouter.ai/api/v1",
         api_key=OPENROUTER_API_KEY,
         default_headers={"HTTP-Referer": "https://railway.app", "X-Title": "Rule Extractor"}
     )
+    condiciones_disponibles = list(CONDICIONES_ATOMICAS.keys())
     prompt = f"""
-Eres un trader profesional. Analiza este gráfico de BTC/USDT (velas de {timeframe} minutos).
-En la línea verde vertical (momento indicado) el precio subió más de un {MIN_MOVE_PERCENT}% en las siguientes 10 velas.
-Describe las condiciones que justifican una entrada COMPRA:
-- Niveles de soporte/resistencia (precios)
-- Patrones de velas (martillo, engulfing, etc.)
-- Posición respecto a EMAs 20 y 50
-- Valores de RSI y MACD (divergencias, sobreventa, cruce)
-- Estructura de mercado
-Responde como lista de condiciones objetivas y programables (ej: "RSI < 30", "precio cruza EMA20 al alza").
+Eres un experto en trading cuantitativo. Analiza este gráfico de BTC/USDT (velas de {timeframe} minutos).
+En la línea vertical verde el precio subió más de 1.2% en las siguientes 10 velas (buena señal de compra).
+Selecciona las condiciones técnicas más relevantes de la siguiente lista:
+{json.dumps(condiciones_disponibles, indent=2)}
+
+Responde ÚNICAMENTE con un JSON que contenga un array de strings con las condiciones elegidas.
+Ejemplo: ["rsi_lt_30", "price_lt_ema20", "close_near_support"]
+No añadas texto adicional.
 """
-    reglas = []
-    for i, m in enumerate(muestras[:max_imagenes]):
+    condiciones_seleccionadas = set()
+    for i, m in enumerate(muestras[:max_muestras]):
         if m['direction'] != 'BUY':
             continue
-        log(f"Enviando imagen {i+1} de {timeframe}m a Claude...")
+        log(f"Enviando muestra {i+1} de {timeframe}m a Claude...")
         with open(m['image_path'], 'rb') as f:
             img_b64 = base64.b64encode(f.read()).decode()
-        response = client.chat.completions.create(
-            model="anthropic/claude-sonnet-4.5",
-            messages=[{"role": "user", "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
-            ]}],
-            temperature=0.2,
-            max_tokens=1500
-        )
-        reglas.append(f"--- {timeframe}m {m['timestamp']} ---\n{response.choices[0].message.content}")
+        try:
+            response = client.chat.completions.create(
+                model="anthropic/claude-sonnet-4.5",
+                messages=[{"role": "user", "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
+                ]}],
+                temperature=0.2,
+                max_tokens=500,
+                response_format={"type": "json_object"}
+            )
+            data = json.loads(response.choices[0].message.content)
+            if isinstance(data, list):
+                for cond in data:
+                    if cond in CONDICIONES_ATOMICAS:
+                        condiciones_seleccionadas.add(cond)
+        except Exception as e:
+            log(f"Error procesando respuesta de Claude: {e}")
         time.sleep(2)
-    with open(f"reglas_{timeframe}m.txt", "w", encoding='utf-8') as f:
-        f.write("\n\n".join(reglas))
-    log(f"✅ Reglas guardadas en reglas_{timeframe}m.txt")
+    log(f"✅ Condiciones descubiertas por IA para {timeframe}m: {list(condiciones_seleccionadas)}")
+    return list(condiciones_seleccionadas)
 
-# =================== 4. BACKTEST CON MÚLTIPLES REGLAS ===================
-def backtest_con_regla(df_ltf, condicion_buy):
+# =================== 5. BACKTEST CON COMBINACIONES ===================
+def backtest_con_regla(df_ltf, condicion_func):
     balance = INITIAL_BALANCE
     in_position = False
     position = None
     trades = []
     for i in range(100, len(df_ltf)):
         if not in_position:
-            if condicion_buy(df_ltf, i):
+            if condicion_func(df_ltf, i):
                 entry = df_ltf['close'].iloc[i]
                 sl = entry * 0.995
                 tp1 = entry * 1.005
@@ -265,145 +315,122 @@ def backtest_con_regla(df_ltf, condicion_buy):
                 break
     return trades, balance
 
-def evaluar_reglas(df_ltf, timeframe):
-    """Define condiciones atómicas y prueba combinaciones en AND. Devuelve mejor regla y top 5."""
-    # Condiciones atómicas
-    def cond_rsi_sobreventa(df, idx):
-        return df['rsi'].iloc[idx] < 30
-    def cond_rsi_sobrecompra(df, idx):
-        return df['rsi'].iloc[idx] > 70
-    def cond_precio_debajo_ema20(df, idx):
-        return df['close'].iloc[idx] < df['ema20'].iloc[idx]
-    def cond_precio_encima_ema20(df, idx):
-        return df['close'].iloc[idx] > df['ema20'].iloc[idx]
-    def cond_macd_cruce_alcista(df, idx):
-        return (df['macd'].iloc[idx] > df['macd_signal'].iloc[idx]) and \
-               (df['macd'].iloc[idx-1] <= df['macd_signal'].iloc[idx-1])
-    def cond_macd_cruce_bajista(df, idx):
-        return (df['macd'].iloc[idx] < df['macd_signal'].iloc[idx]) and \
-               (df['macd'].iloc[idx-1] >= df['macd_signal'].iloc[idx-1])
-    def cond_precio_cerca_soporte(df, idx):
-        soporte = df['low'].iloc[max(0,idx-20):idx+1].min()
-        return abs(df['close'].iloc[idx] - soporte) / df['close'].iloc[idx] < 0.002
-    def cond_precio_cerca_resistencia(df, idx):
-        resistencia = df['high'].iloc[max(0,idx-20):idx+1].max()
-        return abs(resistencia - df['close'].iloc[idx]) / df['close'].iloc[idx] < 0.002
-
-    condiciones = [
-        ('RSI < 30', cond_rsi_sobreventa),
-        ('RSI > 70', cond_rsi_sobrecompra),
-        ('Precio < EMA20', cond_precio_debajo_ema20),
-        ('Precio > EMA20', cond_precio_encima_ema20),
-        ('MACD cruce alcista', cond_macd_cruce_alcista),
-        ('MACD cruce bajista', cond_macd_cruce_bajista),
-        ('Precio cerca soporte', cond_precio_cerca_soporte),
-        ('Precio cerca resistencia', cond_precio_cerca_resistencia),
-    ]
-
+def evaluar_combinaciones(df_ltf, lista_condiciones):
+    if not lista_condiciones:
+        return None, []
+    cond_funcs = [(nombre, CONDICIONES_ATOMICAS[nombre]) for nombre in lista_condiciones]
     resultados = []
-    for (nombre1, c1), (nombre2, c2) in itertools.combinations(condiciones, 2):
-        regla = lambda df, i: c1(df, i) and c2(df, i)
+    # Combinaciones de 2
+    for (nom1, f1), (nom2, f2) in itertools.combinations(cond_funcs, 2):
+        regla = lambda df, i, f1=f1, f2=f2: f1(df, i) and f2(df, i)
         trades, balance_final = backtest_con_regla(df_ltf, regla)
         if not trades:
             continue
         pnl_total = sum(t['pnl'] for t in trades)
         wins = sum(1 for t in trades if t['pnl'] > 0)
-        winrate = wins / len(trades) * 100 if trades else 0
+        winrate = wins / len(trades) * 100
         resultados.append({
-            'regla': f"{nombre1} AND {nombre2}",
+            'regla': f"{nom1} AND {nom2}",
             'trades': len(trades),
             'winrate': winrate,
             'pnl_total': pnl_total,
             'balance_final': balance_final
         })
-    resultados.sort(key=lambda x: x['winrate'], reverse=True)
-    if resultados:
-        return resultados[0], resultados[:5]
-    else:
+    # Combinaciones de 3
+    for (nom1, f1), (nom2, f2), (nom3, f3) in itertools.combinations(cond_funcs, 3):
+        regla = lambda df, i, f1=f1, f2=f2, f3=f3: f1(df, i) and f2(df, i) and f3(df, i)
+        trades, balance_final = backtest_con_regla(df_ltf, regla)
+        if not trades:
+            continue
+        pnl_total = sum(t['pnl'] for t in trades)
+        wins = sum(1 for t in trades if t['pnl'] > 0)
+        winrate = wins / len(trades) * 100
+        resultados.append({
+            'regla': f"{nom1} AND {nom2} AND {nom3}",
+            'trades': len(trades),
+            'winrate': winrate,
+            'pnl_total': pnl_total,
+            'balance_final': balance_final
+        })
+    if not resultados:
         return None, []
+    resultados.sort(key=lambda x: x['winrate'], reverse=True)
+    return resultados[0], resultados[:5]
 
-# =================== 5. REPORTE FINAL A TELEGRAM ===================
-def enviar_resumen_global(mejores_por_timeframe, todas_muestras):
-    # Resumen comparativo
-    msg = "📊 *RESULTADOS POR TEMPORALIDAD*\n\n"
-    for tf, mejor in mejores_por_timeframe.items():
-        if mejor:
-            msg += f"⏱️ *{tf}m*\n"
-            msg += f"  Mejor regla: {mejor['regla']}\n"
-            msg += f"  Winrate: {mejor['winrate']:.1f}% ({mejor['trades']} trades)\n"
-            msg += f"  PnL: {mejor['pnl_total']:+.2f} USDT\n\n"
-        else:
-            msg += f"⏱️ *{tf}m*: sin reglas con trades\n\n"
+# =================== 6. PROCESAR TIMEFRAME ÚNICO ===================
+def procesar_timeframe(tf, df_60m):
+    log(f"\n========== PROCESANDO TIMEFRAME {tf}m ==========")
+    ltf_path = fetch_klines(tf)
+    if not ltf_path:
+        log(f"❌ No se pudo descargar {tf}m")
+        return None, None, []
+    df_ltf = pd.read_csv(ltf_path, parse_dates=['timestamp'], index_col='timestamp')
+    df_ltf = calcular_indicadores(df_ltf)
+
+    muestras = generar_muestras(df_ltf, tf)
+
+    # Extraer condiciones con IA si hay API key
+    condiciones_ia = []
+    if OPENROUTER_API_KEY and muestras:
+        condiciones_ia = extraer_condiciones_con_ia(muestras, tf, max_muestras=8)
+
+    todas_condiciones = list(CONDICIONES_ATOMICAS.keys())
+    if condiciones_ia:
+        for c in condiciones_ia:
+            if c not in todas_condiciones:
+                todas_condiciones.append(c)
+        log(f"Total condiciones a probar: {len(todas_condiciones)} (incluye IA)")
+    else:
+        log(f"Usando {len(todas_condiciones)} condiciones predefinidas")
+
+    mejor, top = evaluar_combinaciones(df_ltf, todas_condiciones)
+    if mejor:
+        log(f"✅ Mejor regla para {tf}m: {mejor['regla']} -> winrate {mejor['winrate']:.1f}%")
+    else:
+        log(f"⚠️ No se encontraron reglas con trades para {tf}m")
+    return mejor, top, muestras
+
+# =================== 7. REPORTE FINAL A TELEGRAM ===================
+def enviar_resumen(mejor, muestras, tf):
+    if not mejor:
+        send_telegram("❌ No se encontró ninguna regla con trades para la temporalidad 5m.")
+        return
+    msg = f"📊 *RESULTADO BACKTEST (5m)*\n\n"
+    msg += f"🏆 Mejor regla:\n{mejor['regla']}\n"
+    msg += f"📈 Winrate: {mejor['winrate']:.1f}% ({mejor['trades']} trades)\n"
+    msg += f"💰 PnL total: {mejor['pnl_total']:+.2f} USDT\n"
+    msg += f"💵 Balance final: {mejor['balance_final']:.2f} USDT\n"
     send_telegram(msg)
 
-    # Enviar la mejor regla global (la de mayor winrate entre todas)
-    mejor_global = max(mejores_por_timeframe.items(), key=lambda x: x[1]['winrate'] if x[1] else -1)
-    if mejor_global[1]:
-        tf_best = mejor_global[0]
-        best = mejor_global[1]
-        msg = f"🏆 *MEJOR REGLA GLOBAL* (temporalidad {tf_best}m)\n"
-        msg += f"{best['regla']}\n"
-        msg += f"Winrate: {best['winrate']:.1f}% | PnL: {best['pnl_total']:+.2f} USDT"
-        send_telegram(msg)
-
-    # Enviar gráficos de las muestras (solo de la temporalidad que dio mejor resultado)
-    if tf_best in todas_muestras:
-        muestras = todas_muestras[tf_best]
-        for idx, m in enumerate(muestras[:20]):
-            caption = f"🔔 Señal #{idx+1} ({tf_best}m): {m['direction']} {m['cambio']:.1f}%\n{m['timestamp'].strftime('%Y-%m-%d %H:%M')}"
-            with open(m['image_path'], 'rb') as f:
-                img_buf = BytesIO(f.read())
-            send_telegram_image(img_buf, caption)
+    # Enviar gráficos de las muestras (hasta 15)
+    for idx, m in enumerate(muestras[:15]):
+        caption = f"🔔 Señal #{idx+1} ({tf}m): {m['direction']} {m['cambio']:.1f}%\n{m['timestamp'].strftime('%Y-%m-%d %H:%M')}"
+        with open(m['image_path'], 'rb') as f:
+            img_buf = BytesIO(f.read())
+        send_telegram_image(img_buf, caption)
 
 # =================== MAIN ===================
 def main():
-    log("🚀 Iniciando pipeline de optimización multi-temporalidad")
-    resultados_por_tf = {}
-    todas_muestras = {}
-
-    # Primero descargar datos de 1h (tendencia, solo una vez)
-    htf_path = fetch_klines(60)
+    log("🚀 Iniciando pipeline optimizado (5 minutos, 3 meses)")
+    # Descargar datos de 1h (opcional, no se usa en backtest pero lo mantenemos)
+    htf_path = fetch_klines(HTF_TIMEFRAME)
     if not htf_path:
-        log("❌ Error descargando datos de 1h")
-        return
-    df_60m = pd.read_csv(htf_path, parse_dates=['timestamp'], index_col='timestamp')
-    df_60m = calcular_indicadores(df_60m)
+        log("⚠️ No se pudo descargar 1h, pero continuamos (no es esencial)")
+    df_60m = None
+    if htf_path:
+        df_60m = pd.read_csv(htf_path, parse_dates=['timestamp'], index_col='timestamp')
+        df_60m = calcular_indicadores(df_60m)
 
-    for tf in TIMEFRAMES:
-        log(f"\n========== PROCESANDO TIMEFRAME {tf}m ==========")
-        # Descargar datos LTF
-        ltf_path = fetch_klines(tf)
-        if not ltf_path:
-            log(f"❌ No se pudo descargar {tf}m, saltando...")
-            continue
-        df_ltf = pd.read_csv(ltf_path, parse_dates=['timestamp'], index_col='timestamp')
-        df_ltf = calcular_indicadores(df_ltf)
+    # Procesar solo 5 minutos
+    tf = 5
+    mejor, top, muestras = procesar_timeframe(tf, df_60m)
 
-        # Generar muestras (para gráficos y opcional IA)
-        muestras = generar_muestras(df_ltf, tf)
-        todas_muestras[tf] = muestras
-
-        # (Opcional) Extraer reglas con IA - comentar si no se desea
-        # extraer_reglas_con_ia(muestras, tf, max_imagenes=10)
-
-        # Evaluar combinaciones de reglas
-        mejor, top = evaluar_reglas(df_ltf, tf)
-        if mejor:
-            resultados_por_tf[tf] = mejor
-            log(f"✅ Mejor regla para {tf}m: winrate {mejor['winrate']:.1f}%")
-        else:
-            resultados_por_tf[tf] = None
-            log(f"⚠️ No se encontraron reglas con trades para {tf}m")
-
-    # Enviar resumen a Telegram
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-        enviar_resumen_global(resultados_por_tf, todas_muestras)
+        enviar_resumen(mejor, muestras, tf)
     else:
         log("⚠️ Telegram no configurado. Resultados impresos en consola.")
-        for tf, res in resultados_por_tf.items():
-            if res:
-                print(f"{tf}m: {res['regla']} -> winrate {res['winrate']:.1f}%")
-
+        if mejor:
+            print(mejor)
     log("✅ Pipeline finalizado")
 
 if __name__ == "__main__":
