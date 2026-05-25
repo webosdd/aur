@@ -8,7 +8,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 from io import BytesIO
-from datetime import datetime
+from datetime import datetime, timedelta
 from ta.momentum import RSIIndicator
 from ta.trend import MACD
 from openai import OpenAI
@@ -24,12 +24,15 @@ INITIAL_BALANCE = 1000.0
 COMMISSION = 0.001
 RISK_PERCENT = 0.02
 MAX_POSITION_PCT = 0.10
-MIN_WINRATE = 50.0          # mínimo winrate para considerar una regla
-MIN_TRADES = 5              # mínimo número de trades
-MAX_ITERATIONS = 5          # iteraciones de mejora con IA
-DESIRED_SETUPS = 1          # solo nos interesa la mejor regla final
+MIN_WINRATE = 50.0
+MIN_TRADES = 5
+MAX_ITERATIONS = 3          # Iteraciones de mejora con IA
+DESIRED_SETUPS = 1
 
 DATA_URL = "https://github.com/webosdd/aur/raw/refs/heads/main/BTCUSDT_15m_data.zip"
+
+# Solo usar los últimos 3 MESES
+MONTHS_TO_USE = 3
 
 # =================== FUNCIONES AUXILIARES ===================
 def log(msg):
@@ -98,7 +101,7 @@ def generar_grafico_equity(trades, equity_curve, titulo):
     plt.close(fig)
     return buf
 
-# =================== CARGAR DATOS (VERSIÓN ROBUSTA) ===================
+# =================== CARGAR DATOS (con filtro de 3 meses) ===================
 def cargar_datos():
     log(f"📥 Descargando datos desde: {DATA_URL}")
     try:
@@ -106,49 +109,28 @@ def cargar_datos():
     except Exception as e:
         raise Exception(f"Error al cargar el archivo: {e}")
 
-    # Mostrar columnas originales para depuración (útil si aún falla)
-    log(f"Columnas originales en el CSV: {df.columns.tolist()}")
-
-    # Mapeo flexible: nombre estándar -> lista de posibles nombres en el CSV
-    posibles_nombres = {
-        'timestamp': ['timestamp', 'time', 'date', 'open_time', 'Open time', 'openTime', 'datetime', 'Date'],
-        'open': ['open', 'Open', 'OPEN', 'o', 'price_open'],
-        'high': ['high', 'High', 'HIGH', 'h', 'price_high'],
-        'low': ['low', 'Low', 'LOW', 'l', 'price_low'],
-        'close': ['close', 'Close', 'CLOSE', 'c', 'price_close'],
-        'volume': ['volume', 'Volume', 'VOLUME', 'vol', 'quote_volume', 'base_volume']
+    log(f"Columnas originales: {df.columns.tolist()}")
+    rename_map = {
+        'Open time': 'timestamp', 'Open': 'open', 'High': 'high',
+        'Low': 'low', 'Close': 'close', 'Volume': 'volume'
     }
-
-    rename_map = {}
-    for std_name, posibles in posibles_nombres.items():
-        for col in df.columns:
-            if col in posibles or col.lower() in [p.lower() for p in posibles]:
-                rename_map[col] = std_name
-                break
-
-    if rename_map:
-        df.rename(columns=rename_map, inplace=True)
-        log(f"Columnas renombradas: {rename_map}")
-    else:
-        log("⚠️ No se pudo renombrar ninguna columna, se usarán las originales")
-
-    # Verificar que las columnas requeridas existan
+    df.rename(columns=rename_map, inplace=True)
     required = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
     missing = [col for col in required if col not in df.columns]
     if missing:
-        raise KeyError(f"Faltan columnas requeridas después del mapeo: {missing}. "
-                       f"Columnas disponibles: {df.columns.tolist()}")
+        raise KeyError(f"Faltan columnas: {missing}")
 
-    # Convertir timestamp a datetime
     df['timestamp'] = pd.to_datetime(df['timestamp'])
     df.set_index('timestamp', inplace=True)
-
-    # Asegurar tipos numéricos
-    for col in ['open', 'high', 'low', 'close', 'volume']:
+    for col in required[1:]:
         df[col] = pd.to_numeric(df[col], errors='coerce')
-
     df = df.sort_index()
-    log(f"✅ Datos cargados: {len(df)} velas desde {df.index[0]} hasta {df.index[-1]}")
+
+    # Calcular la fecha de inicio: última fecha del DataFrame menos MONTHS_TO_USE meses
+    last_date = df.index.max()
+    start_date = last_date - pd.DateOffset(months=MONTHS_TO_USE)
+    df = df[df.index >= start_date]
+    log(f"✅ Datos cargados y filtrados a los últimos {MONTHS_TO_USE} meses: {len(df)} velas desde {df.index[0]} hasta {df.index[-1]}")
     return df
 
 # =================== CONDICIONES ATÓMICAS INICIALES ===================
@@ -192,18 +174,19 @@ def definir_condiciones_iniciales():
     }
 definir_condiciones_iniciales()
 
-# =================== BACKTEST COMPLETO ===================
+# =================== BACKTEST COMPLETO (optimizado para arrays) ===================
 def backtest_completo(df, condicion_func):
     balance = INITIAL_BALANCE
     in_position = False
     position = None
     trades = []
     balance_history = {}
+    close_prices = df['close'].values
     for i in range(100, len(df)):
         current_time = df.index[i]
         if not in_position:
             if condicion_func(df, i):
-                entry = df['close'].iloc[i]
+                entry = close_prices[i]
                 sl = entry * 0.995
                 tp1 = entry * 1.005
                 risk_amount = balance * RISK_PERCENT
@@ -221,7 +204,7 @@ def backtest_completo(df, condicion_func):
                     'entry_time': current_time
                 }
         else:
-            current = df['close'].iloc[i]
+            current = close_prices[i]
             exit_price = None
             exit_reason = None
             if current >= position['tp1']:
@@ -255,17 +238,19 @@ def backtest_completo(df, condicion_func):
         equity_curve[t] = last_balance
     return trades, equity_curve, balance
 
+# =================== EVALUACIÓN SOLO 2 Y 3 CONDICIONES (con progreso) ===================
 def evaluar_todas_combinaciones(df):
     cond_nombres = list(CONDICIONES_ATOMICAS.keys())
     resultados = []
-    total_combos = 0
-    for r in range(2, 5):
-        total_combos += len(list(itertools.combinations(cond_nombres, r)))
-    log(f"Evaluando {total_combos} combinaciones...")
-    for r in range(2, 5):
-        for combo_nombres in itertools.combinations(cond_nombres, r):
+    for r in [2, 3]:
+        combos = list(itertools.combinations(cond_nombres, r))
+        total = len(combos)
+        log(f"Evaluando {total} combinaciones de {r} condiciones...")
+        for i, combo_nombres in enumerate(combos):
+            if i % 100 == 0:
+                log(f"  Progreso: {i}/{total} combos evaluadas")
             combo_funcs = [CONDICIONES_ATOMICAS[n] for n in combo_nombres]
-            regla_func = lambda df, i, fns=combo_funcs: all(f(df, i) for f in fns)
+            regla_func = lambda df, idx, fns=combo_funcs: all(f(df, idx) for f in fns)
             trades, equity, final_balance = backtest_completo(df, regla_func)
             if len(trades) < MIN_TRADES:
                 continue
@@ -306,10 +291,9 @@ def sugerir_nuevas_condiciones_ia(mejor_setup, iteration):
         api_key=OPENROUTER_API_KEY,
         default_headers={"HTTP-Referer": "https://railway.app", "X-Title": "Setups Optimizer"}
     )
-    # Tomar una muestra de los últimos 5 trades perdedores (si existen)
     trades = mejor_setup['trades_list']
     losers = [t for t in trades if t['pnl'] < 0]
-    losers_sample = losers[-5:] if len(losers) > 0 else []
+    losers_sample = losers[-5:] if losers else []
     losers_text = "\n".join([f"  - {l['exit_time']}: PnL {l['pnl']:.2f}, exit {l['exit_reason']}" for l in losers_sample]) if losers_sample else "No hubo trades perdedores."
     
     prompt = f"""
@@ -335,7 +319,7 @@ Ejemplo: ["cond1", "cond2", "cond3"]
 """
     try:
         response = client.chat.completions.create(
-            model="google/gemini-2.0-flash-exp",  # modelo rápido y barato
+            model="google/gemini-2.0-flash-exp",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.7,
             max_tokens=500,
@@ -343,10 +327,7 @@ Ejemplo: ["cond1", "cond2", "cond3"]
         )
         content = response.choices[0].message.content
         data = json.loads(content)
-        if isinstance(data, list):
-            return data
-        else:
-            return []
+        return data if isinstance(data, list) else []
     except Exception as e:
         log(f"Error en IA: {e}")
         return []
@@ -355,14 +336,10 @@ def agregar_condicion_si_valida(expr):
     global CONDICIONES_ATOMICAS
     if expr in CONDICIONES_ATOMICAS:
         return False
-    # Validar sintaxis básica
     try:
         compile(expr, '<string>', 'eval')
-        # Crear función dinámica
         def nueva_cond(df, idx, expr=expr):
             return eval(expr, globals(), {'df': df, 'idx': idx, 'pd': pd, 'np': np})
-        # Probar con un índice cualquiera (e.g., 150) para ver si no da error de ejecución
-        # No lo hacemos aquí porque requiere df real; se probará en backtest.
         CONDICIONES_ATOMICAS[expr] = nueva_cond
         log(f"➕ Nueva condición añadida: {expr}")
         return True
@@ -370,9 +347,9 @@ def agregar_condicion_si_valida(expr):
         log(f"❌ Condición inválida '{expr}': {e}")
         return False
 
-# =================== EJECUCIÓN PRINCIPAL ITERATIVA ===================
+# =================== EJECUCIÓN PRINCIPAL ===================
 def main():
-    log("🚀 Iniciando optimización con IA (Gemini)")
+    log(f"🚀 Iniciando optimización con IA (Gemini) - últimos {MONTHS_TO_USE} meses")
     df = cargar_datos()
     df = calcular_indicadores(df)
     
@@ -386,23 +363,18 @@ def main():
         mejor = resultados[0]
         log(f"✅ Mejor regla: {mejor['regla']} -> winrate {mejor['winrate']:.1f}% ({mejor['trades']} trades)")
         
-        # Actualizar best_overall si es mejor
         if best_overall is None or (mejor['winrate'] > best_overall['winrate']):
             best_overall = mejor
-            # Enviar a Telegram el nuevo mejor encontrado
             msg = f"🔔 *Iter {iteration} - Nuevo mejor setup*\nRegla: `{mejor['regla']}`\nWinrate: {mejor['winrate']:.1f}% ({mejor['trades']} trades)\nProfit factor: {mejor['profit_factor']:.2f}\nPnL: {mejor['total_pnl']:+.2f} USDT"
             send_telegram(msg)
-            # Enviar equity curve
             img = generar_grafico_equity(mejor['trades_list'], mejor['equity_curve'], f"Equity Curve - {mejor['regla'][:60]}")
             if img:
                 send_telegram_image(img, caption=f"Evolución del balance (winrate {mejor['winrate']:.1f}%)")
         
-        # Si ya tenemos un winrate muy alto, podemos parar
         if mejor['winrate'] >= 80:
             log("Winrate >= 80%, deteniendo iteraciones.")
             break
         
-        # Pedir a la IA nuevas condiciones
         log("Consultando IA para sugerir nuevas condiciones...")
         nuevas = sugerir_nuevas_condiciones_ia(mejor, iteration)
         if nuevas:
@@ -411,19 +383,17 @@ def main():
                 if agregar_condicion_si_valida(expr):
                     any_added = True
             if any_added:
-                log(f"Se añadieron {len([e for e in nuevas if e in CONDICIONES_ATOMICAS])} nuevas condiciones. Re-evaluando...")
+                log(f"Se añadieron nuevas condiciones. Re-evaluando...")
             else:
                 log("No se pudo añadir ninguna condición válida.")
         else:
             log("IA no devolvió sugerencias o hubo error.")
         
-        time.sleep(2)  # pausa para no saturar la API
+        time.sleep(2)
     
-    # Resumen final
     if best_overall:
         final_msg = f"🏆 *MEJOR SETUP FINAL* 🏆\n\nRegla: `{best_overall['regla']}`\nWinrate: {best_overall['winrate']:.1f}% ({best_overall['trades']} trades)\nProfit factor: {best_overall['profit_factor']:.2f}\nDrawdown máx: {best_overall['max_drawdown']:.1f}%\nPnL total: {best_overall['total_pnl']:+.2f} USDT\nBalance final: {best_overall['final_balance']:.2f} USDT"
         send_telegram(final_msg)
-        # Enviar trade list resumido
         trade_details = "📋 *Detalle de trades (últimos 10):*\n"
         for t in best_overall['trades_list'][-10:]:
             trade_details += f"{t['exit_time'].strftime('%m-%d %H:%M')} -> {t['pnl']:+.2f} USDT ({t['exit_reason']})\n"
