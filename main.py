@@ -1,4 +1,5 @@
-# BOT TRADING CON CLAUDE SONNET 4.5 - IA CON AUTORIDAD ABSOLUTA
+# BOT TRADING CON CLAUDE SONNET 4.5 - IA CON REGLAS EXPLÍCITAS DE TRADING
+# Temporalidades: 10m (ejecución) y 1h (tendencia)
 # ==============================================================================
 import os, time, requests, json, numpy as np, pandas as pd
 from scipy.stats import linregress
@@ -68,13 +69,13 @@ MODELO_VISION = "anthropic/claude-sonnet-4.5"
 # =================== CONFIGURACIÓN ===================
 PAPER_TRADE = True   # Cambiar a False para real
 SYMBOL = "BTCUSDT"
-INTERVAL_LTF = "3"
-INTERVAL_HTF = "30"
-SLEEP_SECONDS = 60
-GRAFICO_VELAS_LIMIT = 120
+INTERVAL_LTF = "10"   # 10 minutos
+INTERVAL_HTF = "60"   # 1 hora
+SLEEP_SECONDS = 120   # 2 minutos entre ciclos (temporalidades más largas)
+GRAFICO_VELAS_LIMIT = 80  # 80 velas de 10m = ~13 horas
 MAX_CONCURRENT_TRADES = 3
 MIN_MARGIN_PER_TRADE = 3.0
-TP1_PERCENT = 0.5          # Porcentaje a cerrar en TP1
+TP1_PERCENT = 0.5          # 50% del tamaño en TP1
 TRAILING_PERCENT = 0.0015  # 0.15% trailing
 LEVERAGE = 34
 
@@ -88,7 +89,7 @@ paper_total_trades = 0
 paper_trade_history = []
 PAPER_COMMISSION_PCT = 0.001
 
-# Estado real (inicializado después)
+# Estado real
 REAL_BALANCE = None
 REAL_ACTIVE_TRADES = {}
 TRADE_COUNTER = 0
@@ -97,7 +98,7 @@ LOSS_COUNT = 0
 TOTAL_TRADES = 0
 TRADE_HISTORY = []
 
-# =================== FUNCIONES BYBIT ===================
+# =================== FUNCIONES BYBIT (idénticas) ===================
 def bybit_request(endpoint, method="GET", params=None, body=None):
     timestamp = str(int(time.time() * 1000))
     recv_window = "5000"
@@ -248,7 +249,7 @@ def guardar_memoria():
             "loss": paper_loss_count,
             "total": paper_total_trades,
             "history": paper_trade_history,
-            "positions": {tid: {k: v for k, v in t.items() if k != 'analisis_ia'} for tid, t in paper_positions.items()}
+            "positions": {tid: {k: v for k, v in t.items() if k != 'analisis'} for tid, t in paper_positions.items()}
         }
     else:
         data = {
@@ -257,12 +258,12 @@ def guardar_memoria():
             "loss": LOSS_COUNT,
             "total": TOTAL_TRADES,
             "history": TRADE_HISTORY,
-            "positions": {tid: {k: v for k, v in t.items() if k != 'analisis_ia'} for tid, t in REAL_ACTIVE_TRADES.items()}
+            "positions": {tid: {k: v for k, v in t.items() if k != 'analisis'} for tid, t in REAL_ACTIVE_TRADES.items()}
         }
     try:
         with open(MEMORY_FILE, "w") as f:
             json.dump(data, f, indent=4)
-        logger.info("Memoria guardada")
+        logger.info("💾 Memoria guardada")
     except Exception as e:
         logger.error(f"Error guardando: {e}")
 
@@ -288,11 +289,11 @@ def cargar_memoria():
             TOTAL_TRADES = data.get("total", 0)
             TRADE_HISTORY = data.get("history", [])
             REAL_ACTIVE_TRADES = {int(k): v for k, v in data.get("positions", {}).items()}
-        logger.info("Memoria cargada")
+        logger.info("📂 Memoria cargada")
     except Exception as e:
         logger.error(f"Error cargando: {e}")
 
-# =================== TELEGRAM ===================
+# =================== TELEGRAM (con emojis) ===================
 def telegram_mensaje(texto):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -312,6 +313,30 @@ def telegram_enviar_imagen(ruta, caption=""):
                           files={"photo": foto}, timeout=15)
     except Exception as e:
         logger.error(f"Imagen error: {e}")
+
+def enviar_mensaje_trade(trade_id, decision, entrada, sl, tp1, qty, razon, analisis, modo, balance):
+    emoji_decision = "✅ COMPRAR" if decision == "Buy" else "🔴 VENDER"
+    emoji_entry = "🚪"
+    emoji_sl = "🛑"
+    emoji_tp = "🎯"
+    emoji_qty = "📊"
+    emoji_balance = "💰"
+    msg = (
+        f"{emoji_decision} *{modo} #{trade_id}*\n"
+        f"{emoji_entry} *Entrada:* {entrada:.2f} USDT\n"
+        f"{emoji_sl} *Stop Loss:* {sl:.2f} USDT\n"
+        f"{emoji_tp} *Take Profit 1:* {tp1:.2f} USDT\n"
+        f"{emoji_qty} *Cantidad:* {qty:.3f} BTC\n"
+        f"{emoji_balance} *Balance:* {balance:.2f} USDT\n"
+        f"📝 *Razón:* {razon[:200]}\n"
+        f"🔍 *Análisis:* {analisis[:300]}..."
+    )
+    telegram_mensaje(msg)
+
+def enviar_mensaje_cierre(trade_id, pnl, balance, motivo):
+    emoji = "✅" if pnl > 0 else "❌"
+    msg = f"{emoji} *CIERRE #{trade_id}*\n📈 PnL: {pnl:+.2f} USDT\n💰 Balance: {balance:.2f} USDT\n📌 Motivo: {motivo}"
+    telegram_mensaje(msg)
 
 # =================== INDICADORES Y ANÁLISIS TÉCNICO ===================
 def obtener_velas(interval, limit=150):
@@ -424,50 +449,45 @@ def pil_to_base64(img):
     img.save(buffered, format="PNG")
     return f"data:image/png;base64,{base64.b64encode(buffered.getvalue()).decode()}"
 
-# =================== CACHÉ DE DECISIONES ===================
-class DecisionCache:
-    def __init__(self, max_size=10):
-        self.cache = OrderedDict()
-        self.max_size = max_size
-    def get_key(self, df_ltf, df_htf):
-        last_close = df_ltf['close'].iloc[-1]
-        last_rsi = df_ltf['rsi'].iloc[-1] if 'rsi' in df_ltf else 50
-        last_macd = df_ltf['macd'].iloc[-1] if 'macd' in df_ltf else 0
-        close_bin = round(last_close / 100) * 100
-        rsi_bin = round(last_rsi / 5) * 5
-        macd_bin = round(last_macd / 50) * 50
-        return f"{close_bin}_{rsi_bin}_{macd_bin}"
-    def get(self, df_ltf, df_htf):
-        key = self.get_key(df_ltf, df_htf)
-        if key in self.cache:
-            logger.info(f"Usando caché para clave {key}")
-            return self.cache[key]
-        return None
-    def set(self, df_ltf, df_htf, value):
-        key = self.get_key(df_ltf, df_htf)
-        self.cache[key] = value
-        if len(self.cache) > self.max_size:
-            self.cache.popitem(last=False)
-        logger.debug(f"Guardado en caché: {key}")
-decision_cache = DecisionCache()
+# =================== PROMPT CON REGLAS EXPLÍCITAS DE TRADING ===================
+PROMPT_TRADING = """
+Eres un trader profesional con décadas de experiencia. Tu tarea es analizar los gráficos de BTC/USDT en dos temporalidades:
+- Gráfico 1: Velas de 10 minutos (ejecución)
+- Gráfico 2: Velas de 1 hora (tendencia)
 
-# =================== IA (LIBERTAD TOTAL, PARSING ROBUSTO) ===================
+Debes aplicar las siguientes reglas de trading (son principios, no filtros rígidos, pero debes considerarlos):
+1. **Soportes y resistencias**: Nunca vendas justo en un soporte claro (el precio tiende a rebotar). Nunca compres justo en una resistencia clara (el precio tiende a rechazar). Si el soporte es muy fuerte, espera una confirmación de ruptura antes de vender.
+2. **EMAs**: Cuando el precio cruza una EMA, esta puede cambiar de rol: si estaba actuando como soporte y se rompe, puede convertirse en resistencia. Lo mismo al revés. Observa las EMAs 20 y 50.
+3. **Patrones de velas**: Busca patrones de reversión (martillo, estrella fugaz, engulfing, doji) en zonas clave. También patrones de continuación.
+4. **Trampas de liquidez**: A veces el precio rompe un nivel brevemente (liquidez) y luego vuelve. No confundas una ruptura falsa con una verdadera. Espera velas de cierre fuera del nivel.
+5. **Confirmación de tendencia**: Usa el gráfico de 1h para determinar la tendencia principal. Opera a favor de ella siempre que sea posible. Si la tendencia es alcista, prioriza compras en soportes. Si es bajista, prioriza ventas en resistencias.
+6. **RSI y MACD**: Úsalos como confirmación, no como señal principal. Divergencias entre precio e indicador son importantes.
+7. **Gestión de riesgo**: Coloca el stop loss justo detrás del último pivote o nivel relevante. El take profit 1 debe ser alcanzable (no demasiado lejano).
+8. **No sobreoperes**: Si no hay una setup clara con alta probabilidad, decide Hold.
+
+Tu decisión debe ser COMPRAR (Buy), VENDER (Sell) o NO HACER NADA (Hold).
+Si decides Buy o Sell, debes proporcionar:
+- entry_price: precio exacto de entrada (normalmente el precio actual o un nivel límite)
+- sl_price: stop loss (nivel donde la operación se invalida)
+- tp1_price: primer objetivo parcial (idealmente un 50% del tamaño)
+Además, una breve razón (máx 150 caracteres) y un análisis completo en español.
+
+Recuerda: eres libre de interpretar, pero debes evitar errores básicos como vender en un soporte evidente o comprar en una resistencia evidente.
+
+Responde ÚNICAMENTE con un JSON válido con esta estructura:
+{"decision": "Buy/Sell/Hold", "entry_price": 0.0, "sl_price": 0.0, "tp1_price": 0.0, "razon": "...", "analisis": "..."}
+Si Hold, precios 0.0.
+"""
+
 def analizar_con_claude(img_ltf, img_htf, reintentos=2):
     for intento in range(reintentos + 1):
         try:
             img_ltf_b64 = pil_to_base64(img_ltf)
             img_htf_b64 = pil_to_base64(img_htf)
-            prompt = """Eres un trader profesional. Analiza los gráficos de BTC/USDT en 3m y 30m.
-Decide COMPRAR (Buy), VENDER (Sell) o NO HACER NADA (Hold).
-Debes responder ÚNICAMENTE con un objeto JSON válido, sin texto adicional antes o después.
-El JSON debe tener exactamente esta estructura:
-{"decision": "Buy/Sell/Hold", "entry_price": 0.0, "sl_price": 0.0, "tp1_price": 0.0, "razon": "...", "analisis": "..."}
-Si la decisión es Hold, los precios deben ser 0.0.
-No incluyas markdown, ni comillas triples, ni explicaciones. Solo el JSON."""
             response = client.chat.completions.create(
                 model=MODELO_VISION,
                 messages=[{"role": "user", "content": [
-                    {"type": "text", "text": prompt},
+                    {"type": "text", "text": PROMPT_TRADING},
                     {"type": "image_url", "image_url": {"url": img_ltf_b64}},
                     {"type": "image_url", "image_url": {"url": img_htf_b64}}
                 ]}],
@@ -479,7 +499,6 @@ No incluyas markdown, ni comillas triples, ni explicaciones. Solo el JSON."""
             # Limpiar markdown
             clean = re.sub(r'^```json\s*', '', raw, flags=re.IGNORECASE)
             clean = re.sub(r'\s*```$', '', clean)
-            # Buscar JSON
             match = re.search(r'\{.*?"decision"\s*:\s*"(?:Buy|Sell|Hold)".*?\}', clean, re.DOTALL)
             if not match:
                 match = re.search(r'\{.*\}', clean, re.DOTALL)
@@ -497,7 +516,7 @@ No incluyas markdown, ni comillas triples, ni explicaciones. Solo el JSON."""
                 tp1 = float(data.get("tp1_price", 0.0))
                 return decision, razon, analisis, entry, sl, tp1
             else:
-                raise ValueError("No se encontró JSON en la respuesta")
+                raise ValueError("No se encontró JSON")
         except Exception as e:
             logger.error(f"Intento {intento+1} falló: {e}")
             if intento == reintentos:
@@ -505,7 +524,7 @@ No incluyas markdown, ni comillas triples, ni explicaciones. Solo el JSON."""
             time.sleep(2)
     return "Hold", "Error crítico", "", 0.0, 0.0, 0.0
 
-# =================== APERTURA DE POSICIÓN (SIN FILTROS) ===================
+# =================== APERTURA DE POSICIÓN (con mensaje enriquecido) ===================
 def abrir_posicion(decision, precio_actual, razon, analisis, entry_ia, sl_ia, tp1_ia, df_ltf, soporte, resistencia, slope, intercept):
     global paper_balance, paper_positions, paper_trade_counter, REAL_BALANCE, TRADE_COUNTER, REAL_ACTIVE_TRADES
 
@@ -540,7 +559,7 @@ def abrir_posicion(decision, precio_actual, razon, analisis, entry_ia, sl_ia, tp
     sl = sl_ia if sl_ia and sl_ia > 0 else (entrada * 0.995 if decision == "Buy" else entrada * 1.005)
     tp1 = tp1_ia if tp1_ia and tp1_ia > 0 else (entrada * 1.005 if decision == "Buy" else entrada * 0.995)
 
-    # Ajustes mínimos de seguridad (solo para evitar SL absurdo)
+    # Ajustes mínimos de seguridad
     if decision == "Buy":
         if sl >= entrada:
             sl = entrada * 0.995
@@ -585,6 +604,7 @@ def abrir_posicion(decision, precio_actual, razon, analisis, entry_ia, sl_ia, tp
             "trailing_activado": False, "best_price": entrada, "trailing_stop": None
         }
         modo = "PAPER"
+        balance_mostrar = paper_balance
     else:
         order_id = place_market_order(decision, qty_btc)
         if not order_id:
@@ -601,16 +621,18 @@ def abrir_posicion(decision, precio_actual, razon, analisis, entry_ia, sl_ia, tp
             "trailing_activado": False, "best_price": entrada, "trailing_stop": None
         }
         modo = "REAL"
+        balance_mostrar = REAL_BALANCE
 
-    msg = f"{modo} #{trade_id} {decision} a {entrada:.2f} | Qty {qty_btc} | SL {sl:.2f} | TP1 {tp1:.2f}\nRazón: {razon[:100]}"
-    logger.info(msg)
-    telegram_mensaje(msg)
+    # Enviar mensaje detallado a Telegram
+    enviar_mensaje_trade(trade_id, decision, entrada, sl, tp1, qty_btc, razon, analisis, modo, balance_mostrar)
 
+    # Enviar gráfico
     img = generar_grafico(df_ltf, f"{modo} #{trade_id} {decision}", soporte, resistencia, slope, intercept,
                           entry=entrada, sl=sl, tp1=tp1, side=decision)
     if img:
         img.save("/tmp/entrada.png")
-        telegram_enviar_imagen("/tmp/entrada.png", caption=f"#{trade_id} Entry {entrada:.2f} SL {sl:.2f} TP1 {tp1:.2f}")
+        caption = f"📊 {modo} #{trade_id} {decision}\nEntry: {entrada:.2f} | SL: {sl:.2f} | TP1: {tp1:.2f}"
+        telegram_enviar_imagen("/tmp/entrada.png", caption)
 
     guardar_memoria()
 
@@ -636,8 +658,7 @@ def gestionar_trades_simulado(df):
                     t['trailing_activado'] = True
                     t['best_price'] = t['entrada']
                     t['trailing_stop'] = t['entrada'] * (1 - TRAILING_PERCENT) if t['decision']=="Buy" else t['entrada'] * (1 + TRAILING_PERCENT)
-                    logger.info(f"TP1 #{tid} +{pnl:.2f} USDT")
-                    telegram_mensaje(f"TP1 #{tid} +{pnl:.2f} USDT, trailing activado")
+                    logger.info(f"✅ TP1 #{tid} +{pnl:.2f} USDT")
                     if t['qty_restante'] <= 0:
                         cerrar.append(tid)
                 else:
@@ -661,8 +682,7 @@ def gestionar_trades_simulado(df):
                         paper_loss_count += 1
                     paper_trade_history.append({"pnl": total, "win": total>0, "decision": t['decision'], "razon": t['razon']})
                     cerrar.append(tid)
-                    logger.info(f"Trailing close #{tid} PnL {total:.2f}")
-                    telegram_mensaje(f"Trailing close #{tid} PnL {total:.2f}")
+                    enviar_mensaje_cierre(tid, total, paper_balance, "Trailing Stop")
             else:
                 if l < t['best_price']:
                     t['best_price'] = l
@@ -680,9 +700,8 @@ def gestionar_trades_simulado(df):
                         paper_loss_count += 1
                     paper_trade_history.append({"pnl": total, "win": total>0, "decision": t['decision'], "razon": t['razon']})
                     cerrar.append(tid)
-                    logger.info(f"Trailing close #{tid} PnL {total:.2f}")
-                    telegram_mensaje(f"Trailing close #{tid} PnL {total:.2f}")
-        # Stop loss inicial (solo si no se ha tocado TP1)
+                    enviar_mensaje_cierre(tid, total, paper_balance, "Trailing Stop")
+        # Stop loss inicial
         if not t.get('tp1_ejecutado', False) and t['qty_restante'] > 0:
             if (t['decision']=="Buy" and l <= t['sl_actual']) or (t['decision']=="Sell" and h >= t['sl_actual']):
                 qty = t['qty_restante']
@@ -697,70 +716,65 @@ def gestionar_trades_simulado(df):
                     paper_loss_count += 1
                 paper_trade_history.append({"pnl": total, "win": total>0, "decision": t['decision'], "razon": t['razon']})
                 cerrar.append(tid)
-                logger.info(f"SL #{tid} PnL {total:.2f}")
-                telegram_mensaje(f"SL #{tid} PnL {total:.2f}")
+                enviar_mensaje_cierre(tid, total, paper_balance, "Stop Loss")
     for tid in cerrar:
         del paper_positions[tid]
     guardar_memoria()
 
 def gestionar_trades_real(df):
-    # Similar a simulado pero con órdenes reales (pendiente de implementar si se necesita)
+    # Similar pero con órdenes reales (por implementar si se necesita)
     pass
 
-# =================== LOOP PRINCIPAL (SIN FILTROS) ===================
+# =================== LOOP PRINCIPAL ===================
 def run_bot():
     global REAL_BALANCE, paper_balance, ultima_vela
     cargar_memoria()
     set_leverage()
-    telegram_mensaje("Bot iniciado con Claude Sonnet 4.5 - IA con autoridad total")
-    logger.info("Bot iniciado - Sin filtros de mercado, la IA decide todo")
+    telegram_mensaje("🤖 Bot de Trading Iniciado - Claude Sonnet 4.5\n📊 Temporalidades: 10m / 1h\n📜 Reglas de trading activas")
+    logger.info("Bot iniciado con temporalidades 10m/1h y reglas de trading explícitas")
     if PAPER_TRADE:
         logger.info(f"Saldo paper: {paper_balance:.2f}")
+        telegram_mensaje(f"📄 Modo PAPER TRADE - Saldo inicial: {paper_balance:.2f} USDT")
     else:
         REAL_BALANCE = get_real_balance()
         logger.info(f"Saldo real: {REAL_BALANCE:.2f}")
+        telegram_mensaje(f"💰 Modo REAL - Saldo: {REAL_BALANCE:.2f} USDT")
 
     ultima_vela = None
     while True:
         try:
-            df3 = obtener_velas(INTERVAL_LTF)
-            df30 = obtener_velas(INTERVAL_HTF)
-            if df3.empty or df30.empty:
+            df10 = obtener_velas(INTERVAL_LTF)
+            df60 = obtener_velas(INTERVAL_HTF)
+            if df10.empty or df60.empty:
                 time.sleep(SLEEP_SECONDS)
                 continue
-            df3 = calcular_indicadores(df3)
-            df30 = calcular_indicadores(df30)
-            precio_actual = df3['close'].iloc[-1]
-            vela_actual = df3.index[-1]
+            df10 = calcular_indicadores(df10)
+            df60 = calcular_indicadores(df60)
+            precio_actual = df10['close'].iloc[-1]
+            vela_actual = df10.index[-1]
 
             if ultima_vela is None or ultima_vela != vela_actual:
                 ultima_vela = vela_actual
-                # Detectar zonas y tendencia (solo para mostrarlas en el gráfico)
-                sop3, res3, slope3, inter3, _, _ = detectar_zonas_mercado(df3)
-                sop30, res30, slope30, inter30, _, _ = detectar_zonas_mercado(df30)
+                # Detectar zonas y tendencia
+                sop10, res10, slope10, inter10, _, _ = detectar_zonas_mercado(df10)
+                sop60, res60, slope60, inter60, _, _ = detectar_zonas_mercado(df60)
 
-                img3 = generar_grafico(df3, "BTC 3m", soporte=sop3, resistencia=res3, slope=slope3, intercept=inter3, excluir_actual=True)
-                img30 = generar_grafico(df30, "BTC 30m", soporte=sop30, resistencia=res30, slope=slope30, intercept=inter30, excluir_actual=True)
+                img10 = generar_grafico(df10, "BTC 10m", soporte=sop10, resistencia=res10, slope=slope10, intercept=inter10, excluir_actual=True)
+                img60 = generar_grafico(df60, "BTC 1h", soporte=sop60, resistencia=res60, slope=slope60, intercept=inter60, excluir_actual=True)
 
-                if img3 and img30:
-                    cached = decision_cache.get(df3, df30)
-                    if cached:
-                        dec, razon, analisis, entry, sl, tp1 = cached
-                        logger.info(f"Usando decisión en caché: {dec}")
-                    else:
-                        dec, razon, analisis, entry, sl, tp1 = analizar_con_claude(img3, img30)
-                        decision_cache.set(df3, df30, (dec, razon, analisis, entry, sl, tp1))
-                        logger.info(f"IA decide: {dec} - {razon[:100]}")
-                    # SIN NINGÚN FILTRO: si la IA dice Buy o Sell, se ejecuta
+                if img10 and img60:
+                    dec, razon, analisis, entry, sl, tp1 = analizar_con_claude(img10, img60)
+                    logger.info(f"🤖 IA decide: {dec} - {razon[:100]}")
                     if dec in ["Buy", "Sell"]:
-                        abrir_posicion(dec, precio_actual, razon, analisis, entry, sl, tp1, df3, sop3, res3, slope3, inter3)
+                        abrir_posicion(dec, precio_actual, razon, analisis, entry, sl, tp1, df10, sop10, res10, slope10, inter10)
                     else:
-                        logger.info(f"IA decidió Hold. Razón: {razon[:100]}")
+                        logger.info(f"Hold. Razón: {razon[:100]}")
                 else:
                     logger.error("No se generaron gráficos")
 
+            # Gestionar trades activos
             if PAPER_TRADE and paper_positions:
-                gestionar_trades_simulado(df3)
+                gestionar_trades_simulado(df10)
 
             time.sleep(SLEEP_SECONDS)
         except Exception as e:
