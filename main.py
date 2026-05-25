@@ -1,407 +1,497 @@
+# ======================================================
+# BOT TRADING V90.2 BYBIT – IA GEMINI + PAPER TRADING
+# ======================================================
+# - Timeframe 5 minutos
+# - Hasta 3 posiciones simultáneas (sin límite diario)
+# - Drawdown máximo 20% → pausa 1 hora
+# - Gráficos detallados con velas, soporte/resistencia, tendencia, EMA20
+# - IA Gemini (OpenRouter) decide BUY/SELL/HOLD
+# ======================================================
+
 import os
 import time
+import io
+import hmac
+import hashlib
 import json
-import itertools
 import requests
-import pandas as pd
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle
-from io import BytesIO
-from datetime import datetime, timedelta
-from ta.momentum import RSIIndicator
-from ta.trend import MACD
 from openai import OpenAI
-from dotenv import load_dotenv
+from scipy.stats import linregress
+from datetime import datetime, timezone
 
-# =================== CONFIGURACIÓN ===================
-load_dotenv()
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+plt.rcParams['figure.figsize'] = (12, 6)
+
+# ======================================================
+# CONFIGURACIÓN
+# ======================================================
+
+SYMBOL = "BTCUSDT"
+INTERVAL = "5"                # 5 minutos
+RISK_PER_TRADE = 0.0025       # 0.25% del balance por operación
+MAX_SIMULTANEOUS_POSITIONS = 3  # hasta 3 operaciones abiertas a la vez
+MAX_DRAWDOWN_PERCENT = 20.0   # 20% drawdown máximo desde el pico
+PAUSE_ON_DRAWDOWN_SECONDS = 3600  # 1 hora
+SLEEP_SECONDS = 60            # revisar cada 60 segundos
+
+# Papel (simulación)
+PAPER_BALANCE_INICIAL = 100.0
+PAPER_BALANCE = PAPER_BALANCE_INICIAL
+PAPER_PEAK_BALANCE = PAPER_BALANCE_INICIAL   # para drawdown
+PAPER_DRAWDOWN_PAUSED_UNTIL = None           # timestamp de pausa
+PAPER_PNL_GLOBAL = 0.0
+PAPER_POSICIONES_ACTIVAS = []                # lista de diccionarios
+PAPER_TRADES_CERRADOS = []                   # histórico
+PAPER_WIN = 0
+PAPER_LOSS = 0
+PAPER_TRADES_TOTALES = 0
+
+# ======================================================
+# CREDENCIALES (variables de entorno en Railway)
+# ======================================================
+
+BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
+BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-SYMBOL = "BTCUSDT"
-INITIAL_BALANCE = 1000.0
-COMMISSION = 0.001
-RISK_PERCENT = 0.02
-MAX_POSITION_PCT = 0.10
-MIN_WINRATE = 50.0
-MIN_TRADES = 5
-MAX_ITERATIONS = 3          # Iteraciones de mejora con IA
-DESIRED_SETUPS = 1
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
-DATA_URL = "https://github.com/webosdd/aur/raw/refs/heads/main/BTCUSDT_15m_data.zip"
+if not OPENROUTER_API_KEY:
+    raise Exception("❌ OPENROUTER_API_KEY no configurada")
+if not BYBIT_API_KEY or not BYBIT_API_SECRET:
+    raise Exception("❌ BYBIT_API_KEY o BYBIT_API_SECRET no configuradas")
 
-# Solo usar los últimos 3 MESES
-MONTHS_TO_USE = 3
+# Cliente OpenRouter
+client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=OPENROUTER_API_KEY,
+    default_headers={"HTTP-Referer": "https://railway.app", "X-Title": "BTC Trading Bot"}
+)
 
-# =================== FUNCIONES AUXILIARES ===================
-def log(msg):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+# ======================================================
+# FUNCIONES BYBIT
+# ======================================================
 
-def send_telegram(text, parse_mode="Markdown"):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log("Telegram no configurado")
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+BASE_URL = "https://api.bybit.com"
+
+def obtener_velas(limit=300):
+    url = f"{BASE_URL}/v5/market/kline"
+    params = {
+        "category": "linear",
+        "symbol": SYMBOL,
+        "interval": INTERVAL,
+        "limit": limit
+    }
+    r = requests.get(url, params=params, timeout=20)
+    if not r.text:
+        raise Exception("Respuesta vacía de Bybit")
     try:
-        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text[:4000], "parse_mode": parse_mode}, timeout=10)
-    except Exception as e:
-        log(f"Error enviando mensaje: {e}")
+        data_json = r.json()
+    except Exception:
+        raise Exception(f"Bybit devolvió respuesta no-JSON: {r.text}")
+    if not isinstance(data_json, dict):
+        raise Exception(f"Bybit devolvió JSON no dict: {type(data_json)}")
+    if "retCode" in data_json and data_json["retCode"] != 0:
+        raise Exception(f"Bybit Error retCode={data_json.get('retCode')} retMsg={data_json.get('retMsg')}")
+    if "result" not in data_json or not isinstance(data_json["result"], dict):
+        raise Exception(f"Respuesta inválida Bybit: {data_json}")
+    if "list" not in data_json["result"] or not isinstance(data_json["result"]["list"], list):
+        raise Exception(f"Bybit result sin 'list' o no es lista: {data_json['result']}")
+    data = data_json["result"]["list"][::-1]
+    if len(data) == 0:
+        raise Exception("Bybit devolvió lista vacía de velas")
+    df = pd.DataFrame(data, columns=['time','open','high','low','close','volume','turnover'])
+    df[['open','high','low','close','volume']] = df[['open','high','low','close','volume']].astype(float)
+    df['time'] = pd.to_datetime(df['time'].astype(np.int64), unit='ms', utc=True)
+    df.set_index('time', inplace=True)
+    return df
 
-def send_telegram_image(image_buf, caption=""):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
-    files = {'photo': ('image.png', image_buf, 'image/png')}
-    data = {'chat_id': TELEGRAM_CHAT_ID, 'caption': caption[:1000]}
-    try:
-        requests.post(url, files=files, data=data, timeout=15)
-    except Exception as e:
-        log(f"Error enviando imagen: {e}")
+# ======================================================
+# INDICADORES
+# ======================================================
 
 def calcular_indicadores(df):
-    if df.empty:
-        return df
-    df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
-    df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
-    df['rsi'] = RSIIndicator(close=df['close'], window=14).rsi()
-    macd = MACD(close=df['close'])
-    df['macd'] = macd.macd()
-    df['macd_signal'] = macd.macd_signal()
-    df['macd_diff'] = macd.macd_diff()
-    return df
+    df['ema20'] = df['close'].ewm(span=20).mean()
+    # ATR
+    tr = pd.concat([
+        df['high'] - df['low'],
+        (df['high'] - df['close'].shift()).abs(),
+        (df['low'] - df['close'].shift()).abs()
+    ], axis=1).max(axis=1)
+    df['atr'] = tr.rolling(14).mean()
+    # RSI
+    delta = df['close'].diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    avg_gain = gain.rolling(14).mean()
+    avg_loss = loss.rolling(14).mean()
+    rs = avg_gain / avg_loss
+    df['rsi'] = 100 - (100 / (1 + rs))
+    return df.dropna()
 
-def generar_grafico_equity(trades, equity_curve, titulo):
-    if len(equity_curve) == 0:
-        return None
-    fig, ax = plt.subplots(figsize=(12, 6))
-    ax.plot(equity_curve.index, equity_curve.values, color='blue', linewidth=2, label='Equity')
-    if trades:
-        winners = [t for t in trades if t['pnl'] > 0]
-        losers = [t for t in trades if t['pnl'] <= 0]
-        if winners:
-            win_times = [t['exit_time'] for t in winners]
-            win_pnls = [t['cum_balance'] for t in winners]
-            ax.scatter(win_times, win_pnls, color='green', marker='^', s=50, label='Winner')
-        if losers:
-            lose_times = [t['exit_time'] for t in losers]
-            lose_pnls = [t['cum_balance'] for t in losers]
-            ax.scatter(lose_times, lose_pnls, color='red', marker='v', s=50, label='Loser')
-    ax.set_title(titulo, color='white')
-    ax.set_xlabel('Fecha', color='white')
-    ax.set_ylabel('Balance (USDT)', color='white')
-    ax.tick_params(colors='white')
-    ax.set_facecolor('#121212')
-    ax.legend(loc='upper left', framealpha=0.5, facecolor='black', edgecolor='white', labelcolor='white')
-    fig.patch.set_facecolor('#121212')
-    plt.tight_layout()
-    buf = BytesIO()
-    plt.savefig(buf, format='png', dpi=100)
-    buf.seek(0)
-    plt.close(fig)
-    return buf
+def detectar_soportes_resistencias(df, ventana=50):
+    soporte = df['low'].rolling(ventana).min().iloc[-1]
+    resistencia = df['high'].rolling(ventana).max().iloc[-1]
+    return soporte, resistencia
 
-# =================== CARGAR DATOS (con filtro de 3 meses) ===================
-def cargar_datos():
-    log(f"📥 Descargando datos desde: {DATA_URL}")
-    try:
-        df = pd.read_csv(DATA_URL, compression='zip')
-    except Exception as e:
-        raise Exception(f"Error al cargar el archivo: {e}")
+def detectar_tendencia(df, ventana=80):
+    y = df['close'].values[-ventana:]
+    x = np.arange(len(y))
+    slope, intercept, r, _, _ = linregress(x, y)
+    if slope > 0.02:
+        direccion = 'ALCISTA'
+    elif slope < -0.02:
+        direccion = 'BAJISTA'
+    else:
+        direccion = 'LATERAL'
+    return slope, intercept, direccion
 
-    log(f"Columnas originales: {df.columns.tolist()}")
-    rename_map = {
-        'Open time': 'timestamp', 'Open': 'open', 'High': 'high',
-        'Low': 'low', 'Close': 'close', 'Volume': 'volume'
-    }
-    df.rename(columns=rename_map, inplace=True)
-    required = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
-    missing = [col for col in required if col not in df.columns]
-    if missing:
-        raise KeyError(f"Faltan columnas: {missing}")
+# ======================================================
+# IA GEMINI (vía OpenRouter) para DECIDIR TRADE
+# ======================================================
 
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
-    df.set_index('timestamp', inplace=True)
-    for col in required[1:]:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-    df = df.sort_index()
+def obtener_decision_ia(df, soporte, resistencia, slope, tendencia):
+    ultimo = df.iloc[-1]
+    precio = ultimo['close']
+    ema20 = ultimo['ema20']
+    atr = ultimo['atr']
+    rsi = ultimo['rsi'] if 'rsi' in ultimo else 50
+    ultimas_velas = df.tail(5)[['open','high','low','close']].to_dict(orient='records')
+    velas_texto = "\n".join([f"  {v}" for v in ultimas_velas])
 
-    # Calcular la fecha de inicio: última fecha del DataFrame menos MONTHS_TO_USE meses
-    last_date = df.index.max()
-    start_date = last_date - pd.DateOffset(months=MONTHS_TO_USE)
-    df = df[df.index >= start_date]
-    log(f"✅ Datos cargados y filtrados a los últimos {MONTHS_TO_USE} meses: {len(df)} velas desde {df.index[0]} hasta {df.index[-1]}")
-    return df
-
-# =================== CONDICIONES ATÓMICAS INICIALES ===================
-CONDICIONES_ATOMICAS = {}
-
-def definir_condiciones_iniciales():
-    global CONDICIONES_ATOMICAS
-    def rsi_lt_30(df, idx): return df['rsi'].iloc[idx] < 30
-    def rsi_gt_70(df, idx): return df['rsi'].iloc[idx] > 70
-    def price_lt_ema20(df, idx): return df['close'].iloc[idx] < df['ema20'].iloc[idx]
-    def price_gt_ema20(df, idx): return df['close'].iloc[idx] > df['ema20'].iloc[idx]
-    def macd_cross_above(df, idx):
-        return (df['macd'].iloc[idx] > df['macd_signal'].iloc[idx]) and (df['macd'].iloc[idx-1] <= df['macd_signal'].iloc[idx-1])
-    def macd_cross_below(df, idx):
-        return (df['macd'].iloc[idx] < df['macd_signal'].iloc[idx]) and (df['macd'].iloc[idx-1] >= df['macd_signal'].iloc[idx-1])
-    def close_near_support(df, idx):
-        soporte = df['low'].iloc[max(0,idx-20):idx+1].min()
-        return abs(df['close'].iloc[idx] - soporte) / df['close'].iloc[idx] < 0.002
-    def close_near_resistance(df, idx):
-        resistencia = df['high'].iloc[max(0,idx-20):idx+1].max()
-        return abs(resistencia - df['close'].iloc[idx]) / df['close'].iloc[idx] < 0.002
-    def price_above_ema50(df, idx): return df['close'].iloc[idx] > df['ema50'].iloc[idx]
-    def price_below_ema50(df, idx): return df['close'].iloc[idx] < df['ema50'].iloc[idx]
-    def volume_spike(df, idx):
-        avg_vol = df['volume'].iloc[max(0,idx-20):idx].mean()
-        return df['volume'].iloc[idx] > avg_vol * 1.5
-    def close_up_prev(df, idx): return df['close'].iloc[idx] > df['close'].iloc[idx-1]
-    CONDICIONES_ATOMICAS = {
-        "rsi_lt_30": rsi_lt_30,
-        "rsi_gt_70": rsi_gt_70,
-        "price_lt_ema20": price_lt_ema20,
-        "price_gt_ema20": price_gt_ema20,
-        "macd_cross_above": macd_cross_above,
-        "macd_cross_below": macd_cross_below,
-        "close_near_support": close_near_support,
-        "close_near_resistance": close_near_resistance,
-        "price_above_ema50": price_above_ema50,
-        "price_below_ema50": price_below_ema50,
-        "volume_spike": volume_spike,
-        "close_up_prev": close_up_prev,
-    }
-definir_condiciones_iniciales()
-
-# =================== BACKTEST COMPLETO (optimizado para arrays) ===================
-def backtest_completo(df, condicion_func):
-    balance = INITIAL_BALANCE
-    in_position = False
-    position = None
-    trades = []
-    balance_history = {}
-    close_prices = df['close'].values
-    for i in range(100, len(df)):
-        current_time = df.index[i]
-        if not in_position:
-            if condicion_func(df, i):
-                entry = close_prices[i]
-                sl = entry * 0.995
-                tp1 = entry * 1.005
-                risk_amount = balance * RISK_PERCENT
-                risk_per_share = entry - sl
-                if risk_per_share <= 0:
-                    continue
-                qty = risk_amount / risk_per_share
-                max_qty = (balance * MAX_POSITION_PCT) / entry
-                qty = min(qty, max_qty)
-                if qty < 0.0001:
-                    continue
-                in_position = True
-                position = {
-                    'entry': entry, 'sl': sl, 'tp1': tp1, 'qty': qty,
-                    'entry_time': current_time
-                }
-        else:
-            current = close_prices[i]
-            exit_price = None
-            exit_reason = None
-            if current >= position['tp1']:
-                exit_price = position['tp1']
-                exit_reason = 'TP1'
-            elif current <= position['sl']:
-                exit_price = position['sl']
-                exit_reason = 'SL'
-            if exit_price is not None:
-                pnl = (exit_price - position['entry']) * position['qty']
-                pnl -= abs(pnl) * COMMISSION
-                balance += pnl
-                trades.append({
-                    'entry_time': position['entry_time'],
-                    'entry_price': position['entry'],
-                    'exit_time': current_time,
-                    'exit_price': exit_price,
-                    'pnl': pnl,
-                    'cum_balance': balance,
-                    'exit_reason': exit_reason
-                })
-                balance_history[current_time] = balance
-                in_position = False
-    # Construir equity curve
-    all_times = df.index[df.index >= df.index[100]]
-    equity_curve = pd.Series(index=all_times, dtype=float)
-    last_balance = INITIAL_BALANCE
-    for t in all_times:
-        if t in balance_history:
-            last_balance = balance_history[t]
-        equity_curve[t] = last_balance
-    return trades, equity_curve, balance
-
-# =================== EVALUACIÓN SOLO 2 Y 3 CONDICIONES (con progreso) ===================
-def evaluar_todas_combinaciones(df):
-    cond_nombres = list(CONDICIONES_ATOMICAS.keys())
-    resultados = []
-    for r in [2, 3]:
-        combos = list(itertools.combinations(cond_nombres, r))
-        total = len(combos)
-        log(f"Evaluando {total} combinaciones de {r} condiciones...")
-        for i, combo_nombres in enumerate(combos):
-            if i % 100 == 0:
-                log(f"  Progreso: {i}/{total} combos evaluadas")
-            combo_funcs = [CONDICIONES_ATOMICAS[n] for n in combo_nombres]
-            regla_func = lambda df, idx, fns=combo_funcs: all(f(df, idx) for f in fns)
-            trades, equity, final_balance = backtest_completo(df, regla_func)
-            if len(trades) < MIN_TRADES:
-                continue
-            wins = sum(1 for t in trades if t['pnl'] > 0)
-            winrate = wins / len(trades) * 100
-            if winrate < MIN_WINRATE:
-                continue
-            total_pnl = sum(t['pnl'] for t in trades)
-            gross_profit = sum(t['pnl'] for t in trades if t['pnl'] > 0)
-            gross_loss = abs(sum(t['pnl'] for t in trades if t['pnl'] < 0))
-            profit_factor = gross_profit / gross_loss if gross_loss != 0 else float('inf')
-            peak = equity.cummax()
-            drawdown = (peak - equity) / peak * 100
-            max_drawdown = drawdown.max()
-            resultados.append({
-                'regla': ' AND '.join(combo_nombres),
-                'trades': len(trades),
-                'wins': wins,
-                'losses': len(trades) - wins,
-                'winrate': winrate,
-                'total_pnl': total_pnl,
-                'final_balance': final_balance,
-                'profit_factor': profit_factor,
-                'max_drawdown': max_drawdown,
-                'equity_curve': equity,
-                'trades_list': trades
-            })
-    resultados.sort(key=lambda x: (x['winrate'], x['profit_factor']), reverse=True)
-    return resultados
-
-# =================== IA PARA SUGERIR NUEVAS CONDICIONES ===================
-def sugerir_nuevas_condiciones_ia(mejor_setup, iteration):
-    if not OPENROUTER_API_KEY:
-        log("No hay API key de OpenRouter")
-        return []
-    client = OpenAI(
-        base_url="https://openrouter.ai/api/v1",
-        api_key=OPENROUTER_API_KEY,
-        default_headers={"HTTP-Referer": "https://railway.app", "X-Title": "Setups Optimizer"}
-    )
-    trades = mejor_setup['trades_list']
-    losers = [t for t in trades if t['pnl'] < 0]
-    losers_sample = losers[-5:] if losers else []
-    losers_text = "\n".join([f"  - {l['exit_time']}: PnL {l['pnl']:.2f}, exit {l['exit_reason']}" for l in losers_sample]) if losers_sample else "No hubo trades perdedores."
-    
     prompt = f"""
-Eres un experto en trading algorítmico para BTC/USDT en 15 minutos.
+Eres un trader algorítmico experto en BTC/USDT en timeframe de {INTERVAL} minutos.
+Analiza la siguiente situación y decide si comprar (BUY), vender (SELL) o no hacer nada (HOLD).
+Devuelve ÚNICAMENTE un JSON con este formato:
+{{"decision": "BUY/SELL/HOLD", "razones": ["razón1", "razón2", ...]}}
 
-Hemos encontrado una regla que funciona bastante bien:
-Regla: {mejor_setup['regla']}
-Winrate: {mejor_setup['winrate']:.1f}% ({mejor_setup['trades']} trades)
-Profit factor: {mejor_setup['profit_factor']:.2f}
-Máximo drawdown: {mejor_setup['max_drawdown']:.1f}%
+Datos actuales:
+- Precio actual: {precio:.2f}
+- EMA20: {ema20:.2f}
+- ATR: {atr:.2f}
+- RSI: {rsi:.1f}
+- Tendencia (80 velas): {tendencia} (slope {slope:.5f})
+- Soporte: {soporte:.2f}
+- Resistencia: {resistencia:.2f}
+- Últimas 5 velas:
+{velas_texto}
 
-Los últimos trades perdedores (hasta 5):
-{losers_text}
-
-Basándote en este análisis, sugiere **3 nuevas condiciones atómicas** (expresiones en Python/pandas) que podrían filtrar esos perdedores y aumentar el winrate.
-Cada condición debe ser una expresión que use `df` (DataFrame) y `idx` (índice de la vela actual). Ejemplos válidos:
-- "df['close'].iloc[idx] < df['ema20'].iloc[idx]"
-- "df['volume'].iloc[idx] > df['volume'].rolling(20).mean().iloc[idx] * 1.5"
-- "(df['high'].iloc[idx] - df['low'].iloc[idx]) / df['close'].iloc[idx] > 0.01"
-
-Responde ÚNICAMENTE con un JSON array de strings, sin texto adicional.
-Ejemplo: ["cond1", "cond2", "cond3"]
+Reglas:
+- BUY solo si confluencia alcista (precio cerca de soporte, tendencia alcista, RSI > 30).
+- SELL solo si confluencia bajista (precio cerca de resistencia, tendencia bajista, RSI < 70).
+- HOLD si no está claro.
 """
     try:
         response = client.chat.completions.create(
             model="google/gemini-2.0-flash-exp",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.7,
-            max_tokens=500,
+            temperature=0.3,
+            max_tokens=300,
             response_format={"type": "json_object"}
         )
-        content = response.choices[0].message.content
-        data = json.loads(content)
-        return data if isinstance(data, list) else []
+        data = json.loads(response.choices[0].message.content)
+        decision = data.get("decision", "HOLD").upper()
+        razones = data.get("razones", ["Sin razones"])
+        if decision not in ["BUY", "SELL", "HOLD"]:
+            decision = "HOLD"
+        return decision, razones
     except Exception as e:
-        log(f"Error en IA: {e}")
-        return []
+        print(f"Error IA: {e}")
+        return None, [f"Error: {e}"]
 
-def agregar_condicion_si_valida(expr):
-    global CONDICIONES_ATOMICAS
-    if expr in CONDICIONES_ATOMICAS:
-        return False
-    try:
-        compile(expr, '<string>', 'eval')
-        def nueva_cond(df, idx, expr=expr):
-            return eval(expr, globals(), {'df': df, 'idx': idx, 'pd': pd, 'np': np})
-        CONDICIONES_ATOMICAS[expr] = nueva_cond
-        log(f"➕ Nueva condición añadida: {expr}")
-        return True
-    except Exception as e:
-        log(f"❌ Condición inválida '{expr}': {e}")
+# ======================================================
+# PAPER TRADING (con múltiples posiciones)
+# ======================================================
+
+def paper_abrir_posicion(decision, precio, atr, razones, tiempo):
+    global PAPER_BALANCE, PAPER_POSICIONES_ACTIVAS, PAPER_TRADES_TOTALES
+    if len(PAPER_POSICIONES_ACTIVAS) >= MAX_SIMULTANEOUS_POSITIONS:
         return False
 
-# =================== EJECUCIÓN PRINCIPAL ===================
-def main():
-    log(f"🚀 Iniciando optimización con IA (Gemini) - últimos {MONTHS_TO_USE} meses")
-    df = cargar_datos()
-    df = calcular_indicadores(df)
-    
-    best_overall = None
-    for iteration in range(1, MAX_ITERATIONS + 1):
-        log(f"\n🔁 Iteración {iteration}/{MAX_ITERATIONS}")
-        resultados = evaluar_todas_combinaciones(df)
-        if not resultados:
-            log("No hay combinaciones que cumplan los requisitos mínimos.")
-            break
-        mejor = resultados[0]
-        log(f"✅ Mejor regla: {mejor['regla']} -> winrate {mejor['winrate']:.1f}% ({mejor['trades']} trades)")
-        
-        if best_overall is None or (mejor['winrate'] > best_overall['winrate']):
-            best_overall = mejor
-            msg = f"🔔 *Iter {iteration} - Nuevo mejor setup*\nRegla: `{mejor['regla']}`\nWinrate: {mejor['winrate']:.1f}% ({mejor['trades']} trades)\nProfit factor: {mejor['profit_factor']:.2f}\nPnL: {mejor['total_pnl']:+.2f} USDT"
-            send_telegram(msg)
-            img = generar_grafico_equity(mejor['trades_list'], mejor['equity_curve'], f"Equity Curve - {mejor['regla'][:60]}")
-            if img:
-                send_telegram_image(img, caption=f"Evolución del balance (winrate {mejor['winrate']:.1f}%)")
-        
-        if mejor['winrate'] >= 80:
-            log("Winrate >= 80%, deteniendo iteraciones.")
-            break
-        
-        log("Consultando IA para sugerir nuevas condiciones...")
-        nuevas = sugerir_nuevas_condiciones_ia(mejor, iteration)
-        if nuevas:
-            any_added = False
-            for expr in nuevas:
-                if agregar_condicion_si_valida(expr):
-                    any_added = True
-            if any_added:
-                log(f"Se añadieron nuevas condiciones. Re-evaluando...")
-            else:
-                log("No se pudo añadir ninguna condición válida.")
-        else:
-            log("IA no devolvió sugerencias o hubo error.")
-        
-        time.sleep(2)
-    
-    if best_overall:
-        final_msg = f"🏆 *MEJOR SETUP FINAL* 🏆\n\nRegla: `{best_overall['regla']}`\nWinrate: {best_overall['winrate']:.1f}% ({best_overall['trades']} trades)\nProfit factor: {best_overall['profit_factor']:.2f}\nDrawdown máx: {best_overall['max_drawdown']:.1f}%\nPnL total: {best_overall['total_pnl']:+.2f} USDT\nBalance final: {best_overall['final_balance']:.2f} USDT"
-        send_telegram(final_msg)
-        trade_details = "📋 *Detalle de trades (últimos 10):*\n"
-        for t in best_overall['trades_list'][-10:]:
-            trade_details += f"{t['exit_time'].strftime('%m-%d %H:%M')} -> {t['pnl']:+.2f} USDT ({t['exit_reason']})\n"
-        send_telegram(trade_details)
+    riesgo_usd = PAPER_BALANCE * RISK_PER_TRADE
+    if decision == "BUY":
+        sl = precio - atr
+        tp = precio + (atr * 2)
+    else:  # SELL
+        sl = precio + atr
+        tp = precio - (atr * 2)
+
+    distancia_sl = abs(precio - sl)
+    if distancia_sl == 0:
+        return False
+    size_btc = riesgo_usd / distancia_sl
+    size_usd = size_btc * precio
+
+    pos = {
+        "id": len(PAPER_POSICIONES_ACTIVAS) + len(PAPER_TRADES_CERRADOS) + 1,
+        "decision": decision,
+        "entry_price": precio,
+        "entry_time": tiempo,
+        "sl": sl,
+        "tp": tp,
+        "size_btc": size_btc,
+        "size_usd": size_usd,
+        "razones": razones
+    }
+    PAPER_POSICIONES_ACTIVAS.append(pos)
+    PAPER_TRADES_TOTALES += 1
+    return True
+
+def paper_calcular_pnl_posicion(pos, precio_actual):
+    if pos["decision"] == "BUY":
+        return (precio_actual - pos["entry_price"]) * pos["size_btc"]
     else:
-        send_telegram("❌ No se encontró ningún setup válido.")
-    
-    log("✅ Proceso finalizado")
+        return (pos["entry_price"] - precio_actual) * pos["size_btc"]
 
-if __name__ == "__main__":
-    main()
+def paper_actualizar_drawdown():
+    global PAPER_PEAK_BALANCE, PAPER_DRAWDOWN_PAUSED_UNTIL
+    # Actualizar balance sumando PnL flotante de todas las posiciones
+    # El balance "real" en papel se actualiza solo al cerrar, pero para drawdown consideramos balance + PnL flotante
+    # Para simplificar, usamos el balance ajustado con PnL flotante.
+    # Obtener precio actual de la última vela (se pasa desde fuera)
+    pass  # Se llama desde el loop principal con precio actual
+
+def paper_revisar_sl_tp(precio_actual, tiempo_actual):
+    global PAPER_BALANCE, PAPER_PNL_GLOBAL, PAPER_WIN, PAPER_LOSS, PAPER_TRADES_CERRADOS, PAPER_POSICIONES_ACTIVAS
+    global PAPER_PEAK_BALANCE, PAPER_DRAWDOWN_PAUSED_UNTIL
+
+    cerradas = []
+    for pos in PAPER_POSICIONES_ACTIVAS[:]:
+        cerrar = False
+        motivo = None
+        if pos["decision"] == "BUY":
+            if precio_actual <= pos["sl"]:
+                cerrar = True
+                motivo = "SL"
+            elif precio_actual >= pos["tp"]:
+                cerrar = True
+                motivo = "TP"
+        else:
+            if precio_actual >= pos["sl"]:
+                cerrar = True
+                motivo = "SL"
+            elif precio_actual <= pos["tp"]:
+                cerrar = True
+                motivo = "TP"
+        if cerrar:
+            pnl = paper_calcular_pnl_posicion(pos, precio_actual)
+            PAPER_BALANCE += pnl
+            PAPER_PNL_GLOBAL += pnl
+            if pnl > 0:
+                PAPER_WIN += 1
+            else:
+                PAPER_LOSS += 1
+            pos_cerrada = {
+                **pos,
+                "exit_price": precio_actual,
+                "exit_time": tiempo_actual,
+                "pnl": pnl,
+                "motivo": motivo,
+                "balance_after": PAPER_BALANCE
+            }
+            PAPER_TRADES_CERRADOS.append(pos_cerrada)
+            PAPER_POSICIONES_ACTIVAS.remove(pos)
+            cerradas.append(pos_cerrada)
+
+            # Actualizar peak balance y verificar drawdown
+            if PAPER_BALANCE > PAPER_PEAK_BALANCE:
+                PAPER_PEAK_BALANCE = PAPER_BALANCE
+            drawdown_pct = (PAPER_PEAK_BALANCE - PAPER_BALANCE) / PAPER_PEAK_BALANCE * 100
+            if drawdown_pct >= MAX_DRAWDOWN_PERCENT and PAPER_DRAWDOWN_PAUSED_UNTIL is None:
+                PAPER_DRAWDOWN_PAUSED_UNTIL = tiempo_actual + pd.Timedelta(seconds=PAUSE_ON_DRAWDOWN_SECONDS)
+                return cerradas, True  # indica pausa activada
+    return cerradas, False
+
+# ======================================================
+# GRÁFICO DE VELAS DETALLADO
+# ======================================================
+
+def generar_grafico_entrada(df, decision, soporte, resistencia, slope, intercept, razones, precio_entrada=None):
+    try:
+        df_plot = df.copy().tail(120)
+        if df_plot.empty:
+            return None
+        fig, ax = plt.subplots(figsize=(14, 7))
+        x = np.arange(len(df_plot))
+        for i, (idx, row) in enumerate(df_plot.iterrows()):
+            o, h, l, c = row['open'], row['high'], row['low'], row['close']
+            color = 'green' if c >= o else 'red'
+            ax.vlines(i, l, h, color=color, linewidth=1)
+            cuerpo_y = min(o, c)
+            cuerpo_h = abs(c - o)
+            if cuerpo_h == 0:
+                cuerpo_h = 0.0001
+            rect = plt.Rectangle((i - 0.3, cuerpo_y), 0.6, cuerpo_h, color=color, alpha=0.9)
+            ax.add_patch(rect)
+        ax.axhline(soporte, color='cyan', linestyle='--', linewidth=2, label=f"Soporte {soporte:.2f}")
+        ax.axhline(resistencia, color='magenta', linestyle='--', linewidth=2, label=f"Resistencia {resistencia:.2f}")
+        if 'ema20' in df_plot.columns:
+            ax.plot(x, df_plot['ema20'].values, color='yellow', linewidth=2, label='EMA20')
+        y_plot = df_plot['close'].values
+        x_plot = np.arange(len(y_plot))
+        slope_plot, intercept_plot, _, _, _ = linregress(x_plot, y_plot)
+        tendencia_linea = intercept_plot + slope_plot * x_plot
+        ax.plot(x_plot, tendencia_linea, color='white', linewidth=2, linestyle='-', label=f"Tendencia slope {slope_plot:.4f}")
+        entrada_index = len(df_plot) - 1
+        if precio_entrada is None:
+            precio_entrada = df_plot['close'].iloc[-1]
+        if decision == 'BUY':
+            ax.scatter(entrada_index, precio_entrada, s=200, marker='^', color='lime', edgecolors='black', label='Entrada BUY')
+            ax.axvline(entrada_index, color='lime', linestyle=':', linewidth=2)
+        elif decision == 'SELL':
+            ax.scatter(entrada_index, precio_entrada, s=200, marker='v', color='red', edgecolors='black', label='Entrada SELL')
+            ax.axvline(entrada_index, color='red', linestyle=':', linewidth=2)
+        texto = f"{decision}\nPrecio: {precio_entrada:.2f}\nBalance: {PAPER_BALANCE:.2f} USD\nPnL Global: {PAPER_PNL_GLOBAL:.4f}\nRazones:\n" + "\n".join(razones[:4])
+        ax.text(0.02, 0.98, texto, transform=ax.transAxes, fontsize=10, verticalalignment='top',
+                bbox=dict(facecolor='black', alpha=0.7, boxstyle='round'), color='white')
+        ax.set_title(f"{SYMBOL} - Entrada {decision} (IA Gemini) - {INTERVAL}m")
+        ax.set_xlabel("Velas")
+        ax.set_ylabel("Precio")
+        ax.grid(True, alpha=0.2)
+        ax.legend(loc='lower left')
+        step = max(1, int(len(df_plot)/10))
+        ax.set_xticks(x[::step])
+        ax.set_xticklabels([t.strftime('%H:%M') for t in df_plot.index[::step]], rotation=45)
+        plt.tight_layout()
+        return fig
+    except Exception as e:
+        print(f"Error gráfico: {e}")
+        return None
+
+# ======================================================
+# TELEGRAM (sin proxy)
+# ======================================================
+
+def telegram_mensaje(texto):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": texto}, timeout=10)
+    except Exception:
+        pass
+
+def telegram_grafico(fig):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', bbox_inches='tight')
+        buf.seek(0)
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
+        requests.post(url, files={'photo': buf}, data={'chat_id': TELEGRAM_CHAT_ID}, timeout=15)
+        buf.close()
+    except Exception:
+        pass
+
+# ======================================================
+# LOG EN CONSOLA
+# ======================================================
+
+def log_estado(df, tendencia, slope, soporte, resistencia, decision, razones):
+    ahora = datetime.now(timezone.utc)
+    precio = df['close'].iloc[-1]
+    print("="*100)
+    print(f"🕒 {ahora} | BTC: {precio:.2f}")
+    print(f"📐 Tendencia: {tendencia} | Slope: {slope:.5f}")
+    print(f"🧱 Soporte: {soporte:.2f} | Resistencia: {resistencia:.2f}")
+    print(f"🎯 Decisión IA: {decision if decision else 'NO TRADE'}")
+    print(f"🧠 Razones: {', '.join(razones)}")
+    print(f"💵 Balance Paper: {PAPER_BALANCE:.2f} USD | PnL Global: {PAPER_PNL_GLOBAL:.4f}")
+    print(f"📊 Posiciones activas: {len(PAPER_POSICIONES_ACTIVAS)}/{MAX_SIMULTANEOUS_POSITIONS}")
+    peak = max(PAPER_PEAK_BALANCE, PAPER_BALANCE)
+    dd = (peak - PAPER_BALANCE) / peak * 100 if peak > 0 else 0
+    print(f"📉 Drawdown actual: {dd:.2f}% (máx permitido {MAX_DRAWDOWN_PERCENT}%)")
+    if PAPER_DRAWDOWN_PAUSED_UNTIL:
+        print(f"⏸️ PAUSADO hasta {PAPER_DRAWDOWN_PAUSED_UNTIL}")
+    print("="*100)
+
+# ======================================================
+# LOOP PRINCIPAL
+# ======================================================
+
+def run_bot():
+    global PAPER_PEAK_BALANCE, PAPER_DRAWDOWN_PAUSED_UNTIL
+    telegram_mensaje("🤖 BOT V90.2 INICIADO (Gemini, 5m, max 3 posiciones, drawdown 20%)")
+    while True:
+        try:
+            # Si está en pausa por drawdown, esperar
+            ahora = datetime.now(timezone.utc)
+            if PAPER_DRAWDOWN_PAUSED_UNTIL and ahora < PAPER_DRAWDOWN_PAUSED_UNTIL:
+                restante = (PAPER_DRAWDOWN_PAUSED_UNTIL - ahora).total_seconds()
+                if restante > 0:
+                    print(f"⏸️ Pausa por drawdown. Reanudando en {restante:.0f} segundos...")
+                    time.sleep(min(60, restante))
+                    continue
+                else:
+                    PAPER_DRAWDOWN_PAUSED_UNTIL = None
+                    telegram_mensaje("✅ Pausa por drawdown finalizada. Bot reanudado.")
+                    # Resetear peak balance para nuevo ciclo?
+                    PAPER_PEAK_BALANCE = PAPER_BALANCE  # empezar nuevo pico
+
+            df = obtener_velas(limit=200)
+            df = calcular_indicadores(df)
+
+            soporte, resistencia = detectar_soportes_resistencias(df)
+            slope, intercept, tendencia = detectar_tendencia(df)
+
+            decision, razones = obtener_decision_ia(df, soporte, resistencia, slope, tendencia)
+            log_estado(df, tendencia, slope, soporte, resistencia, decision, razones)
+
+            precio_actual = df['close'].iloc[-1]
+            tiempo_actual = df.index[-1]
+
+            # Revisar SL/TP de posiciones activas (puede activar pausa)
+            cerradas, pausa_activada = paper_revisar_sl_tp(precio_actual, tiempo_actual)
+            if pausa_activada:
+                telegram_mensaje(f"⚠️ DRAWDOWN SUPERADO ({MAX_DRAWDOWN_PERCENT}%) - BOT PAUSADO 1 HORA")
+                continue  # volver al inicio, la pausa se manejará en la próxima iteración
+
+            # Actualizar pico de balance después de cierres
+            if PAPER_BALANCE > PAPER_PEAK_BALANCE:
+                PAPER_PEAK_BALANCE = PAPER_BALANCE
+
+            # Enviar notificaciones de cierres
+            for c in cerradas:
+                msg = (
+                    f"📌 CIERRE PAPER {c['decision']} ({c['motivo']})\n"
+                    f"Entrada: {c['entry_price']:.2f} | Salida: {c['exit_price']:.2f}\n"
+                    f"PnL: {c['pnl']:.4f} USD\n"
+                    f"Balance: {c['balance_after']:.2f} USD\n"
+                    f"Win/Loss: {PAPER_WIN}/{PAPER_LOSS}"
+                )
+                telegram_mensaje(msg)
+
+            # Abrir nueva posición si IA lo indica y hay cupo
+            if decision in ("BUY", "SELL") and len(PAPER_POSICIONES_ACTIVAS) < MAX_SIMULTANEOUS_POSITIONS:
+                atr_actual = df['atr'].iloc[-1]
+                abierta = paper_abrir_posicion(decision, precio_actual, atr_actual, razones, tiempo_actual)
+                if abierta:
+                    # Enviar mensaje y gráfico
+                    pnl_flotante_total = sum(paper_calcular_pnl_posicion(p, precio_actual) for p in PAPER_POSICIONES_ACTIVAS)
+                    msg = (
+                        f"📌 ENTRADA PAPER {decision} (IA Gemini)\n"
+                        f"Precio: {precio_actual:.2f}\n"
+                        f"SL: {PAPER_POSICIONES_ACTIVAS[-1]['sl']:.2f} | TP: {PAPER_POSICIONES_ACTIVAS[-1]['tp']:.2f}\n"
+                        f"Size USD: {PAPER_POSICIONES_ACTIVAS[-1]['size_usd']:.2f}\n"
+                        f"Balance: {PAPER_BALANCE:.2f} USD\n"
+                        f"Posiciones activas: {len(PAPER_POSICIONES_ACTIVAS)}\n"
+                        f"Razones: {', '.join(razones)}"
+                    )
+                    telegram_mensaje(msg)
+                    fig = generar_grafico_entrada(df, decision, soporte, resistencia, slope, intercept, razones, precio_actual)
+                    if fig:
+                        telegram_grafico(fig)
+                        plt.close(fig)
+
+            time.sleep(SLEEP_SECONDS)
+
+        except Exception as e:
+            print(f"🚨 ERROR: {e}")
+            telegram_mensaje(f"🚨 ERROR BOT: {e}")
+            time.sleep(60)
+
+if __name__ == '__main__':
+    run_bot()
