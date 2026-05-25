@@ -98,7 +98,7 @@ def generar_grafico(df, titulo, entry_price=None):
     plt.close()
     return buf
 
-# =================== 1. CARGAR DATOS DESDE GITHUB ===================
+# =================== 1. CARGAR DATOS DESDE GITHUB (CORREGIDO) ===================
 def cargar_datos():
     log(f"📥 Descargando datos desde: {DATA_URL}")
     try:
@@ -106,26 +106,32 @@ def cargar_datos():
     except Exception as e:
         raise Exception(f"Error al cargar el archivo: {e}. Verifica la URL y que el archivo sea un ZIP con un CSV dentro.")
     
-    # Identificar la columna de tiempo
-    if 'timestamp' in df.columns:
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
-        df.set_index('timestamp', inplace=True)
-    elif 'time' in df.columns:
-        df['time'] = pd.to_datetime(df['time'])
-        df.set_index('time', inplace=True)
-    elif 'datetime' in df.columns:
-        df['datetime'] = pd.to_datetime(df['datetime'])
-        df.set_index('datetime', inplace=True)
-    else:
-        # Si no encuentra, asume que la primera columna es el índice de tiempo
-        df.index = pd.to_datetime(df.index)
+    # Renombrar columnas al formato esperado
+    rename_map = {
+        'Open time': 'timestamp',
+        'Open': 'open',
+        'High': 'high',
+        'Low': 'low',
+        'Close': 'close',
+        'Volume': 'volume'
+    }
+    for old, new in rename_map.items():
+        if old in df.columns:
+            df.rename(columns={old: new}, inplace=True)
     
-    # Asegurar columnas numéricas
+    # Verificar columnas necesarias
+    required = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
+    missing = [col for col in required if col not in df.columns]
+    if missing:
+        raise KeyError(f"Faltan columnas requeridas: {missing}. Columnas disponibles: {df.columns.tolist()}")
+    
+    # Convertir timestamp y establecer índice
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    df.set_index('timestamp', inplace=True)
+    
+    # Asegurar valores numéricos
     for col in ['open', 'high', 'low', 'close', 'volume']:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-        else:
-            raise KeyError(f"El CSV debe contener una columna '{col}'. Verifica las columnas: {df.columns.tolist()}")
+        df[col] = pd.to_numeric(df[col], errors='coerce')
     
     df = df.sort_index()
     log(f"✅ Datos cargados: {len(df)} velas desde {df.index[0]} hasta {df.index[-1]}")
