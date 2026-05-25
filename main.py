@@ -1,14 +1,13 @@
 # ======================================================
-# BOT TRADING V90.2 BYBIT – IA GEMINI 3.1 FLASH (PAPER)
-# - TP1 50% fijo (2*ATR), trailing para el resto
-# - Número de trade secuencial
-# - MACD incluido, colores mejorados
-# - IA completamente autónoma (sin reglas fijas)
+# BOT TRADING V90.2 BYBIT – IA GEMINI 3.1 FLASH (MULTIMODAL)
+# - La IA recibe el gráfico de velas (imagen) + datos numéricos
+# - Decisiones autónomas basadas en análisis visual y técnico
 # ======================================================
 
 import os
 import time
 import io
+import base64
 import hmac
 import hashlib
 import json
@@ -35,8 +34,7 @@ PAUSE_ON_DRAWDOWN_SECONDS = 3600
 SLEEP_SECONDS = 60
 
 # Trailing stop para la segunda mitad
-TRAILING_ACTIVATION = 1.5     # se activa cuando el precio avanza 1.5*ATR desde la entrada (no usado directamente)
-TRAILING_STEP = 0.5           # el SL sube cada 0.5*ATR
+TRAILING_STEP = 0.5
 
 # Papel (simulación)
 PAPER_BALANCE_INICIAL = 100.0
@@ -44,15 +42,15 @@ PAPER_BALANCE = PAPER_BALANCE_INICIAL
 PAPER_PEAK_BALANCE = PAPER_BALANCE_INICIAL
 PAPER_DRAWDOWN_PAUSED_UNTIL = None
 PAPER_PNL_GLOBAL = 0.0
-PAPER_POSICIONES_ACTIVAS = []      # cada posición es un dict con campos extendidos
+PAPER_POSICIONES_ACTIVAS = []
 PAPER_TRADES_CERRADOS = []
 PAPER_WIN = 0
 PAPER_LOSS = 0
 PAPER_TRADES_TOTALES = 0
-PAPER_NEXT_TRADE_ID = 1            # identificador único de trade
+PAPER_NEXT_TRADE_ID = 1
 
 # ======================================================
-# CREDENCIALES (variables de entorno en Railway)
+# CREDENCIALES
 # ======================================================
 
 BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
@@ -66,7 +64,6 @@ if not OPENROUTER_API_KEY:
 if not BYBIT_API_KEY or not BYBIT_API_SECRET:
     raise Exception("❌ BYBIT_API_KEY o BYBIT_API_SECRET no configuradas")
 
-# Cliente OpenRouter
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=OPENROUTER_API_KEY,
@@ -119,14 +116,12 @@ def obtener_velas(limit=300):
 
 def calcular_indicadores(df):
     df['ema20'] = df['close'].ewm(span=20).mean()
-    # ATR
     tr = pd.concat([
         df['high'] - df['low'],
         (df['high'] - df['close'].shift()).abs(),
         (df['low'] - df['close'].shift()).abs()
     ], axis=1).max(axis=1)
     df['atr'] = tr.rolling(14).mean()
-    # RSI
     delta = df['close'].diff()
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
@@ -134,7 +129,6 @@ def calcular_indicadores(df):
     avg_loss = loss.rolling(14).mean()
     rs = avg_gain / avg_loss
     df['rsi'] = 100 - (100 / (1 + rs))
-    # MACD
     exp1 = df['close'].ewm(span=12, adjust=False).mean()
     exp2 = df['close'].ewm(span=26, adjust=False).mean()
     df['macd'] = exp1 - exp2
@@ -160,10 +154,93 @@ def detectar_tendencia(df, ventana=80):
     return slope, intercept, direccion
 
 # ======================================================
-# IA GEMINI – PROMPT AUTÓNOMO (SIN REGLAS FIJAS)
+# GENERAR GRÁFICO DE VELAS (para IA y Telegram)
 # ======================================================
 
-def obtener_decision_ia(df, soporte, resistencia, slope, tendencia):
+def generar_grafico_base64(df, decision="HOLD", soporte=None, resistencia=None, 
+                           slope=None, intercept=None, razones=None, 
+                           precio_entrada=None, trade_id=None):
+    """Genera gráfico y devuelve imagen en base64 (para la IA) y figura (para Telegram)"""
+    try:
+        df_plot = df.copy().tail(120)
+        if df_plot.empty:
+            return None, None
+        fig, ax = plt.subplots(figsize=(14, 7))
+        x = np.arange(len(df_plot))
+        # Velas
+        for i, (idx, row) in enumerate(df_plot.iterrows()):
+            o, h, l, c = row['open'], row['high'], row['low'], row['close']
+            color = 'green' if c >= o else 'red'
+            ax.vlines(i, l, h, color=color, linewidth=1)
+            cuerpo_y = min(o, c)
+            cuerpo_h = abs(c - o)
+            if cuerpo_h == 0:
+                cuerpo_h = 0.0001
+            rect = plt.Rectangle((i - 0.3, cuerpo_y), 0.6, cuerpo_h, color=color, alpha=0.9)
+            ax.add_patch(rect)
+        # Niveles
+        if soporte:
+            ax.axhline(soporte, color='cyan', linestyle='--', linewidth=2, label=f"Soporte {soporte:.2f}")
+        if resistencia:
+            ax.axhline(resistencia, color='magenta', linestyle='--', linewidth=2, label=f"Resistencia {resistencia:.2f}")
+        # EMA20
+        if 'ema20' in df_plot.columns:
+            ax.plot(x, df_plot['ema20'].values, color='yellow', linewidth=2, label='EMA20')
+        # Tendencia
+        if slope is not None and intercept is not None:
+            y_plot = df_plot['close'].values
+            x_plot = np.arange(len(y_plot))
+            slope_plot, intercept_plot = np.polyfit(x_plot, y_plot, 1)
+            tendencia_linea = intercept_plot + slope_plot * x_plot
+            ax.plot(x_plot, tendencia_linea, color='#FFA500', linewidth=2, linestyle='-', label=f"Tendencia slope {slope_plot:.4f}")
+        # Marcador de entrada
+        if precio_entrada and trade_id:
+            entrada_index = len(df_plot) - 1
+            if decision == 'BUY':
+                ax.scatter(entrada_index, precio_entrada, s=200, marker='^', color='lime', edgecolors='black', label='Entrada BUY')
+                ax.axvline(entrada_index, color='lime', linestyle=':', linewidth=2)
+            elif decision == 'SELL':
+                ax.scatter(entrada_index, precio_entrada, s=200, marker='v', color='red', edgecolors='black', label='Entrada SELL')
+                ax.axvline(entrada_index, color='red', linestyle=':', linewidth=2)
+            texto = f"Trade #{trade_id}\n{decision}\nPrecio: {precio_entrada:.2f}\nBalance: {PAPER_BALANCE:.2f} USD\nPnL Global: {PAPER_PNL_GLOBAL:.4f}\nRazones:\n" + "\n".join(razones[:4]) if razones else ""
+            ax.text(0.02, 0.98, texto, transform=ax.transAxes, fontsize=10, verticalalignment='top',
+                    bbox=dict(facecolor='black', alpha=0.7, boxstyle='round'), color='white')
+        ax.set_title(f"{SYMBOL} - {INTERVAL}m")
+        ax.set_xlabel("Velas")
+        ax.set_ylabel("Precio")
+        ax.grid(True, alpha=0.2)
+        ax.legend(loc='lower left')
+        step = max(1, int(len(df_plot)/10))
+        ax.set_xticks(x[::step])
+        ax.set_xticklabels([t.strftime('%H:%M') for t in df_plot.index[::step]], rotation=45)
+        plt.tight_layout()
+        # Convertir a base64
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', bbox_inches='tight')
+        buf.seek(0)
+        img_base64 = base64.b64encode(buf.read()).decode('utf-8')
+        buf.close()
+        # Devolver también la figura para Telegram
+        return img_base64, fig
+    except Exception as e:
+        print(f"Error generando gráfico: {e}")
+        return None, None
+
+# ======================================================
+# IA MULTIMODAL: recibe imagen + datos numéricos
+# ======================================================
+
+def obtener_decision_ia_multimodal(df, soporte, resistencia, slope, tendencia):
+    """
+    Genera el gráfico, lo convierte a base64 y lo envía a Gemini junto con el prompt.
+    Retorna (decision, razones, imagen_base64, figura) para luego poder enviar a Telegram.
+    """
+    # Primero generamos la imagen (sin marcador de entrada, solo el contexto actual)
+    img_base64, fig = generar_grafico_base64(df, soporte=soporte, resistencia=resistencia, slope=slope, intercept=None)
+    if not img_base64:
+        return "HOLD", ["No se pudo generar gráfico"], None, None
+    
+    # Datos numéricos adicionales
     ultimo = df.iloc[-1]
     precio = ultimo['close']
     ema20 = ultimo['ema20']
@@ -171,35 +248,26 @@ def obtener_decision_ia(df, soporte, resistencia, slope, tendencia):
     rsi = ultimo['rsi'] if 'rsi' in ultimo else 50
     macd = ultimo['macd'] if 'macd' in ultimo else 0
     macd_signal = ultimo['macd_signal'] if 'macd_signal' in ultimo else 0
-    ultimas_velas = df.tail(10)[['open','high','low','close']].to_dict(orient='records')
-    velas_texto = "\n".join([f"  {v}" for v in ultimas_velas])
-
+    volumen = ultimo['volume'] if 'volume' in ultimo else 0
+    vol_media = df['volume'].rolling(20).mean().iloc[-1] if 'volume' in df else 0
+    
     prompt = f"""
 Eres un trader profesional y experimentado en BTC/USDT, operando en timeframe de {INTERVAL} minutos.
-Tu tarea es analizar el contexto actual del mercado y decidir si COMPRAR (BUY), VENDER (SELL) o NO HACER NADA (HOLD).
-Eres completamente autónomo: no tienes reglas fijas, puedes basarte en cualquier patrón o indicador, o incluso actuar en contra de ellos si tu experiencia te dice que es lo correcto.
+Te voy a proporcionar una imagen del gráfico de velas japonesas con EMA20, niveles de soporte/resistencia, y una línea de tendencia (regresión lineal). Además, te doy los siguientes datos numéricos actuales:
 
-Analiza lo siguiente:
 - Precio actual: {precio:.2f}
 - EMA20: {ema20:.2f}
 - ATR (volatilidad): {atr:.2f}
 - RSI: {rsi:.1f}
-- MACD: {macd:.2f} | Línea de señal: {macd_signal:.2f}
-- Tendencia lineal (últimas 80 velas): {tendencia} (pendiente {slope:.5f})
-- Soporte dinámico (mínimo de 50 velas): {soporte:.2f}
-- Resistencia dinámica (máximo de 50 velas): {resistencia:.2f}
-- Últimas 10 velas (open, high, low, close):
-{velas_texto}
+- MACD: {macd:.2f} | Señal: {macd_signal:.2f}
+- Tendencia lineal (pendiente): {slope:.5f} ({tendencia})
+- Soporte dinámico (mín 50 velas): {soporte:.2f}
+- Resistencia dinámica (máx 50 velas): {resistencia:.2f}
+- Volumen actual: {volumen:.0f} | Media 20 velas: {vol_media:.0f}
 
-Conceptos que puedes usar (sin obligación):
-- Soporte y resistencia: cerca, lejos, ruptura, falso quiebre, caza de liquidez, conversión de rol.
-- Patrones de velas: martillo, estrella fugaz, engulfing, doji, etc.
-- Estructura de mercado: máximos/mínimos crecientes o decrecientes, volumen.
-- Medias móviles como soporte/resistencia dinámico.
-- Divergencias en RSI o MACD.
-- Acumulación/distribución, etc.
+Analiza la imagen y los datos. Eres completamente autónomo: no tienes reglas fijas. Puedes basarte en patrones de velas (martillo, engulfing, doji, etc.), mechas, estructura de mercado, caza de liquidez, divergencias, comportamiento del volumen, etc. Decide si COMPRAR (BUY), VENDER (SELL) o NO HACER NADA (HOLD).
 
-Tu decisión debe ser FUNDAMENTADA, con razones claras y concretas (2-4 razones). No uses frases genéricas. Sé específico.
+Tu decisión debe ser fundamentada con 2-4 razones claras y específicas, refiriéndote tanto a lo que ves en la imagen como a los números.
 
 Devuelve ÚNICAMENTE un JSON con este formato exacto, sin texto adicional:
 {{"decision": "BUY/SELL/HOLD", "razones": ["razón específica 1", "razón específica 2", ...]}}
@@ -207,9 +275,17 @@ Devuelve ÚNICAMENTE un JSON con este formato exacto, sin texto adicional:
     try:
         response = client.chat.completions.create(
             model=MODELO_IA,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_base64}"}}
+                    ]
+                }
+            ],
             temperature=0.4,
-            max_tokens=400
+            max_tokens=500
         )
         contenido = response.choices[0].message.content
         print(f"Respuesta IA cruda: {contenido[:300]}...")
@@ -221,44 +297,39 @@ Devuelve ÚNICAMENTE un JSON con este formato exacto, sin texto adicional:
         else:
             data = json.loads(contenido)
         decision = data.get("decision", "HOLD").upper()
-        razones = data.get("razones", ["Sin razones específicas"])
+        razones = data.get("razones", ["Sin razones"])
         if decision not in ["BUY", "SELL", "HOLD"]:
             decision = "HOLD"
-        return decision, razones
+        return decision, razones, img_base64, fig
     except Exception as e:
-        print(f"Error IA: {e}")
-        return "HOLD", [f"Error IA: {e}, se asume HOLD"]
+        print(f"Error IA multimodal: {e}")
+        return "HOLD", [f"Error: {e}"], img_base64, fig
 
 # ======================================================
-# PAPER TRADING CON TP1 (50%) + TRAILING STOP (50%)
+# PAPER TRADING (idéntico al anterior)
 # ======================================================
 
 def paper_abrir_posicion(decision, precio, atr, razones, tiempo):
     global PAPER_BALANCE, PAPER_POSICIONES_ACTIVAS, PAPER_TRADES_TOTALES, PAPER_NEXT_TRADE_ID
     if len(PAPER_POSICIONES_ACTIVAS) >= MAX_SIMULTANEOUS_POSITIONS:
         return None
-
     riesgo_usd = PAPER_BALANCE * RISK_PER_TRADE
     if decision == "BUY":
         sl_inicial = precio - atr
-        tp1 = precio + (atr * 2)           # TP1 fijo 2*ATR
-    else:  # SELL
+        tp1 = precio + (atr * 2)
+    else:
         sl_inicial = precio + atr
         tp1 = precio - (atr * 2)
-
     distancia_sl = abs(precio - sl_inicial)
     if distancia_sl == 0:
         return None
     size_btc_total = riesgo_usd / distancia_sl
     size_usd_total = size_btc_total * precio
-    # Mitad para TP1, mitad para trailing
     size_btc_tp1 = size_btc_total / 2
     size_btc_trail = size_btc_total - size_btc_tp1
-
     trade_id = PAPER_NEXT_TRADE_ID
     PAPER_NEXT_TRADE_ID += 1
     PAPER_TRADES_TOTALES += 1
-
     pos = {
         "id": trade_id,
         "decision": decision,
@@ -272,15 +343,19 @@ def paper_abrir_posicion(decision, precio, atr, razones, tiempo):
         "size_usd_total": size_usd_total,
         "razones": razones,
         "tp1_hit": False,
-        "trailing_active": False,
         "trailing_sl": sl_inicial,
         "best_price": precio,
     }
     PAPER_POSICIONES_ACTIVAS.append(pos)
     return pos
 
+def paper_calcular_pnl_posicion(pos, precio_actual):
+    if pos["decision"] == "BUY":
+        return (precio_actual - pos["entry_price"]) * pos["size_btc_trail"]  # solo para trailing, pero se usa por separado
+    else:
+        return (pos["entry_price"] - precio_actual) * pos["size_btc_trail"]
+
 def paper_actualizar_trailing(pos, precio_actual):
-    """Actualiza el trailing stop para la segunda mitad (long o short)"""
     if not pos["tp1_hit"]:
         return pos["trailing_sl"]
     if pos["decision"] == "BUY":
@@ -289,7 +364,7 @@ def paper_actualizar_trailing(pos, precio_actual):
             new_sl = precio_actual - (pos["entry_atr"] * TRAILING_STEP)
             if new_sl > pos["trailing_sl"]:
                 pos["trailing_sl"] = new_sl
-    else:  # SELL
+    else:
         if precio_actual < pos["best_price"]:
             pos["best_price"] = precio_actual
             new_sl = precio_actual + (pos["entry_atr"] * TRAILING_STEP)
@@ -304,7 +379,6 @@ def paper_revisar_sl_tp(precio_actual, tiempo_actual):
 
     cerradas = []
     for pos in PAPER_POSICIONES_ACTIVAS[:]:
-        # ---- COMPROBAR TP1 (50%) ----
         if not pos["tp1_hit"]:
             if (pos["decision"] == "BUY" and precio_actual >= pos["tp1_price"]) or \
                (pos["decision"] == "SELL" and precio_actual <= pos["tp1_price"]):
@@ -330,8 +404,6 @@ def paper_revisar_sl_tp(precio_actual, tiempo_actual):
                 pos["tp1_hit"] = True
                 pos["best_price"] = pos["tp1_price"] if pos["decision"] == "BUY" else pos["tp1_price"]
                 pos["trailing_sl"] = pos["sl_initial"]
-                # Continuamos para revisar posible trailing inmediato
-        # ---- TRAILING STOP para la segunda mitad ----
         if pos["tp1_hit"]:
             nuevo_sl = paper_actualizar_trailing(pos, precio_actual)
             if (pos["decision"] == "BUY" and precio_actual <= nuevo_sl) or \
@@ -358,7 +430,6 @@ def paper_revisar_sl_tp(precio_actual, tiempo_actual):
                 PAPER_POSICIONES_ACTIVAS.remove(pos)
                 continue
         else:
-            # SL inicial antes de TP1
             if (pos["decision"] == "BUY" and precio_actual <= pos["sl_initial"]) or \
                (pos["decision"] == "SELL" and precio_actual >= pos["sl_initial"]):
                 size_total = pos["size_btc_tp1"] + pos["size_btc_trail"]
@@ -383,7 +454,6 @@ def paper_revisar_sl_tp(precio_actual, tiempo_actual):
                 PAPER_POSICIONES_ACTIVAS.remove(pos)
                 continue
 
-    # Actualizar drawdown
     if PAPER_BALANCE > PAPER_PEAK_BALANCE:
         PAPER_PEAK_BALANCE = PAPER_BALANCE
     drawdown_pct = (PAPER_PEAK_BALANCE - PAPER_BALANCE) / PAPER_PEAK_BALANCE * 100 if PAPER_PEAK_BALANCE > 0 else 0
@@ -392,61 +462,6 @@ def paper_revisar_sl_tp(precio_actual, tiempo_actual):
         PAPER_DRAWDOWN_PAUSED_UNTIL = tiempo_actual + pd.Timedelta(seconds=PAUSE_ON_DRAWDOWN_SECONDS)
         pausa = True
     return cerradas, pausa
-
-# ======================================================
-# GRÁFICO DE VELAS (tendencia en naranja)
-# ======================================================
-
-def generar_grafico_entrada(df, decision, soporte, resistencia, slope, intercept, razones, precio_entrada, trade_id):
-    try:
-        df_plot = df.copy().tail(120)
-        if df_plot.empty:
-            return None
-        fig, ax = plt.subplots(figsize=(14, 7))
-        x = np.arange(len(df_plot))
-        for i, (idx, row) in enumerate(df_plot.iterrows()):
-            o, h, l, c = row['open'], row['high'], row['low'], row['close']
-            color = 'green' if c >= o else 'red'
-            ax.vlines(i, l, h, color=color, linewidth=1)
-            cuerpo_y = min(o, c)
-            cuerpo_h = abs(c - o)
-            if cuerpo_h == 0:
-                cuerpo_h = 0.0001
-            rect = plt.Rectangle((i - 0.3, cuerpo_y), 0.6, cuerpo_h, color=color, alpha=0.9)
-            ax.add_patch(rect)
-        ax.axhline(soporte, color='cyan', linestyle='--', linewidth=2, label=f"Soporte {soporte:.2f}")
-        ax.axhline(resistencia, color='magenta', linestyle='--', linewidth=2, label=f"Resistencia {resistencia:.2f}")
-        if 'ema20' in df_plot.columns:
-            ax.plot(x, df_plot['ema20'].values, color='yellow', linewidth=2, label='EMA20')
-        # Tendencia con color naranja
-        y_plot = df_plot['close'].values
-        x_plot = np.arange(len(y_plot))
-        slope_plot, intercept_plot = np.polyfit(x_plot, y_plot, 1)
-        tendencia_linea = intercept_plot + slope_plot * x_plot
-        ax.plot(x_plot, tendencia_linea, color='#FFA500', linewidth=2, linestyle='-', label=f"Tendencia slope {slope_plot:.4f}")
-        entrada_index = len(df_plot) - 1
-        if decision == 'BUY':
-            ax.scatter(entrada_index, precio_entrada, s=200, marker='^', color='lime', edgecolors='black', label='Entrada BUY')
-            ax.axvline(entrada_index, color='lime', linestyle=':', linewidth=2)
-        elif decision == 'SELL':
-            ax.scatter(entrada_index, precio_entrada, s=200, marker='v', color='red', edgecolors='black', label='Entrada SELL')
-            ax.axvline(entrada_index, color='red', linestyle=':', linewidth=2)
-        texto = f"Trade #{trade_id}\n{decision}\nPrecio: {precio_entrada:.2f}\nBalance: {PAPER_BALANCE:.2f} USD\nPnL Global: {PAPER_PNL_GLOBAL:.4f}\nRazones:\n" + "\n".join(razones[:4])
-        ax.text(0.02, 0.98, texto, transform=ax.transAxes, fontsize=10, verticalalignment='top',
-                bbox=dict(facecolor='black', alpha=0.7, boxstyle='round'), color='white')
-        ax.set_title(f"{SYMBOL} - Entrada {decision} (IA Gemini) - Trade #{trade_id}")
-        ax.set_xlabel("Velas")
-        ax.set_ylabel("Precio")
-        ax.grid(True, alpha=0.2)
-        ax.legend(loc='lower left')
-        step = max(1, int(len(df_plot)/10))
-        ax.set_xticks(x[::step])
-        ax.set_xticklabels([t.strftime('%H:%M') for t in df_plot.index[::step]], rotation=45)
-        plt.tight_layout()
-        return fig
-    except Exception as e:
-        print(f"Error gráfico: {e}")
-        return None
 
 # ======================================================
 # TELEGRAM
@@ -474,10 +489,6 @@ def telegram_grafico(fig):
     except Exception:
         pass
 
-# ======================================================
-# LOG EN CONSOLA
-# ======================================================
-
 def log_estado(df, tendencia, slope, soporte, resistencia, decision, razones):
     ahora = datetime.now(timezone.utc)
     precio = df['close'].iloc[-1]
@@ -502,7 +513,7 @@ def log_estado(df, tendencia, slope, soporte, resistencia, decision, razones):
 
 def run_bot():
     global PAPER_PEAK_BALANCE, PAPER_DRAWDOWN_PAUSED_UNTIL
-    telegram_mensaje("🤖 BOT V90.2 INICIADO (Gemini 3.1 Flash, TP1 50% + Trailing, 5m, max 3 pos, drawdown 20%)")
+    telegram_mensaje("🤖 BOT MULTIMODAL INICIADO (Gemini 3.1 Flash, ve el gráfico)")
     while True:
         try:
             ahora = datetime.now(timezone.utc)
@@ -523,7 +534,8 @@ def run_bot():
             soporte, resistencia = detectar_soportes_resistencias(df)
             slope, intercept, tendencia = detectar_tendencia(df)
 
-            decision, razones = obtener_decision_ia(df, soporte, resistencia, slope, tendencia)
+            # Obtener decisión de IA multimodal (ve el gráfico)
+            decision, razones, _, fig = obtener_decision_ia_multimodal(df, soporte, resistencia, slope, tendencia)
             log_estado(df, tendencia, slope, soporte, resistencia, decision, razones)
 
             precio_actual = df['close'].iloc[-1]
@@ -535,7 +547,6 @@ def run_bot():
                 telegram_mensaje(f"⚠️ DRAWDOWN SUPERADO ({MAX_DRAWDOWN_PERCENT}%) - BOT PAUSADO 1 HORA")
                 continue
 
-            # Enviar notificaciones de cierres
             for c in cerradas:
                 resultado = "✅ GANADOR" if c["pnl"] > 0 else "❌ PERDEDOR"
                 msg_cierre = (
@@ -547,7 +558,6 @@ def run_bot():
                 )
                 telegram_mensaje(msg_cierre)
 
-            # Actualizar pico de balance
             if PAPER_BALANCE > PAPER_PEAK_BALANCE:
                 PAPER_PEAK_BALANCE = PAPER_BALANCE
 
@@ -556,6 +566,12 @@ def run_bot():
                 atr_actual = df['atr'].iloc[-1]
                 nueva_pos = paper_abrir_posicion(decision, precio_actual, atr_actual, razones, tiempo_actual)
                 if nueva_pos:
+                    # Generar gráfico con marcador de entrada para Telegram
+                    _, fig_con_marca = generar_grafico_base64(
+                        df, decision=decision, soporte=soporte, resistencia=resistencia,
+                        slope=slope, intercept=intercept, razones=razones,
+                        precio_entrada=precio_actual, trade_id=nueva_pos['id']
+                    )
                     msg_entrada = (
                         f"🚀 *NUEVA ENTRADA PAPER - Trade #{nueva_pos['id']}*\n"
                         f"📌 Dirección: {decision}\n"
@@ -568,12 +584,9 @@ def run_bot():
                         f"🧠 Setup IA:\n" + "\n".join(razones)
                     )
                     telegram_mensaje(msg_entrada)
-                    fig = generar_grafico_entrada(df, decision, soporte, resistencia, slope, intercept,
-                                                  razones, precio_actual, nueva_pos['id'])
-                    if fig:
-                        telegram_grafico(fig)
-                        plt.close(fig)
-
+                    if fig_con_marca:
+                        telegram_grafico(fig_con_marca)
+                        plt.close(fig_con_marca)
             time.sleep(SLEEP_SECONDS)
 
         except Exception as e:
