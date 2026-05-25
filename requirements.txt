@@ -1,9 +1,10 @@
-numpy
 pandas
-scipy
-matplotlib
-Pillow
-openai
+numpy
+pybit
 requests
+matplotlib
+pillow
+python-telegram-bot
+openai
 json-repair
 ta
