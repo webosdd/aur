@@ -1,6 +1,6 @@
 # ======================================================
 # BOT TRADING V90.2 BYBIT – IA GEMINI + PAPER TRADING
-# (Sin scipy, solo numpy)
+# Modelo: google/gemini-3.1-flash-image-preview (OpenRouter)
 # ======================================================
 
 import os
@@ -33,11 +33,11 @@ SLEEP_SECONDS = 60            # revisar cada 60 segundos
 # Papel (simulación)
 PAPER_BALANCE_INICIAL = 100.0
 PAPER_BALANCE = PAPER_BALANCE_INICIAL
-PAPER_PEAK_BALANCE = PAPER_BALANCE_INICIAL   # para drawdown
-PAPER_DRAWDOWN_PAUSED_UNTIL = None           # timestamp de pausa
+PAPER_PEAK_BALANCE = PAPER_BALANCE_INICIAL
+PAPER_DRAWDOWN_PAUSED_UNTIL = None
 PAPER_PNL_GLOBAL = 0.0
-PAPER_POSICIONES_ACTIVAS = []                # lista de diccionarios
-PAPER_TRADES_CERRADOS = []                   # histórico
+PAPER_POSICIONES_ACTIVAS = []
+PAPER_TRADES_CERRADOS = []
 PAPER_WIN = 0
 PAPER_LOSS = 0
 PAPER_TRADES_TOTALES = 0
@@ -57,12 +57,14 @@ if not OPENROUTER_API_KEY:
 if not BYBIT_API_KEY or not BYBIT_API_SECRET:
     raise Exception("❌ BYBIT_API_KEY o BYBIT_API_SECRET no configuradas")
 
-# Cliente OpenRouter
+# Cliente OpenRouter con el modelo correcto
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=OPENROUTER_API_KEY,
     default_headers={"HTTP-Referer": "https://railway.app", "X-Title": "BTC Trading Bot"}
 )
+
+MODELO_IA = "google/gemini-3.1-flash-image-preview"
 
 # ======================================================
 # FUNCIONES BYBIT
@@ -133,7 +135,6 @@ def detectar_soportes_resistencias(df, ventana=50):
 def detectar_tendencia(df, ventana=80):
     y = df['close'].values[-ventana:]
     x = np.arange(len(y))
-    # Usamos numpy.polyfit en lugar de scipy.stats.linregress
     slope, intercept = np.polyfit(x, y, 1)
     if slope > 0.02:
         direccion = 'ALCISTA'
@@ -144,7 +145,7 @@ def detectar_tendencia(df, ventana=80):
     return slope, intercept, direccion
 
 # ======================================================
-# IA GEMINI (vía OpenRouter) para DECIDIR TRADE
+# IA GEMINI (vía OpenRouter) con modelo corregido
 # ======================================================
 
 def obtener_decision_ia(df, soporte, resistencia, slope, tendencia):
@@ -180,7 +181,7 @@ Reglas:
 """
     try:
         response = client.chat.completions.create(
-            model="google/gemini-2.0-flash-exp",
+            model=MODELO_IA,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
             max_tokens=300,
@@ -197,7 +198,7 @@ Reglas:
         return None, [f"Error: {e}"]
 
 # ======================================================
-# PAPER TRADING (con múltiples posiciones)
+# PAPER TRADING (múltiples posiciones)
 # ======================================================
 
 def paper_abrir_posicion(decision, precio, atr, razones, tiempo):
@@ -209,7 +210,7 @@ def paper_abrir_posicion(decision, precio, atr, razones, tiempo):
     if decision == "BUY":
         sl = precio - atr
         tp = precio + (atr * 2)
-    else:  # SELL
+    else:
         sl = precio + atr
         tp = precio - (atr * 2)
 
@@ -241,7 +242,8 @@ def paper_calcular_pnl_posicion(pos, precio_actual):
         return (pos["entry_price"] - precio_actual) * pos["size_btc"]
 
 def paper_revisar_sl_tp(precio_actual, tiempo_actual):
-    global PAPER_BALANCE, PAPER_PNL_GLOBAL, PAPER_WIN, PAPER_LOSS, PAPER_TRADES_CERRADOS, PAPER_POSICIONES_ACTIVAS
+    global PAPER_BALANCE, PAPER_PNL_GLOBAL, PAPER_WIN, PAPER_LOSS
+    global PAPER_TRADES_CERRADOS, PAPER_POSICIONES_ACTIVAS
     global PAPER_PEAK_BALANCE, PAPER_DRAWDOWN_PAUSED_UNTIL
 
     cerradas = []
@@ -282,17 +284,17 @@ def paper_revisar_sl_tp(precio_actual, tiempo_actual):
             PAPER_POSICIONES_ACTIVAS.remove(pos)
             cerradas.append(pos_cerrada)
 
-            # Actualizar peak balance y verificar drawdown
+            # Actualizar pico y drawdown
             if PAPER_BALANCE > PAPER_PEAK_BALANCE:
                 PAPER_PEAK_BALANCE = PAPER_BALANCE
             drawdown_pct = (PAPER_PEAK_BALANCE - PAPER_BALANCE) / PAPER_PEAK_BALANCE * 100
             if drawdown_pct >= MAX_DRAWDOWN_PERCENT and PAPER_DRAWDOWN_PAUSED_UNTIL is None:
                 PAPER_DRAWDOWN_PAUSED_UNTIL = tiempo_actual + pd.Timedelta(seconds=PAUSE_ON_DRAWDOWN_SECONDS)
-                return cerradas, True  # indica pausa activada
+                return cerradas, True
     return cerradas, False
 
 # ======================================================
-# GRÁFICO DE VELAS DETALLADO (sin scipy)
+# GRÁFICO DE VELAS DETALLADO
 # ======================================================
 
 def generar_grafico_entrada(df, decision, soporte, resistencia, slope, intercept, razones, precio_entrada=None):
@@ -316,7 +318,6 @@ def generar_grafico_entrada(df, decision, soporte, resistencia, slope, intercept
         ax.axhline(resistencia, color='magenta', linestyle='--', linewidth=2, label=f"Resistencia {resistencia:.2f}")
         if 'ema20' in df_plot.columns:
             ax.plot(x, df_plot['ema20'].values, color='yellow', linewidth=2, label='EMA20')
-        # Tendencia con numpy.polyfit
         y_plot = df_plot['close'].values
         x_plot = np.arange(len(y_plot))
         slope_plot, intercept_plot = np.polyfit(x_plot, y_plot, 1)
@@ -349,7 +350,7 @@ def generar_grafico_entrada(df, decision, soporte, resistencia, slope, intercept
         return None
 
 # ======================================================
-# TELEGRAM (sin proxy)
+# TELEGRAM
 # ======================================================
 
 def telegram_mensaje(texto):
@@ -402,10 +403,9 @@ def log_estado(df, tendencia, slope, soporte, resistencia, decision, razones):
 
 def run_bot():
     global PAPER_PEAK_BALANCE, PAPER_DRAWDOWN_PAUSED_UNTIL
-    telegram_mensaje("🤖 BOT V90.2 INICIADO (Gemini, 5m, max 3 posiciones, drawdown 20%)")
+    telegram_mensaje("🤖 BOT V90.2 INICIADO (Gemini 3.1, 5m, max 3 posiciones, drawdown 20%)")
     while True:
         try:
-            # Si está en pausa por drawdown, esperar
             ahora = datetime.now(timezone.utc)
             if PAPER_DRAWDOWN_PAUSED_UNTIL and ahora < PAPER_DRAWDOWN_PAUSED_UNTIL:
                 restante = (PAPER_DRAWDOWN_PAUSED_UNTIL - ahora).total_seconds()
@@ -416,7 +416,7 @@ def run_bot():
                 else:
                     PAPER_DRAWDOWN_PAUSED_UNTIL = None
                     telegram_mensaje("✅ Pausa por drawdown finalizada. Bot reanudado.")
-                    PAPER_PEAK_BALANCE = PAPER_BALANCE  # empezar nuevo pico
+                    PAPER_PEAK_BALANCE = PAPER_BALANCE
 
             df = obtener_velas(limit=200)
             df = calcular_indicadores(df)
@@ -430,17 +430,14 @@ def run_bot():
             precio_actual = df['close'].iloc[-1]
             tiempo_actual = df.index[-1]
 
-            # Revisar SL/TP de posiciones activas (puede activar pausa)
             cerradas, pausa_activada = paper_revisar_sl_tp(precio_actual, tiempo_actual)
             if pausa_activada:
                 telegram_mensaje(f"⚠️ DRAWDOWN SUPERADO ({MAX_DRAWDOWN_PERCENT}%) - BOT PAUSADO 1 HORA")
-                continue  # volver al inicio, la pausa se manejará en la próxima iteración
+                continue
 
-            # Actualizar pico de balance después de cierres
             if PAPER_BALANCE > PAPER_PEAK_BALANCE:
                 PAPER_PEAK_BALANCE = PAPER_BALANCE
 
-            # Enviar notificaciones de cierres
             for c in cerradas:
                 msg = (
                     f"📌 CIERRE PAPER {c['decision']} ({c['motivo']})\n"
@@ -451,12 +448,10 @@ def run_bot():
                 )
                 telegram_mensaje(msg)
 
-            # Abrir nueva posición si IA lo indica y hay cupo
             if decision in ("BUY", "SELL") and len(PAPER_POSICIONES_ACTIVAS) < MAX_SIMULTANEOUS_POSITIONS:
                 atr_actual = df['atr'].iloc[-1]
                 abierta = paper_abrir_posicion(decision, precio_actual, atr_actual, razones, tiempo_actual)
                 if abierta:
-                    # Enviar mensaje y gráfico
                     msg = (
                         f"📌 ENTRADA PAPER {decision} (IA Gemini)\n"
                         f"Precio: {precio_actual:.2f}\n"
