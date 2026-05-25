@@ -3,6 +3,7 @@
 # - TP1 50% fijo (2*ATR), trailing para el resto
 # - Número de trade secuencial
 # - MACD incluido, colores mejorados
+# - IA completamente autónoma (sin reglas fijas)
 # ======================================================
 
 import os
@@ -34,7 +35,7 @@ PAUSE_ON_DRAWDOWN_SECONDS = 3600
 SLEEP_SECONDS = 60
 
 # Trailing stop para la segunda mitad
-TRAILING_ACTIVATION = 1.5     # se activa cuando el precio avanza 1.5*ATR desde la entrada
+TRAILING_ACTIVATION = 1.5     # se activa cuando el precio avanza 1.5*ATR desde la entrada (no usado directamente)
 TRAILING_STEP = 0.5           # el SL sube cada 0.5*ATR
 
 # Papel (simulación)
@@ -113,11 +114,10 @@ def obtener_velas(limit=300):
     return df
 
 # ======================================================
-# INDICADORES (añadido MACD)
+# INDICADORES (incluye MACD)
 # ======================================================
 
 def calcular_indicadores(df):
-    # EMA
     df['ema20'] = df['close'].ewm(span=20).mean()
     # ATR
     tr = pd.concat([
@@ -160,7 +160,7 @@ def detectar_tendencia(df, ventana=80):
     return slope, intercept, direccion
 
 # ======================================================
-# IA GEMINI CON PROMPT MEJORADO (incluye MACD)
+# IA GEMINI – PROMPT AUTÓNOMO (SIN REGLAS FIJAS)
 # ======================================================
 
 def obtener_decision_ia(df, soporte, resistencia, slope, tendencia):
@@ -171,43 +171,48 @@ def obtener_decision_ia(df, soporte, resistencia, slope, tendencia):
     rsi = ultimo['rsi'] if 'rsi' in ultimo else 50
     macd = ultimo['macd'] if 'macd' in ultimo else 0
     macd_signal = ultimo['macd_signal'] if 'macd_signal' in ultimo else 0
-    ultimas_velas = df.tail(5)[['open','high','low','close']].to_dict(orient='records')
+    ultimas_velas = df.tail(10)[['open','high','low','close']].to_dict(orient='records')
     velas_texto = "\n".join([f"  {v}" for v in ultimas_velas])
 
     prompt = f"""
-Eres un trader algorítmico experto en BTC/USDT en timeframe de {INTERVAL} minutos.
-Analiza la siguiente situación y decide si comprar (BUY), vender (SELL) o no hacer nada (HOLD).
-Devuelve ÚNICAMENTE un JSON válido con este formato exacto:
-{{"decision": "BUY/SELL/HOLD", "razones": ["razón1", "razón2", ...]}}
+Eres un trader profesional y experimentado en BTC/USDT, operando en timeframe de {INTERVAL} minutos.
+Tu tarea es analizar el contexto actual del mercado y decidir si COMPRAR (BUY), VENDER (SELL) o NO HACER NADA (HOLD).
+Eres completamente autónomo: no tienes reglas fijas, puedes basarte en cualquier patrón o indicador, o incluso actuar en contra de ellos si tu experiencia te dice que es lo correcto.
 
-Datos actuales:
-- Precio: {precio:.2f}
+Analiza lo siguiente:
+- Precio actual: {precio:.2f}
 - EMA20: {ema20:.2f}
 - ATR (volatilidad): {atr:.2f}
 - RSI: {rsi:.1f}
-- MACD: {macd:.2f} | Señal: {macd_signal:.2f}
-- Tendencia (80 velas): {tendencia} (slope {slope:.5f})
-- Soporte dinámico (50 velas): {soporte:.2f}
-- Resistencia dinámica (50 velas): {resistencia:.2f}
-- Últimas 5 velas (open,high,low,close):
+- MACD: {macd:.2f} | Línea de señal: {macd_signal:.2f}
+- Tendencia lineal (últimas 80 velas): {tendencia} (pendiente {slope:.5f})
+- Soporte dinámico (mínimo de 50 velas): {soporte:.2f}
+- Resistencia dinámica (máximo de 50 velas): {resistencia:.2f}
+- Últimas 10 velas (open, high, low, close):
 {velas_texto}
 
-Reglas de análisis:
-- Observa las mechas largas (rechazos), patrones de velas (martillo, estrella, engulfing, etc.).
-- BUY: precio cerca de soporte + tendencia alcista + RSI > 30 + MACD > señal o cruzando al alza.
-- SELL: precio cerca de resistencia + tendencia bajista + RSI < 70 + MACD < señal o cruzando a la baja.
-- Si no hay clara confluencia, HOLD.
-Explica las razones concretas (ej. "mecha larga inferior indica soporte", "MACD cruzó arriba", etc.).
+Conceptos que puedes usar (sin obligación):
+- Soporte y resistencia: cerca, lejos, ruptura, falso quiebre, caza de liquidez, conversión de rol.
+- Patrones de velas: martillo, estrella fugaz, engulfing, doji, etc.
+- Estructura de mercado: máximos/mínimos crecientes o decrecientes, volumen.
+- Medias móviles como soporte/resistencia dinámico.
+- Divergencias en RSI o MACD.
+- Acumulación/distribución, etc.
+
+Tu decisión debe ser FUNDAMENTADA, con razones claras y concretas (2-4 razones). No uses frases genéricas. Sé específico.
+
+Devuelve ÚNICAMENTE un JSON con este formato exacto, sin texto adicional:
+{{"decision": "BUY/SELL/HOLD", "razones": ["razón específica 1", "razón específica 2", ...]}}
 """
     try:
         response = client.chat.completions.create(
             model=MODELO_IA,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
+            temperature=0.4,
             max_tokens=400
         )
         contenido = response.choices[0].message.content
-        print(f"Respuesta IA cruda: {contenido[:200]}...")
+        print(f"Respuesta IA cruda: {contenido[:300]}...")
         if not contenido:
             raise Exception("Respuesta vacía")
         json_match = re.search(r'\{.*\}', contenido, re.DOTALL)
@@ -216,7 +221,7 @@ Explica las razones concretas (ej. "mecha larga inferior indica soporte", "MACD 
         else:
             data = json.loads(contenido)
         decision = data.get("decision", "HOLD").upper()
-        razones = data.get("razones", ["Sin razones"])
+        razones = data.get("razones", ["Sin razones específicas"])
         if decision not in ["BUY", "SELL", "HOLD"]:
             decision = "HOLD"
         return decision, razones
@@ -266,25 +271,21 @@ def paper_abrir_posicion(decision, precio, atr, razones, tiempo):
         "size_btc_trail": size_btc_trail,
         "size_usd_total": size_usd_total,
         "razones": razones,
-        "tp1_hit": False,           # si ya se tomó TP1
-        "trailing_active": False,   # si se activó trailing
-        "trailing_sl": sl_inicial,  # SL móvil para la parte restante
-        "best_price": precio,       # mejor precio alcanzado (para trailing)
+        "tp1_hit": False,
+        "trailing_active": False,
+        "trailing_sl": sl_inicial,
+        "best_price": precio,
     }
     PAPER_POSICIONES_ACTIVAS.append(pos)
     return pos
 
 def paper_actualizar_trailing(pos, precio_actual):
     """Actualiza el trailing stop para la segunda mitad (long o short)"""
-    if pos["tp1_hit"] is False:
-        # todavía no se ha tomado TP1, no activar trailing
+    if not pos["tp1_hit"]:
         return pos["trailing_sl"]
-    # ya se tomó TP1, ahora trailing está activo
     if pos["decision"] == "BUY":
-        # mejor precio desde que se activó trailing
         if precio_actual > pos["best_price"]:
             pos["best_price"] = precio_actual
-            # subir el SL: se mueve hacia arriba dejando un step fijo
             new_sl = precio_actual - (pos["entry_atr"] * TRAILING_STEP)
             if new_sl > pos["trailing_sl"]:
                 pos["trailing_sl"] = new_sl
@@ -301,26 +302,24 @@ def paper_revisar_sl_tp(precio_actual, tiempo_actual):
     global PAPER_POSICIONES_ACTIVAS, PAPER_TRADES_CERRADOS
     global PAPER_PEAK_BALANCE, PAPER_DRAWDOWN_PAUSED_UNTIL
 
-    cerradas = []   # lista de dicts con info de cierre (cada mitad o total)
+    cerradas = []
     for pos in PAPER_POSICIONES_ACTIVAS[:]:
-        # ---- COMPROBAR TP1 (50%) si no se ha tomado aún ----
+        # ---- COMPROBAR TP1 (50%) ----
         if not pos["tp1_hit"]:
             if (pos["decision"] == "BUY" and precio_actual >= pos["tp1_price"]) or \
                (pos["decision"] == "SELL" and precio_actual <= pos["tp1_price"]):
-                # Cerrar la primera mitad en TP1
                 pnl_tp1 = 0
                 if pos["decision"] == "BUY":
                     pnl_tp1 = (pos["tp1_price"] - pos["entry_price"]) * pos["size_btc_tp1"]
                 else:
                     pnl_tp1 = (pos["entry_price"] - pos["tp1_price"]) * pos["size_btc_tp1"]
-                pnl_tp1 -= abs(pnl_tp1) * 0.001  # comisión
+                pnl_tp1 -= abs(pnl_tp1) * 0.001
                 PAPER_BALANCE += pnl_tp1
                 PAPER_PNL_GLOBAL += pnl_tp1
                 if pnl_tp1 > 0:
-                    PAPER_WIN += 0.5  # medio trade ganador (contaremos como medio al sumar enteros después)
+                    PAPER_WIN += 0.5
                 else:
                     PAPER_LOSS += 0.5
-                # Registrar cierre parcial
                 cerradas.append({
                     "trade_id": pos["id"],
                     "type": "TP1 parcial (50%)",
@@ -329,19 +328,14 @@ def paper_revisar_sl_tp(precio_actual, tiempo_actual):
                     "balance_after": PAPER_BALANCE
                 })
                 pos["tp1_hit"] = True
-                pos["trailing_active"] = True
                 pos["best_price"] = pos["tp1_price"] if pos["decision"] == "BUY" else pos["tp1_price"]
-                pos["trailing_sl"] = pos["sl_initial"]  # inicialmente el mismo SL original
-                # Continuamos para revisar si también se debe cerrar la segunda mitad ahora mismo (por trailing)
-        
-        # ---- TRAILING STOP para la segunda mitad (si TP1 ya se tomó) ----
+                pos["trailing_sl"] = pos["sl_initial"]
+                # Continuamos para revisar posible trailing inmediato
+        # ---- TRAILING STOP para la segunda mitad ----
         if pos["tp1_hit"]:
-            # Actualizar trailing SL
             nuevo_sl = paper_actualizar_trailing(pos, precio_actual)
-            # Comprobar si se toca el trailing SL
             if (pos["decision"] == "BUY" and precio_actual <= nuevo_sl) or \
                (pos["decision"] == "SELL" and precio_actual >= nuevo_sl):
-                # Cerrar la segunda mitad en trailing SL
                 pnl_trail = 0
                 if pos["decision"] == "BUY":
                     pnl_trail = (nuevo_sl - pos["entry_price"]) * pos["size_btc_trail"]
@@ -361,16 +355,12 @@ def paper_revisar_sl_tp(precio_actual, tiempo_actual):
                     "price": nuevo_sl,
                     "balance_after": PAPER_BALANCE
                 })
-                # Eliminar posición completamente
                 PAPER_POSICIONES_ACTIVAS.remove(pos)
-                # Registrar trade completo
                 continue
         else:
-            # Si aún no se tomó TP1, también se puede cerrar todo por SL inicial
+            # SL inicial antes de TP1
             if (pos["decision"] == "BUY" and precio_actual <= pos["sl_initial"]) or \
                (pos["decision"] == "SELL" and precio_actual >= pos["sl_initial"]):
-                # Stop loss golpeado antes de TP1: se cierra toda la posición
-                pnl_total = 0
                 size_total = pos["size_btc_tp1"] + pos["size_btc_trail"]
                 if pos["decision"] == "BUY":
                     pnl_total = (pos["sl_initial"] - pos["entry_price"]) * size_total
@@ -393,7 +383,7 @@ def paper_revisar_sl_tp(precio_actual, tiempo_actual):
                 PAPER_POSICIONES_ACTIVAS.remove(pos)
                 continue
 
-    # Actualizar drawdown después de los cierres
+    # Actualizar drawdown
     if PAPER_BALANCE > PAPER_PEAK_BALANCE:
         PAPER_PEAK_BALANCE = PAPER_BALANCE
     drawdown_pct = (PAPER_PEAK_BALANCE - PAPER_BALANCE) / PAPER_PEAK_BALANCE * 100 if PAPER_PEAK_BALANCE > 0 else 0
@@ -404,7 +394,7 @@ def paper_revisar_sl_tp(precio_actual, tiempo_actual):
     return cerradas, pausa
 
 # ======================================================
-# GRÁFICO DE VELAS MEJORADO (color tendencia naranja)
+# GRÁFICO DE VELAS (tendencia en naranja)
 # ======================================================
 
 def generar_grafico_entrada(df, decision, soporte, resistencia, slope, intercept, razones, precio_entrada, trade_id):
@@ -428,7 +418,7 @@ def generar_grafico_entrada(df, decision, soporte, resistencia, slope, intercept
         ax.axhline(resistencia, color='magenta', linestyle='--', linewidth=2, label=f"Resistencia {resistencia:.2f}")
         if 'ema20' in df_plot.columns:
             ax.plot(x, df_plot['ema20'].values, color='yellow', linewidth=2, label='EMA20')
-        # Tendencia con color naranja para que se vea bien
+        # Tendencia con color naranja
         y_plot = df_plot['close'].values
         x_plot = np.arange(len(y_plot))
         slope_plot, intercept_plot = np.polyfit(x_plot, y_plot, 1)
@@ -545,7 +535,7 @@ def run_bot():
                 telegram_mensaje(f"⚠️ DRAWDOWN SUPERADO ({MAX_DRAWDOWN_PERCENT}%) - BOT PAUSADO 1 HORA")
                 continue
 
-            # Enviar notificaciones de cierres (ganadores/perdedores)
+            # Enviar notificaciones de cierres
             for c in cerradas:
                 resultado = "✅ GANADOR" if c["pnl"] > 0 else "❌ PERDEDOR"
                 msg_cierre = (
@@ -561,25 +551,23 @@ def run_bot():
             if PAPER_BALANCE > PAPER_PEAK_BALANCE:
                 PAPER_PEAK_BALANCE = PAPER_BALANCE
 
-            # Abrir nueva posición si IA lo indica y hay cupo
+            # Abrir nueva posición si IA lo indica
             if decision in ("BUY", "SELL") and len(PAPER_POSICIONES_ACTIVAS) < MAX_SIMULTANEOUS_POSITIONS:
                 atr_actual = df['atr'].iloc[-1]
                 nueva_pos = paper_abrir_posicion(decision, precio_actual, atr_actual, razones, tiempo_actual)
                 if nueva_pos:
-                    # Enviar mensaje detallado a Telegram
                     msg_entrada = (
                         f"🚀 *NUEVA ENTRADA PAPER - Trade #{nueva_pos['id']}*\n"
                         f"📌 Dirección: {decision}\n"
                         f"💲 Precio Entry: {precio_actual:.2f}\n"
                         f"🛑 Stop Loss inicial: {nueva_pos['sl_initial']:.2f}\n"
                         f"🎯 TP1 (50%): {nueva_pos['tp1_price']:.2f}\n"
-                        f"🔄 Trailing para 50% restante: activación después de TP1, step {TRAILING_STEP}×ATR\n"
+                        f"🔄 Trailing para 50% restante: step {TRAILING_STEP}×ATR\n"
                         f"💰 Riesgo: {RISK_PER_TRADE*100:.2f}% del balance\n"
                         f"📦 Tamaño total: {nueva_pos['size_usd_total']:.2f} USD\n"
                         f"🧠 Setup IA:\n" + "\n".join(razones)
                     )
                     telegram_mensaje(msg_entrada)
-                    # Enviar gráfico
                     fig = generar_grafico_entrada(df, decision, soporte, resistencia, slope, intercept,
                                                   razones, precio_actual, nueva_pos['id'])
                     if fig:
