@@ -43,27 +43,22 @@ if not BYBIT_API_KEY or not BYBIT_API_SECRET:
 MODELO_VISION = "google/gemini-3.1-flash-image-preview"
 SYMBOLS = ["BTCUSDT", "SOLUSDT"]
 MIN_INVEST_USDT = 20
-HORA_ANALISIS = "07:00"   # Hora UTC del análisis diario con IA
+HORA_ANALISIS = "07:00"   # UTC
 
-# IDs reales de productos (confirmados desde la app)
 PRODUCT_IDS = {
     "BTC": "134685",
     "SOL": "134711"
 }
 
-# Archivo para persistir posiciones activas y decisión del día
-DATA_FILE = "duplo_bot_data.json"
-
 client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY,
                 default_headers={"HTTP-Referer": "https://railway.app", "X-Title": "Dual Asset Bot"})
 bybit_session = HTTP(testnet=False, api_key=BYBIT_API_KEY, api_secret=BYBIT_API_SECRET)
 
-# Estado en memoria
+# Estado en memoria (se pierde al reiniciar, pero no importa)
+decision_diaria = {}        # {"BTC": "Buy Low", "SOL": "Sell High"}
+ultimo_resumen = 0
 ws_offers = {}
 ws_connected = False
-decision_diaria = {}        # {"BTC": "Buy Low", "SOL": "Sell High"}
-posiciones_activas = []     # lista de dicts con id, productId, monto, inicio, vencimiento, decision
-ultimo_resumen_horas = 0
 
 # ================= TELEGRAM =================
 def telegram_mensaje(texto):
@@ -85,29 +80,6 @@ def telegram_enviar_imagen(ruta, caption=""):
                           files={"photo": foto}, timeout=15)
     except Exception as e:
         logger.error(f"Error enviando imagen: {e}")
-
-# ================= PERSISTENCIA DE DATOS =================
-def guardar_datos():
-    data = {
-        "decision_diaria": decision_diaria,
-        "posiciones_activas": posiciones_activas,
-        "ultima_fecha_analisis": str(datetime.now().date())
-    }
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=2)
-    logger.info("Datos guardados")
-
-def cargar_datos():
-    global decision_diaria, posiciones_activas
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r") as f:
-                data = json.load(f)
-            decision_diaria = data.get("decision_diaria", {})
-            posiciones_activas = data.get("posiciones_activas", [])
-            logger.info(f"Datos cargados: {len(posiciones_activas)} posiciones activas")
-        except Exception as e:
-            logger.error(f"Error cargando datos: {e}")
 
 # ================= SALDO Y CONVERSIONES =================
 def obtener_saldo_usdt_unificado():
@@ -145,7 +117,6 @@ def convertir_activo_a_usdt(coin, amount):
         return 0.0
 
 def obtener_saldo_total_disponible():
-    """Suma USDT + convierte otros activos de la cuenta UNIFIED."""
     total = obtener_saldo_usdt_unificado()
     try:
         resp = bybit_session.get_wallet_balance(accountType="UNIFIED")
@@ -324,10 +295,9 @@ def ejecutar_analisis_diario():
             decision_diaria[base] = decision
         else:
             decision_diaria[base] = None
-    guardar_datos()
     telegram_mensaje(f"📅 Decisión del día guardada: BTC={decision_diaria.get('BTC')}, SOL={decision_diaria.get('SOL')}")
 
-# ================= WEBSOCKET (solo para obtener ofertas al momento de invertir) =================
+# ================= WEBSOCKET (ofertas) =================
 def on_message(ws, message):
     global ws_offers
     try:
@@ -451,93 +421,85 @@ def suscribir_dual_asset(product_id, amount_usdt, decision, quote_info):
             return True, order_link_id
         else:
             logger.error(f"Suscripción falló: {result}")
+            telegram_mensaje(f"❌ Error suscripción {product_id}: {result.get('retMsg')}")
             return False, None
     except Exception as e:
         logger.error(f"Excepción suscripción: {e}")
         return False, None
 
-# ================= GESTIÓN DE POSICIONES ACTIVAS =================
-def agregar_posicion(product_id, monto, decision, order_link_id, quote_info):
-    ahora = time.time()
-    vencimiento = ahora + 86400  # 24 horas
-    pos = {
-        "id": order_link_id,
-        "productId": product_id,
-        "monto": monto,
-        "decision": decision,
-        "inicio": ahora,
-        "vencimiento": vencimiento,
-        "apy": quote_info.get("apy", 0)
-    }
-    posiciones_activas.append(pos)
-    guardar_datos()
-    # Enviar mensaje a Telegram
-    fecha_venc = datetime.fromtimestamp(vencimiento).strftime("%Y-%m-%d %H:%M:%S UTC")
-    telegram_mensaje(
-        f"🟢 NUEVA POSICIÓN DUAL ASSET\n"
-        f"Producto: {product_id}\n"
-        f"Dirección: {decision}\n"
-        f"Monto: {monto:.2f} USDT\n"
-        f"APY: {quote_info.get('apy',0)}%\n"
-        f"Vence: {fecha_venc}"
-    )
+# ================= POSICIONES ACTIVAS (desde API) =================
+def obtener_posiciones_activas():
+    """Obtiene las posiciones activas de DoubleWin desde Bybit."""
+    try:
+        timestamp = str(int(time.time() * 1000))
+        recv_window = "5000"
+        query = "category=DoubleWin"
+        payload = timestamp + BYBIT_API_KEY + recv_window + query
+        signature = hmac.new(BYBIT_API_SECRET.encode('utf-8'), payload.encode('utf-8'), hashlib.sha256).hexdigest()
+        headers = {
+            "X-BAPI-API-KEY": BYBIT_API_KEY,
+            "X-BAPI-TIMESTAMP": timestamp,
+            "X-BAPI-RECV-WINDOW": recv_window,
+            "X-BAPI-SIGN": signature,
+        }
+        url = "https://api.bybit.com/v5/earn/advance/position"
+        resp = requests.get(url, headers=headers, params={"category": "DoubleWin"}, timeout=10)
+        data = resp.json()
+        if data.get("retCode") != 0:
+            return []
+        activas = []
+        for pos in data["result"]["list"]:
+            if pos.get("status") == "Active":
+                activas.append({
+                    "productId": pos.get("productId"),
+                    "amount": float(pos.get("amount", 0)),
+                    "coin": pos.get("coin"),
+                    "createTime": int(pos.get("createTime", 0)),
+                    "expireTime": int(pos.get("expireTime", 0))
+                })
+        return activas
+    except Exception as e:
+        logger.error(f"Error obteniendo posiciones: {e}")
+        return []
 
-def verificar_vencimientos():
-    global posiciones_activas
+def reporte_posiciones():
+    global ultimo_resumen
     ahora = time.time()
-    nuevas_activas = []
-    for pos in posiciones_activas:
-        if pos["vencimiento"] <= ahora:
-            # Posición vencida, debe liquidarse. La liquidación la hace Bybit automáticamente,
-            # nosotros solo esperamos que el saldo aparezca en la wallet.
-            telegram_mensaje(f"⏰ Posición vencida: {pos['productId']} - {pos['decision']} - Monto: {pos['monto']} USDT. Se liquidará en breve.")
-            # No la mantenemos en activas.
-            continue
-        else:
-            # Avisar si falta 1 hora o menos
-            tiempo_restante = pos["vencimiento"] - ahora
-            if 0 < tiempo_restante <= 3600:
-                horas = tiempo_restante / 3600
-                telegram_mensaje(f"⚠️ POSICIÓN PRÓXIMA A VENCER\nProducto: {pos['productId']}\nVence en {horas:.1f} horas.")
-            nuevas_activas.append(pos)
-    posiciones_activas = nuevas_activas
-    guardar_datos()
-
-def reporte_resumen():
-    global ultimo_resumen_horas
-    ahora = time.time()
-    if ahora - ultimo_resumen_horas >= 10800:  # 3 horas
-        if posiciones_activas:
-            texto = f"📊 RESUMEN DE POSICIONES ACTIVAS ({len(posiciones_activas)})\n"
-            for pos in posiciones_activas:
-                vence = datetime.fromtimestamp(pos["vencimiento"]).strftime("%H:%M UTC")
-                texto += f"🔹 {pos['productId']} | {pos['decision']} | {pos['monto']:.0f} USDT | vence {vence}\n"
-            telegram_mensaje(texto)
-        else:
+    if ahora - ultimo_resumen >= 10800:  # 3 horas
+        posiciones = obtener_posiciones_activas()
+        if not posiciones:
             telegram_mensaje("📊 No hay posiciones activas en este momento.")
-        ultimo_resumen_horas = ahora
+        else:
+            texto = f"📊 RESUMEN DE POSICIONES ACTIVAS ({len(posiciones)})\n"
+            for pos in posiciones:
+                venc = datetime.fromtimestamp(pos["expireTime"] / 1000).strftime("%H:%M UTC")
+                texto += f"🔹 {pos['productId']} | {pos['amount']:.0f} {pos['coin']} | vence {venc}\n"
+                # Avisar si falta 1 hora o menos
+                tiempo_restante = (pos["expireTime"] / 1000) - ahora
+                if 0 < tiempo_restante <= 3600:
+                    telegram_mensaje(f"⚠️ POSICIÓN PRÓXIMA A VENCER\nProducto: {pos['productId']}\nVence en {tiempo_restante/60:.0f} minutos.")
+            telegram_mensaje(texto)
+        ultimo_resumen = ahora
 
-# ================= CICLO PRINCIPAL CADA HORA =================
+# ================= CICLO HORARIO =================
 def ciclo_horario():
     logger.info("--- Ciclo horario ---")
-    # 1. Verificar vencimientos y reportar
-    verificar_vencimientos()
-    reporte_resumen()
+    # Reporte cada 3 horas
+    reporte_posiciones()
     
-    # 2. Obtener saldo disponible
+    # Obtener saldo disponible
     saldo = obtener_saldo_total_disponible()
     if saldo < MIN_INVEST_USDT:
         logger.info(f"Saldo insuficiente ({saldo:.2f} USDT). No se invierte ahora.")
         return
     
-    # 3. Para cada símbolo con decisión válida, intentar invertir
+    # Por cada símbolo, si hay decisión, invertir
     for symbol in SYMBOLS:
         base = symbol.replace("USDT", "")
         decision = decision_diaria.get(base)
         if not decision or decision == "Hold":
             continue
         
-        # Obtener la mejor oferta actual para esa dirección
         oferta = obtener_mejor_oferta(base, decision)
         if not oferta:
             logger.warning(f"No hay oferta para {base} con dirección {decision}")
@@ -547,16 +509,21 @@ def ciclo_horario():
         if not quote:
             continue
         
-        # Calcular monto a invertir (todo el saldo disponible, pero respetando máximos)
         monto = min(saldo, oferta["maxAmount"], quote["maxInvestmentAmount"])
         if monto < MIN_INVEST_USDT:
             continue
         
-        # Intentar suscripción
         exito, order_id = suscribir_dual_asset(oferta["productId"], monto, decision, {**quote, "apy": oferta["apy"]})
         if exito:
-            agregar_posicion(oferta["productId"], monto, decision, order_id, {"apy": oferta["apy"]})
-            saldo -= monto  # Restamos del saldo disponible para no duplicar en el mismo ciclo
+            telegram_mensaje(
+                f"🟢 NUEVA INVERSIÓN DUAL ASSET\n"
+                f"Producto: {oferta['productId']}\n"
+                f"Dirección: {decision}\n"
+                f"Monto: {monto:.2f} USDT\n"
+                f"APY: {oferta['apy']}%\n"
+                f"Vence en 24 horas."
+            )
+            saldo -= monto
             if saldo < MIN_INVEST_USDT:
                 break
         else:
@@ -575,26 +542,25 @@ def keep_alive():
 
 # ================= MAIN =================
 def main():
-    cargar_datos()
-    logger.info("🚀 Bot Dual Asset Avanzado iniciado")
-    telegram_mensaje("🚀 Bot Dual Asset Avanzado activo. Gestión cada hora y reportes cada 3h.")
-    
+    logger.info("🚀 Bot Dual Asset Avanzado (sin persistencia) iniciado")
+    telegram_mensaje("🚀 Bot Dual Asset activo - Sin persistencia, revisa cada hora saldo y suscribe.")
+
     start_websocket()
     keep_alive()
     time.sleep(5)  # esperar WebSocket
-    
-    # Programar análisis diario a las 07:00 UTC
+
+    # Programar análisis diario
     schedule.every().day.at(HORA_ANALISIS).do(ejecutar_analisis_diario)
-    # Programar ciclo cada 1 hora
+    # Programar ciclo cada hora
     schedule.every(1).hours.do(ciclo_horario)
-    
-    # Ejecutar análisis inmediato si es primera vez
+
+    # Si es primera vez y no hay decisión, ejecutar análisis inmediato
     if not decision_diaria:
         ejecutar_analisis_diario()
     else:
         # Si ya hay decisión, ejecutar ciclo horario inmediatamente
         ciclo_horario()
-    
+
     while True:
         schedule.run_pending()
         time.sleep(60)
