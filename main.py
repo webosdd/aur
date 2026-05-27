@@ -44,12 +44,14 @@ if not BYBIT_API_KEY or not BYBIT_API_SECRET:
 MODELO_VISION = "google/gemini-3.1-flash-image-preview"
 SYMBOLS = ["BTCUSDT", "SOLUSDT"]
 MIN_INVEST_USDT = 20
-MIN_APY_PERCENT = 180.0
-HORA_ANALISIS = "07:00"
+MIN_APY_PERCENT = 180.0          # APY mínimo para invertir
+HORA_ANALISIS = "07:00"          # UTC
 
-# IDs dinámicos: se obtendrán al inicio y se actualizarán cada hora
-product_ids = {"BTC": None, "SOL": None}
-product_ids_last_update = 0
+# IDs reales de productos Dual Asset (obtenidos de la web)
+PRODUCT_IDS = {
+    "BTC": "134685",
+    "SOL": "134711"
+}
 
 client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY,
                 default_headers={"HTTP-Referer": "https://railway.app", "X-Title": "Dual Asset Bot"})
@@ -60,6 +62,7 @@ decision_diaria = {}
 ultimo_resumen = 0
 ws_offers = {}
 ws_connected = False
+ultima_inversion_time = 0
 
 # ================= TELEGRAM =================
 def telegram_mensaje(texto):
@@ -150,37 +153,6 @@ def obtener_saldo_total_disponible():
         logger.error(f"Error procesando activos: {e}")
     logger.info(f"Saldo total disponible: {total:.2f} USDT")
     return total
-
-# ================= OBTENER IDs DE PRODUCTO DINÁMICAMENTE =================
-def actualizar_product_ids():
-    global product_ids, product_ids_last_update
-    ahora = time.time()
-    # Actualizar cada 30 minutos si no se tienen, o cada hora
-    if product_ids["BTC"] and (ahora - product_ids_last_update) < 3600:
-        return
-    try:
-        url = "https://api.bybit.com/v5/earn/advance/product?category=DoubleWin"
-        resp = requests.get(url, timeout=10)
-        data = resp.json()
-        if data.get("retCode") != 0:
-            logger.error(f"Error obteniendo productos: {data}")
-            return
-        nuevos_ids = {"BTC": None, "SOL": None}
-        for prod in data["result"]["list"]:
-            symbol = prod.get("symbol", "")
-            if symbol == "BTCUSDT" and not nuevos_ids["BTC"]:
-                nuevos_ids["BTC"] = str(prod.get("productId"))
-            elif symbol == "SOLUSDT" and not nuevos_ids["SOL"]:
-                nuevos_ids["SOL"] = str(prod.get("productId"))
-        if nuevos_ids["BTC"] and nuevos_ids["SOL"]:
-            product_ids = nuevos_ids
-            product_ids_last_update = ahora
-            logger.info(f"IDs actualizados: BTC={product_ids['BTC']}, SOL={product_ids['SOL']}")
-            telegram_mensaje(f"🆔 IDs de productos actualizados: BTC={product_ids['BTC']}, SOL={product_ids['SOL']}")
-        else:
-            logger.warning(f"No se encontraron ambos productos. Obtenidos: {nuevos_ids}")
-    except Exception as e:
-        logger.error(f"Excepción actualizando productos: {e}")
 
 # ================= VELAS DIARIAS Y GRÁFICOS =================
 def obtener_velas_diarias(symbol, limit=100):
@@ -346,7 +318,7 @@ def ejecutar_analisis_diario():
             decision_diaria[base] = None
     telegram_mensaje(f"📅 Decisión del día: BTC={decision_diaria.get('BTC')}, SOL={decision_diaria.get('SOL')}")
 
-# ================= WEBSOCKET =================
+# ================= WEBSOCKET DE OFERTAS =================
 def on_message(ws, message):
     global ws_offers
     try:
@@ -354,8 +326,7 @@ def on_message(ws, message):
         if "data" in data:
             for product in data["data"]:
                 pid = str(product.get("p"))
-                # Solo almacenar si es uno de nuestros IDs actuales
-                if pid in [product_ids["BTC"], product_ids["SOL"]]:
+                if pid in [PRODUCT_IDS["BTC"], PRODUCT_IDS["SOL"]]:
                     ws_offers[pid] = product
                     for key in ["b", "s"]:
                         if key in product:
@@ -390,17 +361,20 @@ def start_websocket():
     wst.start()
     return ws
 
-# ================= OBTENER OFERTA =================
+# ================= OBTENER OFERTA Y COTIZACIÓN (ENDPOINTS CORRECTOS) =================
 def obtener_mejor_oferta(symbol_base, decision):
+    """Obtiene la mejor oferta desde WebSocket (filtrada por APY)."""
     target_key = "b" if decision == "Buy Low" else "s"
-    pid = product_ids.get(symbol_base)
-    if not pid:
-        logger.warning(f"No hay productId para {symbol_base}")
+    product_id = PRODUCT_IDS.get(symbol_base)
+    if not product_id:
+        logger.error(f"No hay productId para {symbol_base}")
         return None
-    product = ws_offers.get(pid)
+    
+    product = ws_offers.get(product_id)
     if not product or target_key not in product:
-        logger.warning(f"No hay oferta en WebSocket para {symbol_base} ({pid})")
+        logger.warning(f"No hay oferta en WebSocket para {symbol_base}")
         return None
+    
     mejor = None
     mejor_apy = -1
     for quote in product[target_key]:
@@ -408,7 +382,7 @@ def obtener_mejor_oferta(symbol_base, decision):
         if apy >= MIN_APY_PERCENT and apy > mejor_apy:
             mejor_apy = apy
             mejor = {
-                "productId": pid,
+                "productId": product_id,
                 "apy": apy,
                 "maxAmount": float(quote.get("m", 0)),
                 "selectPrice": float(quote.get("s", 0)),
@@ -420,11 +394,12 @@ def obtener_mejor_oferta(symbol_base, decision):
         logger.warning(f"No hay oferta con APY >= {MIN_APY_PERCENT}% para {symbol_base}")
     return mejor
 
-def obtener_quote_fijo(product_id):
+def obtener_quote_fijo_dual_asset(product_id):
+    """Obtiene leverage y currentPrice del producto Dual Asset."""
     try:
         timestamp = str(int(time.time() * 1000))
         recv_window = "5000"
-        query = f"category=DoubleWin&productId={product_id}"
+        query = f"productId={product_id}"
         payload = timestamp + BYBIT_API_KEY + recv_window + query
         signature = hmac.new(BYBIT_API_SECRET.encode('utf-8'), payload.encode('utf-8'), hashlib.sha256).hexdigest()
         headers = {
@@ -433,7 +408,7 @@ def obtener_quote_fijo(product_id):
             "X-BAPI-RECV-WINDOW": recv_window,
             "X-BAPI-SIGN": signature,
         }
-        url = f"https://api.bybit.com/v5/earn/advance/product-extra-info?{query}"
+        url = f"https://api.bybit.com/v5/earn/dual-asset/product-extra-info?{query}"
         resp = requests.get(url, headers=headers, timeout=10)
         data = resp.json()
         if data.get("retCode") == 0:
@@ -443,24 +418,25 @@ def obtener_quote_fijo(product_id):
                 "currentPrice": float(data["result"]["currentPrice"])
             }
         else:
-            logger.error(f"Error en quote {product_id}: {data}")
+            logger.error(f"Error en quote para {product_id}: {data}")
             return None
     except Exception as e:
         logger.error(f"Excepción quote: {e}")
         return None
 
 def suscribir_dual_asset(product_id, amount_usdt, decision, quote_info):
+    """Suscribe a producto Dual Asset usando el endpoint correcto."""
     order_link_id = f"duplo_{int(time.time())}"
-    coin = "USDT" if decision == "Buy Low" else "BTC" if "BTC" in product_id else "SOL"
+    # Determinar el side (Buy o Sell) según decision: Buy Low -> "Buy", Sell High -> "Sell"
+    side = "Buy" if decision == "Buy Low" else "Sell"
     body = {
-        "category": "DoubleWin",
         "productId": product_id,
+        "side": side,
         "orderType": "Stake",
         "amount": str(amount_usdt),
         "accountType": "UNIFIED",
-        "coin": coin,
         "orderLinkId": order_link_id,
-        "doubleWinStakeExtra": {
+        "dualAssetStakeExtra": {
             "leverage": quote_info["leverage"],
             "initialPrice": str(quote_info["currentPrice"])
         }
@@ -478,7 +454,7 @@ def suscribir_dual_asset(product_id, amount_usdt, decision, quote_info):
             "X-BAPI-SIGN": signature,
             "Content-Type": "application/json"
         }
-        url = "https://api.bybit.com/v5/earn/advance/place-order"
+        url = "https://api.bybit.com/v5/earn/dual-asset/place-order"
         resp = requests.post(url, headers=headers, data=body_json, timeout=15)
         result = resp.json()
         if result.get("retCode") == 0:
@@ -492,12 +468,12 @@ def suscribir_dual_asset(product_id, amount_usdt, decision, quote_info):
         logger.error(f"Excepción suscripción: {e}")
         return False, None
 
-# ================= POSICIONES ACTIVAS =================
+# ================= POSICIONES ACTIVAS Y REPORTES =================
 def obtener_posiciones_activas():
     try:
         timestamp = str(int(time.time() * 1000))
         recv_window = "5000"
-        query = "category=DoubleWin"
+        query = ""
         payload = timestamp + BYBIT_API_KEY + recv_window + query
         signature = hmac.new(BYBIT_API_SECRET.encode('utf-8'), payload.encode('utf-8'), hashlib.sha256).hexdigest()
         headers = {
@@ -506,8 +482,8 @@ def obtener_posiciones_activas():
             "X-BAPI-RECV-WINDOW": recv_window,
             "X-BAPI-SIGN": signature,
         }
-        url = "https://api.bybit.com/v5/earn/advance/position"
-        resp = requests.get(url, headers=headers, params={"category": "DoubleWin"}, timeout=10)
+        url = "https://api.bybit.com/v5/earn/dual-asset/position"
+        resp = requests.get(url, headers=headers, timeout=10)
         data = resp.json()
         if data.get("retCode") != 0:
             return []
@@ -546,17 +522,12 @@ def reporte_posiciones():
 
 # ================= CICLO HORARIO =================
 def ciclo_horario():
+    global ultima_inversion_time
     try:
         logger.info("🕒 EJECUTANDO CICLO HORARIO")
         telegram_mensaje("🔄 Ciclo horario: revisando saldo y ofertas...")
         
-        # Actualizar IDs de productos periódicamente
-        actualizar_product_ids()
-        
-        # Reporte de posiciones cada 3 horas
         reporte_posiciones()
-        
-        # Obtener saldo
         saldo = obtener_saldo_total_disponible()
         telegram_mensaje(f"💰 Saldo disponible: {saldo:.2f} USDT")
         
@@ -565,33 +536,26 @@ def ciclo_horario():
             telegram_mensaje(f"⚠️ Saldo insuficiente. Mínimo: {MIN_INVEST_USDT} USDT")
             return
         
-        # Invertir para cada símbolo
         for symbol in SYMBOLS:
             base = symbol.replace("USDT", "")
             decision = decision_diaria.get(base)
             if not decision or decision == "Hold":
-                logger.info(f"{base}: decisión Hold, no se invierte")
-                continue
-            
-            # Verificar que tengamos productId
-            pid = product_ids.get(base)
-            if not pid:
-                logger.warning(f"No hay productId para {base}")
+                logger.info(f"{base}: decisión Hold")
                 continue
             
             oferta = obtener_mejor_oferta(base, decision)
             if not oferta:
                 logger.warning(f"No hay oferta válida para {base}")
-                telegram_mensaje(f"⚠️ No se encontró oferta para {base} con APY >= {MIN_APY_PERCENT}%")
                 continue
             
-            quote = obtener_quote_fijo(oferta["productId"])
+            quote = obtener_quote_fijo_dual_asset(oferta["productId"])
             if not quote:
+                logger.error(f"No se pudo obtener quote para {oferta['productId']}")
                 continue
             
             monto = min(saldo, oferta["maxAmount"], quote["maxInvestmentAmount"])
             if monto < MIN_INVEST_USDT:
-                logger.info(f"Monto {monto} menor al mínimo {MIN_INVEST_USDT}")
+                logger.info(f"Monto {monto} menor al mínimo")
                 continue
             
             logger.info(f"INVIRTIENDO: {base} - {decision} - {monto} USDT - APY {oferta['apy']}%")
@@ -606,6 +570,7 @@ def ciclo_horario():
                     f"Vence en 24h."
                 )
                 saldo -= monto
+                ultima_inversion_time = time.time()
                 if saldo < MIN_INVEST_USDT:
                     break
             else:
@@ -628,18 +593,13 @@ def keep_alive():
 
 # ================= MAIN =================
 def main():
-    logger.info("🚀 Bot Dual Asset con detección dinámica de productos iniciado")
-    telegram_mensaje("🚀 Bot Dual Asset activo - APY mínimo 180%, IDs dinámicos")
-    
-    # Obtener IDs iniciales
-    actualizar_product_ids()
+    logger.info("🚀 Bot Dual Asset (endpoints correctos) iniciado")
+    telegram_mensaje("🚀 Bot Dual Asset activo - APY mínimo 180%, revisión cada hora")
     
     start_websocket()
     keep_alive()
     time.sleep(5)
     
-    # Programar actualización periódica de IDs (cada 30 minutos)
-    schedule.every(30).minutes.do(actualizar_product_ids)
     schedule.every().day.at(HORA_ANALISIS).do(ejecutar_analisis_diario)
     schedule.every(1).hours.do(ciclo_horario)
     
