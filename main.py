@@ -48,6 +48,14 @@ MAX_INVEST_PERCENT = 0.5                  # Invertir máximo el 50% del saldo
 MIN_INVEST_USDT = 10                      # Monto mínimo para invertir
 HORA_EJECUCION = "07:00"                  # Hora UTC del análisis diario
 
+# ========== IDs MANUALES de respaldo (solo si la API falla) ==========
+# Si quieres, puedes dejarlos vacíos y confiar solo en la API.
+MANUAL_PRODUCT_IDS = {
+    "BTC": [],   # Ejemplo: ["20001"]
+    "SOL": []
+}
+# ====================================================================
+
 # Variables globales
 client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY,
                 default_headers={"HTTP-Referer": "https://railway.app", "X-Title": "Dual Asset Bot"})
@@ -60,9 +68,6 @@ fecha_decision = None
 # WebSocket de ofertas
 ws_offers = {}
 ws_connected = False
-product_id_cache = {}       # cache: {"BTC": ["123", "456"], "SOL": [...]}
-cache_timestamp = 0
-CACHE_DURATION = 300        # 5 minutos
 
 # ================= TELEGRAM =================
 def telegram_mensaje(texto):
@@ -87,12 +92,11 @@ def telegram_enviar_imagen(ruta, caption=""):
 
 # ================= OBTENER VELAS DIARIAS =================
 def obtener_velas_diarias(symbol, limit=100):
-    """Velas de 1 día (intervalo 'D') para análisis de tendencia."""
     try:
         resp = bybit_session.get_kline(category="spot", symbol=symbol, interval="D", limit=limit)
         if resp.get("retCode") != 0:
             return pd.DataFrame()
-        lista = resp["result"]["list"][::-1]  # orden cronológico
+        lista = resp["result"]["list"][::-1]
         df = pd.DataFrame(lista, columns=['time','open','high','low','close','volume','turnover'])
         for col in ['open','high','low','close','volume']:
             df[col] = df[col].astype(float)
@@ -108,20 +112,17 @@ def calcular_indicadores_diarios(df):
         return df
     df['ema20'] = df['close'].ewm(span=20).mean()
     df['ema50'] = df['close'].ewm(span=50).mean()
-    # RSI
     delta = df['close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / loss
     df['rsi'] = 100 - (100 / (1 + rs))
-    # MACD
     exp12 = df['close'].ewm(span=12, adjust=False).mean()
     exp26 = df['close'].ewm(span=26, adjust=False).mean()
     df['macd'] = exp12 - exp26
     df['signal'] = df['macd'].ewm(span=9, adjust=False).mean()
     df['histogram'] = df['macd'] - df['signal']
-    # Tendencia por regresión lineal
-    y = df['close'].values[-60:]  # últimos 60 días
+    y = df['close'].values[-60:]
     slope, intercept, _, _, _ = linregress(np.arange(len(y)), y)
     df['trend_slope'] = slope
     return df.dropna()
@@ -154,13 +155,11 @@ def generar_grafico_diario(df, symbol, soporte, resistencia, slope, intercept):
         x_trend = np.array([0, len(df_plot)-1])
         y_trend = intercept + slope * x_trend
         ax.plot(x_trend, y_trend, color='white', linestyle='-.', lw=2, label='Tendencia', alpha=0.7)
-    # RSI
     ax2 = ax.twinx()
     ax2.plot(x, df_plot['rsi'], color='orange', lw=1.5, alpha=0.7, label='RSI')
     ax2.axhline(70, color='red', linestyle='--', alpha=0.5)
     ax2.axhline(30, color='green', linestyle='--', alpha=0.5)
     ax2.set_ylabel('RSI', color='orange')
-    # MACD
     ax3 = ax.twinx()
     ax3.spines['right'].set_position(('outward', 60))
     ax3.plot(x, df_plot['macd'], color='blue', lw=1, label='MACD')
@@ -215,7 +214,6 @@ def analizar_con_gemini(img, symbol):
             timeout=60
         )
         contenido = response.choices[0].message.content
-        # Extraer JSON
         inicio = contenido.find('{')
         fin = contenido.rfind('}') + 1
         if inicio != -1 and fin != 0:
@@ -226,53 +224,42 @@ def analizar_con_gemini(img, symbol):
         logger.error(f"Error IA {symbol}: {e}")
         return "Hold", f"Error: {e}", "", 0
 
-# ================= OBTENER LISTA DE PRODUCTOS POR ACTIVO (API REST) =================
-def obtener_lista_productos_por_activo(symbol_base):
-    """Obtiene los productId de DoubleWin para un activo base usando el endpoint REST."""
-    global product_id_cache, cache_timestamp
-    ahora = time.time()
-    
-    # Si el cache no ha expirado y ya tenemos la lista para este símbolo, la devolvemos
-    if ahora - cache_timestamp < CACHE_DURATION:
-        if symbol_base in product_id_cache:
-            return product_id_cache[symbol_base]
-    
+# ================= OBTENER IDs DE PRODUCTO DESDE API PÚBLICA =================
+def obtener_product_ids_desde_api(symbol_base):
+    """Usa el endpoint público /v5/earn/advance/product para obtener los productId reales."""
     try:
-        timestamp = str(int(time.time() * 1000))
-        recv_window = "5000"
-        query = "category=DoubleWin"
-        payload = timestamp + BYBIT_API_KEY + recv_window + query
-        signature = hmac.new(BYBIT_API_SECRET.encode('utf-8'), payload.encode('utf-8'), hashlib.sha256).hexdigest()
-        headers = {
-            "X-BAPI-API-KEY": BYBIT_API_KEY,
-            "X-BAPI-TIMESTAMP": timestamp,
-            "X-BAPI-RECV-WINDOW": recv_window,
-            "X-BAPI-SIGN": signature,
+        url = "https://api.bybit.com/v5/earn/advance/product"
+        params = {
+            "category": "DoubleWin",
+            "coin": symbol_base.upper()
         }
-        url = f"https://api.bybit.com/v5/earn/advance/product-info?{query}"
-        resp = requests.get(url, headers=headers, timeout=10)
+        resp = requests.get(url, params=params, timeout=10)
         data = resp.json()
-        
         if data.get("retCode") != 0:
-            logger.error(f"Error obteniendo productos: {data}")
+            logger.error(f"Error API productos: {data}")
             return []
-        
-        # Filtrar productos que correspondan al símbolo base
-        productos = []
-        for prod in data.get("result", {}).get("list", []):
-            # El campo "symbol" viene como "BTCUSDT" o "SOLUSDT"
-            if prod.get("symbol") == f"{symbol_base}USDT":
-                productos.append(prod.get("productId"))
-        
-        # Actualizar cache
-        product_id_cache[symbol_base] = productos
-        cache_timestamp = ahora
-        
-        logger.info(f"IDs de producto para {symbol_base}: {productos}")
-        return productos
+        product_ids = []
+        for product in data.get("result", {}).get("list", []):
+            pid = product.get("productId")
+            if pid:
+                product_ids.append(str(pid))
+        logger.info(f"IDs obtenidos para {symbol_base}: {product_ids}")
+        return product_ids
     except Exception as e:
-        logger.error(f"Excepción obteniendo productos: {e}")
+        logger.error(f"Excepción obteniendo productos desde API: {e}")
         return []
+
+def obtener_product_ids_para_activo(symbol_base):
+    """Obtiene IDs: primero desde API pública, si falla usa manuales."""
+    ids_api = obtener_product_ids_desde_api(symbol_base)
+    if ids_api:
+        return ids_api
+    # Fallback a manuales
+    if symbol_base in MANUAL_PRODUCT_IDS and MANUAL_PRODUCT_IDS[symbol_base]:
+        logger.warning(f"Usando IDs manuales para {symbol_base}: {MANUAL_PRODUCT_IDS[symbol_base]}")
+        return MANUAL_PRODUCT_IDS[symbol_base]
+    logger.error(f"No se pudieron obtener IDs para {symbol_base}")
+    return []
 
 # ================= WEBSOCKET DE OFERTAS (DOUBLEWIN) =================
 def on_message(ws, message):
@@ -281,7 +268,8 @@ def on_message(ws, message):
         data = json.loads(message)
         if "data" in data:
             for product in data["data"]:
-                ws_offers[str(product["p"])] = product  # Aseguramos que la clave sea string
+                pid = str(product["p"])
+                ws_offers[pid] = product
     except Exception as e:
         logger.error(f"Error procesando mensaje WS: {e}")
 
@@ -297,7 +285,6 @@ def on_close(ws, close_status_code, close_msg):
 
 def on_open(ws):
     global ws_connected
-    # Suscribirse al topic correcto para DoubleWin
     ws.send(json.dumps({"op": "subscribe", "args": ["earn.doublewin.offers"]}))
     ws_connected = True
     logger.info("WebSocket DoubleWin conectado y suscrito")
@@ -312,28 +299,23 @@ def start_websocket():
 
 # ================= OBTENER MEJOR OFERTA =================
 def obtener_mejor_oferta(symbol_base, decision):
-    """Busca en ws_offers la oferta con mayor APY para la dirección indicada."""
     target_key = "b" if decision == "Buy Low" else "s"
-    
-    # Obtener lista de productId válidos para este activo
-    product_ids_validos = obtener_lista_productos_por_activo(symbol_base)
+    product_ids_validos = obtener_product_ids_para_activo(symbol_base)
     if not product_ids_validos:
-        logger.warning(f"No se encontraron IDs de producto para {symbol_base}")
+        logger.warning(f"No hay IDs para {symbol_base}")
         return None
-
     mejores = []
-    for pid, product in ws_offers.items():
-        # Verificar que el productId esté en la lista de válidos
-        if pid not in product_ids_validos:
+    for pid in product_ids_validos:
+        product = ws_offers.get(pid)
+        if not product:
             continue
-        
         if target_key in product:
             for quote in product[target_key]:
                 apy = int(quote.get("a", 0)) / 1e8
                 max_amount = float(quote.get("m", 0))
                 select_price = float(quote.get("s", 0))
                 expire_time = int(quote.get("x", 0))
-                if expire_time > int(time.time()) * 1000:  # no expirada
+                if expire_time > int(time.time()) * 1000:
                     mejores.append({
                         "productId": pid,
                         "apy": apy,
@@ -341,14 +323,12 @@ def obtener_mejor_oferta(symbol_base, decision):
                         "selectPrice": select_price,
                         "expireTime": expire_time
                     })
-    
     if not mejores:
         return None
     return max(mejores, key=lambda x: x["apy"])
 
 # ================= OBTENER QUOTE FIJO =================
 def obtener_quote_fijo(product_id):
-    """GET /v5/earn/advance/product-extra-info?category=DoubleWin&productId=..."""
     try:
         timestamp = str(int(time.time() * 1000))
         recv_window = "5000"
@@ -381,11 +361,7 @@ def obtener_quote_fijo(product_id):
 def suscribir_dual_asset(product_id, amount_usdt, decision, quote_info, order_link_id=None):
     if order_link_id is None:
         order_link_id = f"duplo_{int(time.time())}"
-    # La moneda base para la suscripción:
-    # - Buy Low: se invierte USDT
-    # - Sell High: se invierte la moneda base (BTC, SOL)
-    coin = "USDT" if decision == "Buy Low" else "BTC"  # Ajustar según producto real
-    
+    coin = "USDT" if decision == "Buy Low" else "BTC"
     body = {
         "category": "DoubleWin",
         "productId": product_id,
@@ -440,7 +416,6 @@ def obtener_saldo_usdt():
         return 0.0
 
 def verificar_liquidaciones():
-    """Revisa posiciones vencidas y convierte a USDT si es necesario."""
     try:
         timestamp = str(int(time.time() * 1000))
         recv_window = "5000"
@@ -484,10 +459,8 @@ def convertir_a_usdt(coin, amount):
 def ejecutar_estrategia():
     global decision_guardada, fecha_decision
     hoy = datetime.now().date()
-    # Si ya se ejecutó hoy, no repetir IA
     if fecha_decision == hoy and decision_guardada:
         logger.info("Ya se ejecutó la IA hoy. Usando decisión guardada.")
-        # Usar la decisión guardada para intentar suscribir (sin IA)
         for symbol in SYMBOLS:
             base = symbol.replace("USDT", "")
             if base in decision_guardada:
@@ -522,7 +495,7 @@ def ejecutar_estrategia():
         df = calcular_indicadores_diarios(df)
         soporte, resistencia = detectar_soportes_resistencias_diario(df)
         slope = df['trend_slope'].iloc[-1] if 'trend_slope' in df else 0
-        intercept = 0  # no necesario para el gráfico
+        intercept = 0
         img = generar_grafico_diario(df, symbol, soporte, resistencia, slope, intercept)
         if img:
             img_path = f"/tmp/duplo_{symbol}.png"
@@ -536,9 +509,7 @@ def ejecutar_estrategia():
         telegram_mensaje(f"🤖 {symbol}: {decision} (confianza {confianza}%)\n📝 {razon}")
 
         if decision != "Hold" and confianza >= 60:
-            # Guardar decisión para el resto del día
             decision_guardada[base] = decision
-            # Intentar suscribir ahora
             monto = saldo_usdt * MAX_INVEST_PERCENT
             if monto < MIN_INVEST_USDT:
                 monto = MIN_INVEST_USDT
@@ -577,13 +548,9 @@ def main():
     telegram_mensaje("🚀 Bot Dual Asset activo - Estrategia diaria con IA única")
     start_websocket()
     keep_alive()
-    # Esperar a que WebSocket tenga datos
     time.sleep(5)
-    # Ejecutar diariamente a la hora configurada
     schedule.every().day.at(HORA_EJECUCION).do(ejecutar_estrategia)
-    # También verificar liquidaciones cada 2 horas
     schedule.every(2).hours.do(verificar_liquidaciones)
-    # Ejecutar una vez al inicio
     ejecutar_estrategia()
     while True:
         schedule.run_pending()
