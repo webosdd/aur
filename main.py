@@ -6,7 +6,7 @@ import requests
 import numpy as np
 import pandas as pd
 from scipy.stats import linregress
-from datetime import datetime
+from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
 import matplotlib
 matplotlib.use('Agg')
@@ -44,13 +44,12 @@ if not BYBIT_API_KEY or not BYBIT_API_SECRET:
 MODELO_VISION = "google/gemini-3.1-flash-image-preview"
 SYMBOLS = ["BTCUSDT", "SOLUSDT"]
 MIN_INVEST_USDT = 20
-MIN_APY_PERCENT = 180.0          # APY mínimo para invertir (180% o más)
-HORA_ANALISIS = "07:00"          # UTC
+MIN_APY_PERCENT = 180.0
+HORA_ANALISIS = "07:00"
 
-PRODUCT_IDS = {
-    "BTC": "134685",
-    "SOL": "134711"
-}
+# IDs dinámicos: se obtendrán al inicio y se actualizarán cada hora
+product_ids = {"BTC": None, "SOL": None}
+product_ids_last_update = 0
 
 client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY,
                 default_headers={"HTTP-Referer": "https://railway.app", "X-Title": "Dual Asset Bot"})
@@ -61,7 +60,6 @@ decision_diaria = {}
 ultimo_resumen = 0
 ws_offers = {}
 ws_connected = False
-ultima_inversion_time = 0
 
 # ================= TELEGRAM =================
 def telegram_mensaje(texto):
@@ -100,7 +98,6 @@ def obtener_saldo_usdt_unificado():
         return 0.0
 
 def convertir_activo_a_usdt(coin, amount):
-    """Convierte un activo a USDT usando el par spot coin/USDT."""
     try:
         symbol = f"{coin}USDT"
         tickers = bybit_session.get_tickers(category="spot", symbol=symbol)
@@ -153,6 +150,37 @@ def obtener_saldo_total_disponible():
         logger.error(f"Error procesando activos: {e}")
     logger.info(f"Saldo total disponible: {total:.2f} USDT")
     return total
+
+# ================= OBTENER IDs DE PRODUCTO DINÁMICAMENTE =================
+def actualizar_product_ids():
+    global product_ids, product_ids_last_update
+    ahora = time.time()
+    # Actualizar cada 30 minutos si no se tienen, o cada hora
+    if product_ids["BTC"] and (ahora - product_ids_last_update) < 3600:
+        return
+    try:
+        url = "https://api.bybit.com/v5/earn/advance/product?category=DoubleWin"
+        resp = requests.get(url, timeout=10)
+        data = resp.json()
+        if data.get("retCode") != 0:
+            logger.error(f"Error obteniendo productos: {data}")
+            return
+        nuevos_ids = {"BTC": None, "SOL": None}
+        for prod in data["result"]["list"]:
+            symbol = prod.get("symbol", "")
+            if symbol == "BTCUSDT" and not nuevos_ids["BTC"]:
+                nuevos_ids["BTC"] = str(prod.get("productId"))
+            elif symbol == "SOLUSDT" and not nuevos_ids["SOL"]:
+                nuevos_ids["SOL"] = str(prod.get("productId"))
+        if nuevos_ids["BTC"] and nuevos_ids["SOL"]:
+            product_ids = nuevos_ids
+            product_ids_last_update = ahora
+            logger.info(f"IDs actualizados: BTC={product_ids['BTC']}, SOL={product_ids['SOL']}")
+            telegram_mensaje(f"🆔 IDs de productos actualizados: BTC={product_ids['BTC']}, SOL={product_ids['SOL']}")
+        else:
+            logger.warning(f"No se encontraron ambos productos. Obtenidos: {nuevos_ids}")
+    except Exception as e:
+        logger.error(f"Excepción actualizando productos: {e}")
 
 # ================= VELAS DIARIAS Y GRÁFICOS =================
 def obtener_velas_diarias(symbol, limit=100):
@@ -318,7 +346,7 @@ def ejecutar_analisis_diario():
             decision_diaria[base] = None
     telegram_mensaje(f"📅 Decisión del día: BTC={decision_diaria.get('BTC')}, SOL={decision_diaria.get('SOL')}")
 
-# ================= WEBSOCKET DE OFERTAS =================
+# ================= WEBSOCKET =================
 def on_message(ws, message):
     global ws_offers
     try:
@@ -326,9 +354,9 @@ def on_message(ws, message):
         if "data" in data:
             for product in data["data"]:
                 pid = str(product.get("p"))
-                if pid in [PRODUCT_IDS["BTC"], PRODUCT_IDS["SOL"]]:
+                # Solo almacenar si es uno de nuestros IDs actuales
+                if pid in [product_ids["BTC"], product_ids["SOL"]]:
                     ws_offers[pid] = product
-                    # Log de APY para depuración
                     for key in ["b", "s"]:
                         if key in product:
                             for quote in product[key]:
@@ -362,52 +390,35 @@ def start_websocket():
     wst.start()
     return ws
 
-# ================= OBTENER OFERTA (WebSocket + fallback REST) =================
+# ================= OBTENER OFERTA =================
 def obtener_mejor_oferta(symbol_base, decision):
-    """Primero intenta con WebSocket, si falla usa API REST directa."""
     target_key = "b" if decision == "Buy Low" else "s"
-    product_id = PRODUCT_IDS.get(symbol_base)
-    if not product_id:
+    pid = product_ids.get(symbol_base)
+    if not pid:
+        logger.warning(f"No hay productId para {symbol_base}")
         return None
-    
-    # Intento con WebSocket
-    product = ws_offers.get(product_id)
-    if product and target_key in product:
-        mejor = None
-        mejor_apy = -1
-        for quote in product[target_key]:
-            apy = int(quote.get("a", 0)) / 1e8
-            if apy >= MIN_APY_PERCENT and apy > mejor_apy:
-                mejor_apy = apy
-                mejor = {
-                    "productId": product_id,
-                    "apy": apy,
-                    "maxAmount": float(quote.get("m", 0)),
-                    "selectPrice": float(quote.get("s", 0)),
-                    "expireTime": int(quote.get("x", 0))
-                }
-        if mejor:
-            logger.info(f"Oferta por WebSocket para {symbol_base}: APY {mejor['apy']}%")
-            return mejor
-        else:
-            logger.warning(f"WebSocket no tiene oferta con APY >= {MIN_APY_PERCENT}% para {symbol_base}")
-    
-    # Fallback: obtener cotización directamente por REST y asumir APY mínimo válido
-    logger.info(f"Fallback a API REST para {symbol_base}")
-    quote = obtener_quote_fijo(product_id)
-    if not quote:
+    product = ws_offers.get(pid)
+    if not product or target_key not in product:
+        logger.warning(f"No hay oferta en WebSocket para {symbol_base} ({pid})")
         return None
-    # Si llegamos aquí, asumimos que el producto está disponible con APY alto (lo confirmaremos con un mensaje)
-    # Nota: la API REST no devuelve APY, pero asumimos que es >= MIN_APY_PERCENT porque tú lo ves en la app
-    oferta_fallback = {
-        "productId": product_id,
-        "apy": MIN_APY_PERCENT,  # asumimos el mínimo aceptable
-        "maxAmount": quote["maxInvestmentAmount"],
-        "selectPrice": quote["currentPrice"],
-        "expireTime": int((datetime.now() + timedelta(days=1)).timestamp() * 1000)
-    }
-    logger.info(f"Usando fallback REST para {symbol_base}: APY asumido {MIN_APY_PERCENT}%")
-    return oferta_fallback
+    mejor = None
+    mejor_apy = -1
+    for quote in product[target_key]:
+        apy = int(quote.get("a", 0)) / 1e8
+        if apy >= MIN_APY_PERCENT and apy > mejor_apy:
+            mejor_apy = apy
+            mejor = {
+                "productId": pid,
+                "apy": apy,
+                "maxAmount": float(quote.get("m", 0)),
+                "selectPrice": float(quote.get("s", 0)),
+                "expireTime": int(quote.get("x", 0))
+            }
+    if mejor:
+        logger.info(f"Oferta seleccionada para {symbol_base}: APY {mejor['apy']}%")
+    else:
+        logger.warning(f"No hay oferta con APY >= {MIN_APY_PERCENT}% para {symbol_base}")
+    return mejor
 
 def obtener_quote_fijo(product_id):
     try:
@@ -481,7 +492,7 @@ def suscribir_dual_asset(product_id, amount_usdt, decision, quote_info):
         logger.error(f"Excepción suscripción: {e}")
         return False, None
 
-# ================= POSICIONES ACTIVAS Y REPORTES =================
+# ================= POSICIONES ACTIVAS =================
 def obtener_posiciones_activas():
     try:
         timestamp = str(int(time.time() * 1000))
@@ -535,15 +546,17 @@ def reporte_posiciones():
 
 # ================= CICLO HORARIO =================
 def ciclo_horario():
-    global ultima_inversion_time
     try:
         logger.info("🕒 EJECUTANDO CICLO HORARIO")
         telegram_mensaje("🔄 Ciclo horario: revisando saldo y ofertas...")
         
+        # Actualizar IDs de productos periódicamente
+        actualizar_product_ids()
+        
         # Reporte de posiciones cada 3 horas
         reporte_posiciones()
         
-        # Obtener saldo total
+        # Obtener saldo
         saldo = obtener_saldo_total_disponible()
         telegram_mensaje(f"💰 Saldo disponible: {saldo:.2f} USDT")
         
@@ -552,7 +565,7 @@ def ciclo_horario():
             telegram_mensaje(f"⚠️ Saldo insuficiente. Mínimo: {MIN_INVEST_USDT} USDT")
             return
         
-        # Invertir para cada símbolo según decisión
+        # Invertir para cada símbolo
         for symbol in SYMBOLS:
             base = symbol.replace("USDT", "")
             decision = decision_diaria.get(base)
@@ -560,10 +573,15 @@ def ciclo_horario():
                 logger.info(f"{base}: decisión Hold, no se invierte")
                 continue
             
-            logger.info(f"Buscando oferta para {base} (APY mínimo {MIN_APY_PERCENT}%)")
+            # Verificar que tengamos productId
+            pid = product_ids.get(base)
+            if not pid:
+                logger.warning(f"No hay productId para {base}")
+                continue
+            
             oferta = obtener_mejor_oferta(base, decision)
             if not oferta:
-                logger.warning(f"No hay oferta para {base}")
+                logger.warning(f"No hay oferta válida para {base}")
                 telegram_mensaje(f"⚠️ No se encontró oferta para {base} con APY >= {MIN_APY_PERCENT}%")
                 continue
             
@@ -588,7 +606,6 @@ def ciclo_horario():
                     f"Vence en 24h."
                 )
                 saldo -= monto
-                ultima_inversion_time = time.time()
                 if saldo < MIN_INVEST_USDT:
                     break
             else:
@@ -611,28 +628,28 @@ def keep_alive():
 
 # ================= MAIN =================
 def main():
-    logger.info("🚀 Bot Dual Asset con APY mínimo 180% y fallback REST iniciado")
-    telegram_mensaje("🚀 Bot Dual Asset activo - APY mínimo 180%, revisión cada hora")
+    logger.info("🚀 Bot Dual Asset con detección dinámica de productos iniciado")
+    telegram_mensaje("🚀 Bot Dual Asset activo - APY mínimo 180%, IDs dinámicos")
+    
+    # Obtener IDs iniciales
+    actualizar_product_ids()
     
     start_websocket()
     keep_alive()
-    time.sleep(5)  # esperar WebSocket
+    time.sleep(5)
     
-    # Programar análisis diario
+    # Programar actualización periódica de IDs (cada 30 minutos)
+    schedule.every(30).minutes.do(actualizar_product_ids)
     schedule.every().day.at(HORA_ANALISIS).do(ejecutar_analisis_diario)
-    # Programar ciclo horario
     schedule.every(1).hours.do(ciclo_horario)
     
-    # Ejecutar análisis inmediato si no hay decisión
     if not decision_diaria:
         ejecutar_analisis_diario()
     else:
         telegram_mensaje(f"📌 Decisión actual: BTC={decision_diaria.get('BTC')}, SOL={decision_diaria.get('SOL')}")
     
-    # Ejecutar ciclo horario inmediatamente
     ciclo_horario()
     
-    # Bucle principal
     while True:
         schedule.run_pending()
         time.sleep(60)
