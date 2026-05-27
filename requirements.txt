@@ -6,3 +6,4 @@ matplotlib
 ta
 openai
 python-dotenv
+scipy
