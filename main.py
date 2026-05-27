@@ -6,7 +6,7 @@ import requests
 import numpy as np
 import pandas as pd
 from scipy.stats import linregress
-from datetime import datetime, timedelta
+from datetime import datetime
 import matplotlib.pyplot as plt
 import matplotlib
 matplotlib.use('Agg')
@@ -43,29 +43,28 @@ if not BYBIT_API_KEY or not BYBIT_API_SECRET:
 
 # ================= CONFIGURACIÓN GENERAL =================
 MODELO_VISION = "google/gemini-3.1-flash-image-preview"
-SYMBOLS = ["BTCUSDT", "SOLUSDT"]          # Pares a analizar (diario)
-MAX_INVEST_PERCENT = 0.5                  # Invertir máximo el 50% del saldo
-MIN_INVEST_USDT = 10                      # Monto mínimo para invertir
-HORA_EJECUCION = "07:00"                  # Hora UTC del análisis diario
+SYMBOLS = ["BTCUSDT", "SOLUSDT"]
+MAX_INVEST_PERCENT = 0.5
+MIN_INVEST_USDT = 10
+HORA_EJECUCION = "07:00"   # UTC
 
-# ========== IDs MANUALES de respaldo (solo si la API falla) ==========
-# Si quieres, puedes dejarlos vacíos y confiar solo en la API.
-MANUAL_PRODUCT_IDS = {
-    "BTC": [],   # Ejemplo: ["20001"]
-    "SOL": []
+# ========== IDs REALES DE PRODUCTOS (obtenidos de la app) ==========
+PRODUCT_IDS = {
+    "BTC": "134685",
+    "SOL": "134711"
 }
-# ====================================================================
+# ===================================================================
 
 # Variables globales
 client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY,
                 default_headers={"HTTP-Referer": "https://railway.app", "X-Title": "Dual Asset Bot"})
 bybit_session = HTTP(testnet=False, api_key=BYBIT_API_KEY, api_secret=BYBIT_API_SECRET)
 
-# Variables para persistir la decisión del día (sin repetir IA)
+# Para evitar repetir IA el mismo día
 decision_guardada = {}      # {"BTC": "Buy Low", "SOL": "Sell High"}
 fecha_decision = None
 
-# WebSocket de ofertas
+# WebSocket de ofertas (solo guardaremos nuestros productos)
 ws_offers = {}
 ws_connected = False
 
@@ -90,7 +89,7 @@ def telegram_enviar_imagen(ruta, caption=""):
     except Exception as e:
         logger.error(f"Error enviando imagen: {e}")
 
-# ================= OBTENER VELAS DIARIAS =================
+# ================= VELAS DIARIAS =================
 def obtener_velas_diarias(symbol, limit=100):
     try:
         resp = bybit_session.get_kline(category="spot", symbol=symbol, interval="D", limit=limit)
@@ -188,7 +187,7 @@ def pil_to_base64(img):
     img.save(buffered, format="PNG")
     return f"data:image/png;base64,{base64.b64encode(buffered.getvalue()).decode()}"
 
-# ================= IA (SOLO UNA VEZ AL DÍA) =================
+# ================= IA (una vez al día) =================
 def analizar_con_gemini(img, symbol):
     try:
         img_b64 = pil_to_base64(img)
@@ -224,54 +223,20 @@ def analizar_con_gemini(img, symbol):
         logger.error(f"Error IA {symbol}: {e}")
         return "Hold", f"Error: {e}", "", 0
 
-# ================= OBTENER IDs DE PRODUCTO DESDE API PÚBLICA =================
-def obtener_product_ids_desde_api(symbol_base):
-    """Usa el endpoint público /v5/earn/advance/product para obtener los productId reales."""
-    try:
-        url = "https://api.bybit.com/v5/earn/advance/product"
-        params = {
-            "category": "DoubleWin",
-            "coin": symbol_base.upper()
-        }
-        resp = requests.get(url, params=params, timeout=10)
-        data = resp.json()
-        if data.get("retCode") != 0:
-            logger.error(f"Error API productos: {data}")
-            return []
-        product_ids = []
-        for product in data.get("result", {}).get("list", []):
-            pid = product.get("productId")
-            if pid:
-                product_ids.append(str(pid))
-        logger.info(f"IDs obtenidos para {symbol_base}: {product_ids}")
-        return product_ids
-    except Exception as e:
-        logger.error(f"Excepción obteniendo productos desde API: {e}")
-        return []
-
-def obtener_product_ids_para_activo(symbol_base):
-    """Obtiene IDs: primero desde API pública, si falla usa manuales."""
-    ids_api = obtener_product_ids_desde_api(symbol_base)
-    if ids_api:
-        return ids_api
-    # Fallback a manuales
-    if symbol_base in MANUAL_PRODUCT_IDS and MANUAL_PRODUCT_IDS[symbol_base]:
-        logger.warning(f"Usando IDs manuales para {symbol_base}: {MANUAL_PRODUCT_IDS[symbol_base]}")
-        return MANUAL_PRODUCT_IDS[symbol_base]
-    logger.error(f"No se pudieron obtener IDs para {symbol_base}")
-    return []
-
-# ================= WEBSOCKET DE OFERTAS (DOUBLEWIN) =================
+# ================= WEB SOCKET (topic correcto) =================
 def on_message(ws, message):
     global ws_offers
     try:
         data = json.loads(message)
+        # Solo nos interesan nuestros productos
         if "data" in data:
             for product in data["data"]:
-                pid = str(product["p"])
-                ws_offers[pid] = product
+                pid = str(product.get("p"))
+                if pid in [PRODUCT_IDS["BTC"], PRODUCT_IDS["SOL"]]:
+                    ws_offers[pid] = product
+                    logger.info(f"Oferta actualizada para producto {pid}")
     except Exception as e:
-        logger.error(f"Error procesando mensaje WS: {e}")
+        logger.error(f"Error en WS: {e}")
 
 def on_error(ws, error):
     logger.error(f"WS error: {error}")
@@ -285,9 +250,10 @@ def on_close(ws, close_status_code, close_msg):
 
 def on_open(ws):
     global ws_connected
-    ws.send(json.dumps({"op": "subscribe", "args": ["earn.doublewin.offers"]}))
+    # Topic correcto para Dual Asset (Double-Win)
+    ws.send(json.dumps({"op": "subscribe", "args": ["earn.dualassets.offers"]}))
     ws_connected = True
-    logger.info("WebSocket DoubleWin conectado y suscrito")
+    logger.info("WebSocket Dual Asset conectado y suscrito a earn.dualassets.offers")
 
 def start_websocket():
     websocket.enableTrace(False)
@@ -297,37 +263,48 @@ def start_websocket():
     wst.start()
     return ws
 
-# ================= OBTENER MEJOR OFERTA =================
-def obtener_mejor_oferta(symbol_base, decision):
+# ================= OBTENER MEJOR OFERTA PARA NUESTRO PRODUCTO =================
+def obtener_oferta_para_producto(symbol_base, decision):
+    """
+    Obtiene la oferta (Buy Low o Sell High) para el producto específico.
+    """
+    product_id = PRODUCT_IDS.get(symbol_base)
+    if not product_id:
+        logger.error(f"No hay ID para {symbol_base}")
+        return None
+    product = ws_offers.get(product_id)
+    if not product:
+        logger.warning(f"No se ha recibido oferta para producto {product_id}")
+        return None
+    
     target_key = "b" if decision == "Buy Low" else "s"
-    product_ids_validos = obtener_product_ids_para_activo(symbol_base)
-    if not product_ids_validos:
-        logger.warning(f"No hay IDs para {symbol_base}")
+    if target_key not in product:
+        logger.warning(f"Producto {product_id} no tiene oferta para {decision}")
         return None
-    mejores = []
-    for pid in product_ids_validos:
-        product = ws_offers.get(pid)
-        if not product:
-            continue
-        if target_key in product:
-            for quote in product[target_key]:
-                apy = int(quote.get("a", 0)) / 1e8
-                max_amount = float(quote.get("m", 0))
-                select_price = float(quote.get("s", 0))
-                expire_time = int(quote.get("x", 0))
-                if expire_time > int(time.time()) * 1000:
-                    mejores.append({
-                        "productId": pid,
-                        "apy": apy,
-                        "maxAmount": max_amount,
-                        "selectPrice": select_price,
-                        "expireTime": expire_time
-                    })
-    if not mejores:
+    
+    # Tomar la primera (o la mejor) cotización. Normalmente solo hay una.
+    # Se puede iterar si hay múltiples (pero suele ser una)
+    quotes = product[target_key]
+    if not quotes:
         return None
-    return max(mejores, key=lambda x: x["apy"])
+    
+    # Elegir la de mayor APY
+    mejor = None
+    mejor_apy = -1
+    for quote in quotes:
+        apy = int(quote.get("a", 0)) / 1e8
+        if apy > mejor_apy:
+            mejor_apy = apy
+            mejor = {
+                "productId": product_id,
+                "apy": apy,
+                "maxAmount": float(quote.get("m", 0)),
+                "selectPrice": float(quote.get("s", 0)),
+                "expireTime": int(quote.get("x", 0))
+            }
+    return mejor
 
-# ================= OBTENER QUOTE FIJO =================
+# ================= OBTENER QUOTE FIJO (leverage, currentPrice) =================
 def obtener_quote_fijo(product_id):
     try:
         timestamp = str(int(time.time() * 1000))
@@ -357,11 +334,12 @@ def obtener_quote_fijo(product_id):
         logger.error(f"Excepción quote: {e}")
         return None
 
-# ================= SUSCRIPCIÓN A DUAL ASSET =================
+# ================= SUSCRIPCIÓN =================
 def suscribir_dual_asset(product_id, amount_usdt, decision, quote_info, order_link_id=None):
     if order_link_id is None:
         order_link_id = f"duplo_{int(time.time())}"
-    coin = "USDT" if decision == "Buy Low" else "BTC"
+    # Moneda base: para Buy Low se invierte USDT; para Sell High se invierte la moneda base (BTC o SOL)
+    coin = "USDT" if decision == "Buy Low" else "BTC" if "BTC" in product_id else "SOL"
     body = {
         "category": "DoubleWin",
         "productId": product_id,
@@ -416,6 +394,7 @@ def obtener_saldo_usdt():
         return 0.0
 
 def verificar_liquidaciones():
+    """Revisa posiciones vencidas y convierte a USDT."""
     try:
         timestamp = str(int(time.time() * 1000))
         recv_window = "5000"
@@ -438,7 +417,7 @@ def verificar_liquidaciones():
                     coin = pos.get("coin")
                     if amount > 0 and coin:
                         convertir_a_usdt(coin, amount)
-                        telegram_mensaje(f"🔄 Liquidación automática: {amount} {coin} convertido a USDT")
+                        telegram_mensaje(f"🔄 Liquidación: {amount} {coin} -> USDT")
     except Exception as e:
         logger.error(f"Error liquidaciones: {e}")
 
@@ -455,24 +434,25 @@ def convertir_a_usdt(coin, amount):
     except Exception as e:
         logger.error(f"Error conversión: {e}")
 
-# ================= ESTRATEGIA DIARIA (UNA SOLA IA) =================
+# ================= ESTRATEGIA DIARIA =================
 def ejecutar_estrategia():
     global decision_guardada, fecha_decision
     hoy = datetime.now().date()
+    # Si ya se ejecutó hoy, usar decisión guardada (sin IA)
     if fecha_decision == hoy and decision_guardada:
         logger.info("Ya se ejecutó la IA hoy. Usando decisión guardada.")
         for symbol in SYMBOLS:
             base = symbol.replace("USDT", "")
             if base in decision_guardada:
                 decision = decision_guardada[base]
-                logger.info(f"Reintento suscripción para {base} con decisión {decision} (sin IA)")
+                logger.info(f"Reintento suscripción para {base} con decisión {decision}")
                 saldo = obtener_saldo_usdt()
                 if saldo < MIN_INVEST_USDT:
                     continue
                 monto = saldo * MAX_INVEST_PERCENT
                 if monto < MIN_INVEST_USDT:
                     monto = MIN_INVEST_USDT
-                oferta = obtener_mejor_oferta(base, decision)
+                oferta = obtener_oferta_para_producto(base, decision)
                 if oferta:
                     quote = obtener_quote_fijo(oferta["productId"])
                     if quote:
@@ -481,10 +461,11 @@ def ejecutar_estrategia():
                             suscribir_dual_asset(oferta["productId"], monto_final, decision, {**quote, "apy": oferta["apy"]})
         return
 
+    # Primer análisis del día: usar IA
     logger.info("=== ANÁLISIS DIARIO CON IA ===")
     saldo_usdt = obtener_saldo_usdt()
     if saldo_usdt < MIN_INVEST_USDT:
-        telegram_mensaje(f"Saldo insuficiente: {saldo_usdt:.2f} USDT. No se invierte hoy.")
+        telegram_mensaje(f"Saldo insuficiente: {saldo_usdt:.2f} USDT")
         return
 
     for symbol in SYMBOLS:
@@ -495,8 +476,7 @@ def ejecutar_estrategia():
         df = calcular_indicadores_diarios(df)
         soporte, resistencia = detectar_soportes_resistencias_diario(df)
         slope = df['trend_slope'].iloc[-1] if 'trend_slope' in df else 0
-        intercept = 0
-        img = generar_grafico_diario(df, symbol, soporte, resistencia, slope, intercept)
+        img = generar_grafico_diario(df, symbol, soporte, resistencia, slope, 0)
         if img:
             img_path = f"/tmp/duplo_{symbol}.png"
             img.save(img_path)
@@ -513,7 +493,7 @@ def ejecutar_estrategia():
             monto = saldo_usdt * MAX_INVEST_PERCENT
             if monto < MIN_INVEST_USDT:
                 monto = MIN_INVEST_USDT
-            oferta = obtener_mejor_oferta(base, decision)
+            oferta = obtener_oferta_para_producto(base, decision)
             if oferta:
                 quote = obtener_quote_fijo(oferta["productId"])
                 if quote:
@@ -548,7 +528,7 @@ def main():
     telegram_mensaje("🚀 Bot Dual Asset activo - Estrategia diaria con IA única")
     start_websocket()
     keep_alive()
-    time.sleep(5)
+    time.sleep(5)  # esperar a que lleguen las primeras ofertas
     schedule.every().day.at(HORA_EJECUCION).do(ejecutar_estrategia)
     schedule.every(2).hours.do(verificar_liquidaciones)
     ejecutar_estrategia()
