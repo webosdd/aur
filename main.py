@@ -1,11 +1,12 @@
 # =================================================================
-# BOT BYBIT EARN DUAL ASSET (DUPLOS) con IA Multimodal
+# BOT BYBIT EARN DUAL ASSET (DUPLOS) con IA Multimodal y Robustez
 # - Analiza gráficos diarios (velas, EMAs, RSI, MACD, S/R, tendencia)
 # - IA decide activo (BTC/SOL) y tipo (Buy Low / Sell High)
 # - Suscribe a producto de 1 día con mejor APR
 # - Espera activamente hasta vencimiento (evita hibernación en Railway)
 # - Convierte saldos no USDT automáticamente y reinicia ciclo
 # - Reportes completos con gráfico por Telegram
+# - Manejo de reintentos, logs detallados y rate limiting
 # =================================================================
 
 import os
@@ -15,6 +16,7 @@ import base64
 import hmac
 import hashlib
 import json
+import random
 import requests
 import pandas as pd
 import numpy as np
@@ -31,7 +33,9 @@ TIMEFRAME = "D"                                # Velas diarias (1 día)
 LOOKBACK_DAYS = 60                             # Días de histórico para gráfico
 INVEST_PERCENT = 1.0                           # Invertir 100% del USDT disponible
 SPOT_COMMISSION = 0.001                        # 0.1% comisión spot
-KEEP_AWAKE_INTERVAL_SECONDS = 300              # Ping cada 5 min para evitar hibernación
+KEEP_AWAKE_INTERVAL_SECONDS = 600              # Ping cada 10 min para evitar hibernación
+MAX_RETRIES = 3                                # Número máximo de reintentos ante errores
+BASE_DELAY = 2                                 # Segundos inicial de backoff exponencial
 
 # ======================================================
 # CREDENCIALES (variables de entorno)
@@ -56,12 +60,16 @@ client = OpenAI(
 MODELO_IA = "google/gemini-3.1-flash-image-preview"   # Cambia si lo deseas
 
 # ======================================================
-# FUNCIONES BYBIT API v5
+# FUNCIONES BYBIT API v5 CON REINTENTOS Y LOGS
 # ======================================================
 
 BASE_URL = "https://api.bybit.com"
 
-def _bybit_request(method, endpoint, params=None, body=None):
+def _bybit_request(method, endpoint, params=None, body=None, retry_count=0):
+    """
+    Realiza una petición a la API de Bybit con firma HMAC.
+    Incluye reintentos con backoff exponencial y logs detallados.
+    """
     timestamp = str(int(time.time() * 1000))
     recv_window = "5000"
     query_string = ""
@@ -85,17 +93,55 @@ def _bybit_request(method, endpoint, params=None, body=None):
         "Content-Type": "application/json"
     }
     url = BASE_URL + endpoint
-    if method == "GET":
-        response = requests.get(url, headers=headers, params=params, timeout=15)
-    else:
-        response = requests.post(url, headers=headers, json=body, timeout=15)
+    try:
+        if method == "GET":
+            response = requests.get(url, headers=headers, params=params, timeout=20)
+        else:
+            response = requests.post(url, headers=headers, json=body, timeout=20)
+    except requests.exceptions.RequestException as e:
+        print(f"🔍 ERROR de conexión: {e}")
+        if retry_count < MAX_RETRIES:
+            delay = BASE_DELAY ** retry_count + random.uniform(0, 1)
+            print(f"🔄 Reintento {retry_count+1}/{MAX_RETRIES} en {delay:.2f}s")
+            time.sleep(delay)
+            return _bybit_request(method, endpoint, params, body, retry_count+1)
+        raise Exception(f"Fallo conexión tras {MAX_RETRIES} reintentos: {e}")
+
+    print(f"🔍 DEBUG: Status Code: {response.status_code}")
+    print(f"🔍 DEBUG: Response Text (primeros 500): {response.text[:500]}")
+
+    # Manejo de errores HTTP conocidos
+    if response.status_code == 403:
+        telegram_mensaje("🚨 ERROR 403: IP bloqueada por exceso de peticiones. Pausa de 10 minutos.")
+        time.sleep(600)
+        return {}
+    if response.status_code == 429:
+        telegram_mensaje("⚠️ Rate limit (429). Pausa de 30 segundos.")
+        time.sleep(30)
+        if retry_count < MAX_RETRIES:
+            return _bybit_request(method, endpoint, params, body, retry_count+1)
+        raise Exception("Rate limit excedido")
     
     try:
         data = response.json()
-    except:
-        raise Exception(f"Respuesta no JSON: {response.text}")
+    except json.JSONDecodeError:
+        error_msg = f"Respuesta no JSON: {response.text[:200]}"
+        print(f"❌ {error_msg}")
+        if retry_count < MAX_RETRIES:
+            delay = BASE_DELAY ** retry_count + random.uniform(0, 1)
+            print(f"🔄 Reintento {retry_count+1}/{MAX_RETRIES} en {delay:.2f}s")
+            time.sleep(delay)
+            return _bybit_request(method, endpoint, params, body, retry_count+1)
+        raise Exception(error_msg)
     
     if data.get("retCode") != 0:
+        # Si es error de límite de frecuencia, reintentar
+        if data.get("retCode") in [10006, 10007]:
+            if retry_count < MAX_RETRIES:
+                delay = BASE_DELAY ** retry_count + random.uniform(0, 1)
+                print(f"🔄 Rate limit de Bybit. Reintento en {delay:.2f}s")
+                time.sleep(delay)
+                return _bybit_request(method, endpoint, params, body, retry_count+1)
         raise Exception(f"Bybit error: {data.get('retMsg')} (code {data.get('retCode')})")
     return data.get("result", {})
 
@@ -245,7 +291,7 @@ def ia_analizar_grafico(symbol, df):
     """Envía gráfico + datos a Gemini y devuelve: 'BUY_LOW' o 'SELL_HIGH' o 'HOLD'"""
     img_b64 = generar_grafico_base64(df, symbol, "Análisis para Dual Asset")
     if not img_b64:
-        return "HOLD", ["Error gráfico"]
+        return "HOLD", ["Error gráfico"], None
     
     ultimo = df.iloc[-1]
     precio_actual = ultimo['close']
@@ -269,8 +315,8 @@ Datos actuales:
 - ATR (volatilidad): {atr:.2f}
 
 El objetivo es invertir en un producto **Dual Asset (Duplos) de Bybit con vencimiento en 1 día** para **acumular USDT**.
-- Si seleccionas **Buy Low**: inviertes USDT. Recibirás USDT + intereses si el precio al vencimiento está **por encima** del precio objetivo (precio actual + pequeño margen). Si baja, recibes la cripto.
-- Si seleccionas **Sell High**: inviertes la cripto (BTC o SOL). Recibirás USDT + intereses si el precio está **por debajo** del precio objetivo.
+- Si seleccionas **BUY_LOW**: inviertes USDT. Recibirás USDT + intereses si el precio al vencimiento está **por encima** del precio objetivo (precio actual + pequeño margen). Si baja, recibes la cripto.
+- Si seleccionas **SELL_HIGH**: inviertes la cripto (BTC o SOL). Recibirás USDT + intereses si el precio está **por debajo** del precio objetivo.
 
 Decide cuál opción tiene mayor probabilidad de que al vencimiento (1 día) el pago sea en USDT, basándote en el análisis técnico del gráfico.
 Si el mercado está muy incierto, responde "HOLD".
@@ -415,7 +461,6 @@ def esperar_hasta_vencimiento(expiry_timestamp):
         restante = (expiry - ahora).total_seconds()
         if restante > 60:
             telegram_mensaje(f"⏳ Esperando vencimiento. Restan {int(restante//3600)}h {int((restante%3600)//60)}m.")
-        # Espera en intervalos cortos pero hace ping para mantener activo
         tiempo_espera = min(restante, KEEP_AWAKE_INTERVAL_SECONDS)
         time.sleep(tiempo_espera)
         # Ping a Bybit para generar tráfico
@@ -465,8 +510,7 @@ def ejecutar_ciclo():
             # Enviar gráfico y decisión al Telegram
             telegram_mensaje(f"📊 *Análisis para {symbol}*\nDecisión IA: {decision}\nRazones: " + "\n".join(razones), img_b64)
             if decision != "HOLD":
-                # Calcular un "score" simple: por ahora elegimos la que no sea HOLD (priorizamos la que aparezca)
-                # Podríamos mejorar con métricas pero elegimos la primera que decida operar
+                # Elegir la primera que no sea HOLD (puedes ajustar criterio)
                 if mejor_opcion is None:
                     mejor_opcion = symbol
                     mejor_decision = decision
@@ -550,7 +594,7 @@ def run_bot():
             # Pequeña pausa antes de reiniciar para no saturar
             time.sleep(60)
         except Exception as e:
-            telegram_mensaje(f"🚨 ERROR en bucle principal: {e}")
+            telegram_mensaje(f"🚨 ERROR en bucle principal: {str(e)[:200]}")
             time.sleep(60)
 
 if __name__ == "__main__":
