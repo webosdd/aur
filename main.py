@@ -60,6 +60,9 @@ fecha_decision = None
 # WebSocket de ofertas
 ws_offers = {}
 ws_connected = False
+product_id_cache = {}       # cache: {"BTC": ["123", "456"], "SOL": [...]}
+cache_timestamp = 0
+CACHE_DURATION = 300        # 5 minutos
 
 # ================= TELEGRAM =================
 def telegram_mensaje(texto):
@@ -223,16 +226,64 @@ def analizar_con_gemini(img, symbol):
         logger.error(f"Error IA {symbol}: {e}")
         return "Hold", f"Error: {e}", "", 0
 
-# ================= WEBSOCKET DE OFERTAS =================
+# ================= OBTENER LISTA DE PRODUCTOS POR ACTIVO (API REST) =================
+def obtener_lista_productos_por_activo(symbol_base):
+    """Obtiene los productId de DoubleWin para un activo base usando el endpoint REST."""
+    global product_id_cache, cache_timestamp
+    ahora = time.time()
+    
+    # Si el cache no ha expirado y ya tenemos la lista para este símbolo, la devolvemos
+    if ahora - cache_timestamp < CACHE_DURATION:
+        if symbol_base in product_id_cache:
+            return product_id_cache[symbol_base]
+    
+    try:
+        timestamp = str(int(time.time() * 1000))
+        recv_window = "5000"
+        query = "category=DoubleWin"
+        payload = timestamp + BYBIT_API_KEY + recv_window + query
+        signature = hmac.new(BYBIT_API_SECRET.encode('utf-8'), payload.encode('utf-8'), hashlib.sha256).hexdigest()
+        headers = {
+            "X-BAPI-API-KEY": BYBIT_API_KEY,
+            "X-BAPI-TIMESTAMP": timestamp,
+            "X-BAPI-RECV-WINDOW": recv_window,
+            "X-BAPI-SIGN": signature,
+        }
+        url = f"https://api.bybit.com/v5/earn/advance/product-info?{query}"
+        resp = requests.get(url, headers=headers, timeout=10)
+        data = resp.json()
+        
+        if data.get("retCode") != 0:
+            logger.error(f"Error obteniendo productos: {data}")
+            return []
+        
+        # Filtrar productos que correspondan al símbolo base
+        productos = []
+        for prod in data.get("result", {}).get("list", []):
+            # El campo "symbol" viene como "BTCUSDT" o "SOLUSDT"
+            if prod.get("symbol") == f"{symbol_base}USDT":
+                productos.append(prod.get("productId"))
+        
+        # Actualizar cache
+        product_id_cache[symbol_base] = productos
+        cache_timestamp = ahora
+        
+        logger.info(f"IDs de producto para {symbol_base}: {productos}")
+        return productos
+    except Exception as e:
+        logger.error(f"Excepción obteniendo productos: {e}")
+        return []
+
+# ================= WEBSOCKET DE OFERTAS (DOUBLEWIN) =================
 def on_message(ws, message):
     global ws_offers
     try:
         data = json.loads(message)
         if "data" in data:
             for product in data["data"]:
-                ws_offers[product["p"]] = product
-    except:
-        pass
+                ws_offers[str(product["p"])] = product  # Aseguramos que la clave sea string
+    except Exception as e:
+        logger.error(f"Error procesando mensaje WS: {e}")
 
 def on_error(ws, error):
     logger.error(f"WS error: {error}")
@@ -246,9 +297,10 @@ def on_close(ws, close_status_code, close_msg):
 
 def on_open(ws):
     global ws_connected
-    ws.send(json.dumps({"op": "subscribe", "args": ["earn.dualassets.offers"]}))
+    # Suscribirse al topic correcto para DoubleWin
+    ws.send(json.dumps({"op": "subscribe", "args": ["earn.doublewin.offers"]}))
     ws_connected = True
-    logger.info("WebSocket Dual Asset conectado")
+    logger.info("WebSocket DoubleWin conectado y suscrito")
 
 def start_websocket():
     websocket.enableTrace(False)
@@ -262,11 +314,19 @@ def start_websocket():
 def obtener_mejor_oferta(symbol_base, decision):
     """Busca en ws_offers la oferta con mayor APY para la dirección indicada."""
     target_key = "b" if decision == "Buy Low" else "s"
+    
+    # Obtener lista de productId válidos para este activo
+    product_ids_validos = obtener_lista_productos_por_activo(symbol_base)
+    if not product_ids_validos:
+        logger.warning(f"No se encontraron IDs de producto para {symbol_base}")
+        return None
+
     mejores = []
     for pid, product in ws_offers.items():
-        # Filtrar por símbolo base (ej. "BTC" dentro del productId)
-        if symbol_base.upper() not in pid.upper():
+        # Verificar que el productId esté en la lista de válidos
+        if pid not in product_ids_validos:
             continue
+        
         if target_key in product:
             for quote in product[target_key]:
                 apy = int(quote.get("a", 0)) / 1e8
@@ -281,6 +341,7 @@ def obtener_mejor_oferta(symbol_base, decision):
                         "selectPrice": select_price,
                         "expireTime": expire_time
                     })
+    
     if not mejores:
         return None
     return max(mejores, key=lambda x: x["apy"])
@@ -320,7 +381,11 @@ def obtener_quote_fijo(product_id):
 def suscribir_dual_asset(product_id, amount_usdt, decision, quote_info, order_link_id=None):
     if order_link_id is None:
         order_link_id = f"duplo_{int(time.time())}"
+    # La moneda base para la suscripción:
+    # - Buy Low: se invierte USDT
+    # - Sell High: se invierte la moneda base (BTC, SOL)
     coin = "USDT" if decision == "Buy Low" else "BTC"  # Ajustar según producto real
+    
     body = {
         "category": "DoubleWin",
         "productId": product_id,
