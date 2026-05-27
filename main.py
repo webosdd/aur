@@ -1,12 +1,9 @@
 # =================================================================
-# BOT BYBIT DOUBLEWIN (DUPLOS) con IA Multimodal - VERSIÓN DEFINITIVA
-# - Usa los endpoints correctos de Bybit: /v5/earn/advance/...
-# - Analiza gráficos diarios (velas, EMAs, RSI, MACD, S/R, tendencia)
-# - IA decide activo (BTC o SOL) y tipo (Buy Low / Sell High)
-# - Suscribe a producto de 1 día con mejor APR
-# - Espera activamente hasta vencimiento (evita hibernación)
-# - Convierte saldos no USDT automáticamente y reinicia ciclo
-# - Reportes completos con gráfico por Telegram
+# BOT BYBIT DOUBLEWIN (DUPLOS) con IA Multimodal - VERSIÓN CORREGIDA
+# Endpoints correctos:
+#   - GET /v5/earn/advance/product-extra-info  (productos)
+#   - POST /v5/earn/advance/place-order        (suscribir)
+#   - GET /v5/earn/advance/order               (consultar órdenes)
 # =================================================================
 
 import os
@@ -28,14 +25,14 @@ from openai import OpenAI
 # CONFIGURACIÓN
 # ======================================================
 
-ASSET_PAIRS = ["BTCUSDT", "SOLUSDT"]           # Activos a considerar
-TIMEFRAME = "D"                                # Velas diarias (1 día)
-LOOKBACK_DAYS = 60                             # Días de histórico para gráfico
-INVEST_PERCENT = 1.0                           # Invertir 100% del USDT disponible
-SPOT_COMMISSION = 0.001                        # 0.1% comisión spot
-KEEP_AWAKE_INTERVAL_SECONDS = 600              # Ping cada 10 min para evitar hibernación
-MAX_RETRIES = 3                                # Reintentos ante errores
-BASE_DELAY = 2                                 # Backoff exponencial
+ASSET_PAIRS = ["BTCUSDT", "SOLUSDT"]
+TIMEFRAME = "D"
+LOOKBACK_DAYS = 60
+INVEST_PERCENT = 1.0
+SPOT_COMMISSION = 0.001
+KEEP_AWAKE_INTERVAL_SECONDS = 600
+MAX_RETRIES = 3
+BASE_DELAY = 2
 
 # ======================================================
 # CREDENCIALES (variables de entorno)
@@ -60,13 +57,12 @@ client = OpenAI(
 MODELO_IA = "google/gemini-3.1-flash-image-preview"
 
 # ======================================================
-# FUNCIONES BYBIT API v5 CON REINTENTOS Y LOGS
+# FUNCIONES BYBIT API v5 CON REINTENTOS
 # ======================================================
 
 BASE_URL = "https://api.bybit.com"
 
 def _bybit_request(method, endpoint, params=None, body=None, retry_count=0):
-    """Petición firmada a API Bybit con reintentos y manejo de errores."""
     timestamp = str(int(time.time() * 1000))
     recv_window = "5000"
     query_string = ""
@@ -74,7 +70,7 @@ def _bybit_request(method, endpoint, params=None, body=None, retry_count=0):
         query_string = "&".join([f"{k}={v}" for k, v in sorted(params.items())])
     elif method == "POST" and body:
         query_string = json.dumps(body)
-    
+
     signature_payload = timestamp + BYBIT_API_KEY + recv_window + query_string
     signature = hmac.new(
         BYBIT_API_SECRET.encode("utf-8"),
@@ -96,19 +92,19 @@ def _bybit_request(method, endpoint, params=None, body=None, retry_count=0):
         else:
             response = requests.post(url, headers=headers, json=body, timeout=20)
     except requests.exceptions.RequestException as e:
-        print(f"🔍 ERROR de conexión: {e}")
+        print(f"🔍 Error conexión: {e}")
         if retry_count < MAX_RETRIES:
             delay = BASE_DELAY ** retry_count + random.uniform(0, 1)
             print(f"🔄 Reintento {retry_count+1}/{MAX_RETRIES} en {delay:.2f}s")
             time.sleep(delay)
             return _bybit_request(method, endpoint, params, body, retry_count+1)
-        raise Exception(f"Fallo conexión tras {MAX_RETRIES} reintentos: {e}")
+        raise Exception(f"Fallo conexión: {e}")
 
     print(f"🔍 {method} {endpoint} → Status {response.status_code}")
-    
+
     if response.status_code == 404:
-        telegram_mensaje(f"❌ Endpoint {endpoint} no existe (404). Verifica que la cuenta tenga DoubleWin habilitado.")
-        raise Exception(f"Endpoint no encontrado: {endpoint}. Revisa permisos.")
+        telegram_mensaje(f"❌ Endpoint {endpoint} no existe (404). Revisa permisos y categoría.")
+        raise Exception(f"Endpoint no encontrado: {endpoint}")
     if response.status_code == 403:
         telegram_mensaje("🚨 ERROR 403: IP bloqueada. Pausa 10 min.")
         time.sleep(600)
@@ -119,7 +115,7 @@ def _bybit_request(method, endpoint, params=None, body=None, retry_count=0):
         if retry_count < MAX_RETRIES:
             return _bybit_request(method, endpoint, params, body, retry_count+1)
         raise Exception("Rate limit excedido")
-    
+
     try:
         data = response.json()
     except json.JSONDecodeError:
@@ -128,9 +124,8 @@ def _bybit_request(method, endpoint, params=None, body=None, retry_count=0):
             time.sleep(delay)
             return _bybit_request(method, endpoint, params, body, retry_count+1)
         raise Exception(f"Respuesta no JSON: {response.text[:200]}")
-    
+
     if data.get("retCode") != 0:
-        # Errores de rate limit internos de Bybit
         if data.get("retCode") in [10006, 10007]:
             if retry_count < MAX_RETRIES:
                 delay = BASE_DELAY ** retry_count + random.uniform(0, 1)
@@ -144,14 +139,8 @@ def _bybit_request(method, endpoint, params=None, body=None, retry_count=0):
 # ======================================================
 
 def obtener_velas(symbol, interval="D", limit=60):
-    """Obtiene velas diarias (o del intervalo indicado) para un símbolo."""
     url = f"{BASE_URL}/v5/market/kline"
-    params = {
-        "category": "spot",
-        "symbol": symbol,
-        "interval": interval,
-        "limit": limit
-    }
+    params = {"category": "spot", "symbol": symbol, "interval": interval, "limit": limit}
     r = requests.get(url, params=params, timeout=20)
     data = r.json()
     if data.get("retCode") != 0:
@@ -163,12 +152,9 @@ def obtener_velas(symbol, interval="D", limit=60):
     return df
 
 def calcular_indicadores(df):
-    """Añade EMA20, EMA50, RSI, MACD, ATR, soporte/resistencia, tendencia."""
     df = df.copy()
     df['ema20'] = df['close'].ewm(span=20).mean()
     df['ema50'] = df['close'].ewm(span=50).mean()
-    
-    # RSI
     delta = df['close'].diff()
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
@@ -176,27 +162,15 @@ def calcular_indicadores(df):
     avg_loss = loss.rolling(14).mean()
     rs = avg_gain / avg_loss
     df['rsi'] = 100 - (100 / (1 + rs))
-    
-    # MACD
     exp1 = df['close'].ewm(span=12, adjust=False).mean()
     exp2 = df['close'].ewm(span=26, adjust=False).mean()
     df['macd'] = exp1 - exp2
     df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
     df['macd_hist'] = df['macd'] - df['macd_signal']
-    
-    # ATR
-    tr = pd.concat([
-        df['high'] - df['low'],
-        (df['high'] - df['close'].shift()).abs(),
-        (df['low'] - df['close'].shift()).abs()
-    ], axis=1).max(axis=1)
+    tr = pd.concat([df['high'] - df['low'], (df['high'] - df['close'].shift()).abs(), (df['low'] - df['close'].shift()).abs()], axis=1).max(axis=1)
     df['atr'] = tr.rolling(14).mean()
-    
-    # Soporte / Resistencia (mínimos y máximos de 20 velas)
     df['soporte'] = df['low'].rolling(20).min()
     df['resistencia'] = df['high'].rolling(20).max()
-    
-    # Tendencia lineal en últimos 30 días
     y = df['close'].values[-30:]
     x = np.arange(len(y))
     slope, intercept = np.polyfit(x, y, 1)
@@ -211,7 +185,7 @@ def calcular_indicadores(df):
     return df
 
 # ======================================================
-# GENERAR GRÁFICO
+# GRÁFICO
 # ======================================================
 
 def generar_grafico_base64(df, symbol, titulo_extra=""):
@@ -229,12 +203,10 @@ def generar_grafico_base64(df, symbol, titulo_extra=""):
                 cuerpo_h = 0.0001
             rect = plt.Rectangle((i - 0.3, cuerpo_y), 0.6, cuerpo_h, color=color, alpha=0.9)
             ax1.add_patch(rect)
-        
         ax1.plot(x, df['ema20'].values, color='orange', linewidth=2, label='EMA20')
         ax1.plot(x, df['ema50'].values, color='blue', linewidth=2, label='EMA50')
         ax1.axhline(df['soporte'].iloc[-1], color='cyan', linestyle='--', alpha=0.7, label=f"Soporte {df['soporte'].iloc[-1]:.2f}")
         ax1.axhline(df['resistencia'].iloc[-1], color='magenta', linestyle='--', alpha=0.7, label=f"Resistencia {df['resistencia'].iloc[-1]:.2f}")
-        
         y_tend = df['close'].values[-30:]
         x_tend = np.arange(len(df)-30, len(df))
         slope = df['tendencia_slope'].iloc[-1]
@@ -244,21 +216,18 @@ def generar_grafico_base64(df, symbol, titulo_extra=""):
         ax1.set_title(f"{symbol} - Velas diarias | {titulo_extra}")
         ax1.legend(loc='upper left')
         ax1.grid(True, alpha=0.2)
-        
         ax2.plot(x, df['rsi'].values, color='purple', linewidth=1.5)
         ax2.axhline(70, color='red', linestyle='--', alpha=0.5)
         ax2.axhline(30, color='green', linestyle='--', alpha=0.5)
         ax2.set_ylabel('RSI')
         ax2.set_ylim(0, 100)
         ax2.grid(True, alpha=0.2)
-        
         ax3.plot(x, df['macd'].values, color='blue', linewidth=1.5, label='MACD')
         ax3.plot(x, df['macd_signal'].values, color='red', linewidth=1.5, label='Señal')
         ax3.bar(x, df['macd_hist'].values, color='gray', alpha=0.5, width=0.8, label='Histograma')
         ax3.set_ylabel('MACD')
         ax3.legend(loc='upper left')
         ax3.grid(True, alpha=0.2)
-        
         step = max(1, int(len(df)/6))
         ax3.set_xticks(x[::step])
         ax3.set_xticklabels([t.strftime('%Y-%m-%d') for t in df.index[::step]], rotation=45)
@@ -278,10 +247,9 @@ def generar_grafico_base64(df, symbol, titulo_extra=""):
 # ======================================================
 
 def ia_analizar_grafico(symbol, df):
-    img_b64 = generar_grafico_base64(df, symbol, "Análisis para DoubleWin")
+    img_b64 = generar_grafico_base64(df, symbol, "Análisis DoubleWin")
     if not img_b64:
         return "HOLD", ["Error gráfico"], None
-    
     ultimo = df.iloc[-1]
     precio_actual = ultimo['close']
     tendencia = ultimo['tendencia']
@@ -291,38 +259,19 @@ def ia_analizar_grafico(symbol, df):
     soporte = ultimo['soporte']
     resistencia = ultimo['resistencia']
     atr = ultimo['atr']
-    
     prompt = f"""
-Eres un experto trader de criptomonedas. Analiza el gráfico diario de {symbol}.
-Datos actuales:
-- Precio: {precio_actual:.2f}
-- Tendencia: {tendencia} (pendiente {slope:.5f})
-- RSI: {rsi:.1f}
-- MACD histograma: {macd_hist:.2f}
-- Soporte: {soporte:.2f}
-- Resistencia: {resistencia:.2f}
-- ATR (volatilidad): {atr:.2f}
-
-El objetivo es invertir en un producto **DoubleWin (Duplos) de Bybit con vencimiento en 1 día** para **acumular USDT**.
-- Si seleccionas **BUY_LOW**: inviertes USDT. Recibirás USDT + intereses si el precio al vencimiento está **por encima** del precio objetivo. Si baja, recibes la cripto.
-- Si seleccionas **SELL_HIGH**: inviertes la cripto (BTC o SOL). Recibirás USDT + intereses si el precio está **por debajo** del precio objetivo.
-
-Decide cuál opción tiene mayor probabilidad de que al vencimiento (1 día) el pago sea en USDT. Si el mercado está muy incierto, responde "HOLD".
-
-Responde ÚNICAMENTE en JSON:
-{{"decision": "BUY_LOW" / "SELL_HIGH" / "HOLD", "razones": ["razón1", "razón2"]}}
+Eres un experto trader. Analiza el gráfico diario de {symbol}.
+Datos: Precio={precio_actual:.2f}, Tendencia={tendencia} (pendiente {slope:.5f}), RSI={rsi:.1f}, MACD hist={macd_hist:.2f}, Soporte={soporte:.2f}, Resistencia={resistencia:.2f}, ATR={atr:.2f}
+Objetivo: Invertir en DoubleWin de 1 día para acumular USDT.
+- BUY_LOW: inviertes USDT, ganas si precio final > objetivo.
+- SELL_HIGH: inviertes la cripto, ganas si precio final < objetivo.
+Decide BUY_LOW, SELL_HIGH o HOLD. Devuelve JSON: {{"decision": "...", "razones": ["..."]}}
 """
     try:
         response = client.chat.completions.create(
             model=MODELO_IA,
-            messages=[
-                {"role": "user", "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
-                ]}
-            ],
-            temperature=0.3,
-            max_tokens=300
+            messages=[{"role": "user", "content": [{"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}]}],
+            temperature=0.3, max_tokens=300
         )
         contenido = response.choices[0].message.content
         import re
@@ -374,14 +323,7 @@ def convertir_a_usdt(moneda, cantidad):
     ticker = _bybit_request("GET", "/v5/market/tickers", params={"category": "spot", "symbol": symbol})
     precio = float(ticker["list"][0]["lastPrice"])
     usdt_esperado = cantidad * precio * (1 - SPOT_COMMISSION)
-    body = {
-        "category": "spot",
-        "symbol": symbol,
-        "side": "Sell",
-        "orderType": "Market",
-        "qty": str(cantidad),
-        "timeInForce": "IOC"
-    }
+    body = {"category": "spot", "symbol": symbol, "side": "Sell", "orderType": "Market", "qty": str(cantidad), "timeInForce": "IOC"}
     try:
         _bybit_request("POST", "/v5/order/create", body=body)
         return usdt_esperado
@@ -390,47 +332,44 @@ def convertir_a_usdt(moneda, cantidad):
         return 0
 
 def obtener_productos_doublewin(symbol, option_side, duration_days=1):
-    """Obtiene productos DoubleWin (Duplos) disponibles para un símbolo y tipo, filtrados por duración."""
     try:
         result = _bybit_request("GET", "/v5/earn/advance/product-extra-info", params={"category": "DoubleWin", "symbol": symbol})
         mejores = []
         for item in result.get("list", []):
-            # El campo 'optionSide' puede ser "BuyLow" o "SellHigh"
             if item.get("optionSide") != option_side:
                 continue
-            duration = int(item.get("duration", 0))
-            if duration != duration_days:
+            if int(item.get("duration", 0)) != duration_days:
                 continue
             apy = float(item.get("apy", 0))
             mejores.append({
                 "product_id": item["productId"],
                 "apy": apy,
                 "target_price": float(item["targetPrice"]),
-                "duration": duration,
+                "duration": duration_days,
             })
         if mejores:
             return max(mejores, key=lambda x: x["apy"])
         return None
     except Exception as e:
-        telegram_mensaje(f"⚠️ Error obteniendo DoubleWin para {symbol} {option_side}: {e}")
+        telegram_mensaje(f"⚠️ Error obteniendo productos DoubleWin para {symbol} {option_side}: {e}")
         return None
 
 def suscribir_doublewin(producto, cantidad_usdt):
-    body = {
-        "category": "DoubleWin",
-        "productId": producto["product_id"],
-        "amount": str(cantidad_usdt),
-        "currency": "USDT"
-    }
+    body = {"category": "DoubleWin", "productId": producto["product_id"], "amount": str(cantidad_usdt), "currency": "USDT"}
     result = _bybit_request("POST", "/v5/earn/advance/place-order", body=body)
     return result
 
 def obtener_suscripciones_activas():
-    result = _bybit_request("GET", "/v5/earn/advance/orders", params={"category": "DoubleWin", "status": "processing"})
-    return result.get("list", [])
+    """Lista órdenes activas de DoubleWin con estado 'Processing'."""
+    try:
+        result = _bybit_request("GET", "/v5/earn/advance/order", params={"category": "DoubleWin", "status": "Processing"})
+        return result.get("list", [])
+    except Exception as e:
+        print(f"Error al obtener suscripciones activas: {e}")
+        return []
 
-def esperar_hasta_vencimiento(expiry_timestamp):
-    expiry = datetime.fromtimestamp(expiry_timestamp / 1000, tz=timezone.utc)
+def esperar_hasta_vencimiento(expiry_ms):
+    expiry = datetime.fromtimestamp(expiry_ms / 1000, tz=timezone.utc)
     while True:
         ahora = datetime.now(timezone.utc)
         if ahora >= expiry:
@@ -440,6 +379,7 @@ def esperar_hasta_vencimiento(expiry_timestamp):
             telegram_mensaje(f"⏳ Esperando vencimiento. Restan {int(restante//3600)}h {int((restante%3600)//60)}m.")
         tiempo_espera = min(restante, KEEP_AWAKE_INTERVAL_SECONDS)
         time.sleep(tiempo_espera)
+        # Ping para mantener activo Railway
         try:
             _bybit_request("GET", "/v5/market/tickers", params={"category": "spot", "symbol": "BTCUSDT"})
         except:
@@ -450,70 +390,59 @@ def esperar_hasta_vencimiento(expiry_timestamp):
 # ======================================================
 
 def ejecutar_ciclo():
-    telegram_mensaje("🔄 *Iniciando ciclo de análisis y selección de DoubleWin*")
-    
-    # 1. Obtener saldos actuales
+    telegram_mensaje("🔄 *Iniciando ciclo de análisis DoubleWin*")
     saldos = obtener_saldos()
     usdt = saldos["USDT"]
     btc = saldos["BTC"]
     sol = saldos["SOL"]
     telegram_mensaje(f"💰 Saldos: USDT={usdt:.2f}, BTC={btc:.8f}, SOL={sol:.2f}")
-    
-    # 2. Convertir cualquier BTC o SOL a USDT
     if btc > 0:
         telegram_mensaje(f"🔄 Convirtiendo {btc:.8f} BTC → USDT")
         usdt += convertir_a_usdt("BTC", btc)
     if sol > 0:
         telegram_mensaje(f"🔄 Convirtiendo {sol:.2f} SOL → USDT")
         usdt += convertir_a_usdt("SOL", sol)
-    
     if usdt <= 10:
         telegram_mensaje("⚠️ Saldo USDT insuficiente (<10). Esperando...")
         return
-    
-    # 3. Analizar cada activo con IA para elegir el mejor par y tipo
+
     mejor_opcion = None
     mejor_decision = None
     mejor_razones = []
     mejor_imagen = None
-    
+
     for symbol in ASSET_PAIRS:
         try:
             df = obtener_velas(symbol, TIMEFRAME, LOOKBACK_DAYS)
             df = calcular_indicadores(df)
             decision, razones, img_b64 = ia_analizar_grafico(symbol, df)
             telegram_mensaje(f"📊 *Análisis para {symbol}*\nDecisión IA: {decision}\nRazones: " + "\n".join(razones), img_b64)
-            if decision != "HOLD":
-                if mejor_opcion is None:
-                    mejor_opcion = symbol
-                    mejor_decision = decision
-                    mejor_razones = razones
-                    mejor_imagen = img_b64
+            if decision != "HOLD" and mejor_opcion is None:
+                mejor_opcion = symbol
+                mejor_decision = decision
+                mejor_razones = razones
+                mejor_imagen = img_b64
         except Exception as e:
             telegram_mensaje(f"⚠️ Error analizando {symbol}: {e}")
-    
+
     if mejor_opcion is None:
-        telegram_mensaje("🤷 IA recomienda HOLD para todos los activos. No se opera.")
+        telegram_mensaje("🤷 IA recomienda HOLD para todos. No se opera.")
         return
-    
-    # 4. Buscar producto DoubleWin para ese símbolo, misma decisión, duración 1 día
+
     option_side = "BuyLow" if mejor_decision == "BUY_LOW" else "SellHigh"
     producto = obtener_productos_doublewin(mejor_opcion, option_side, duration_days=1)
     if not producto:
         telegram_mensaje(f"❌ No se encontró producto DoubleWin de 1 día para {mejor_opcion} con {option_side}")
         return
-    
-    # 5. Suscribir todo el USDT disponible
+
     cantidad_invertir = usdt * INVEST_PERCENT
     if cantidad_invertir < 10:
         telegram_mensaje(f"⚠️ Cantidad muy pequeña ({cantidad_invertir:.2f} USDT). Mínimo 10.")
         return
-    
+
     try:
         resultado = suscribir_doublewin(producto, cantidad_invertir)
-        # Extraer timestamp de vencimiento de la respuesta (si lo da) o calcular 1 día
-        # En DoubleWin, la respuesta suele contener "orderId", podemos consultar la orden después
-        # Por simplicidad, calculamos 1 día desde ahora
+        # El vencimiento es a los 1 día
         expiry_ms = int((datetime.now(timezone.utc) + timedelta(days=1)).timestamp() * 1000)
         telegram_mensaje(
             f"✅ *SUSCRIPCIÓN REALIZADA*\n"
@@ -529,7 +458,7 @@ def ejecutar_ciclo():
         telegram_mensaje(f"❌ Error en suscripción: {e}")
 
 # ======================================================
-# BUCLE PRINCIPAL CON KEEP-AWAKE
+# BUCLE PRINCIPAL
 # ======================================================
 
 def run_bot():
@@ -538,9 +467,9 @@ def run_bot():
         try:
             activas = obtener_suscripciones_activas()
             if activas:
+                # Tomamos el vencimiento más cercano de las activas
                 vencimientos = []
                 for ord in activas:
-                    # Asegurar que la orden tenga campo expiryTime
                     if "expiryTime" in ord:
                         expiry = datetime.fromtimestamp(int(ord["expiryTime"]) / 1000, tz=timezone.utc)
                         vencimientos.append(expiry)
@@ -549,9 +478,10 @@ def run_bot():
                     ahora = datetime.now(timezone.utc)
                     if proximo > ahora:
                         restante = (proximo - ahora).total_seconds()
-                        telegram_mensaje(f"⏳ Hay {len(activas)} suscripción(es) activa(s). Próximo vencimiento en {restante/3600:.1f}h. Esperando...")
+                        telegram_mensaje(f"⏳ Hay {len(activas)} suscripción(es) activa(s). Próximo vencimiento en {restante/3600:.1f}h.")
                         while datetime.now(timezone.utc) < proximo:
                             time.sleep(min(KEEP_AWAKE_INTERVAL_SECONDS, (proximo - datetime.now(timezone.utc)).total_seconds()))
+                            # Ping
                             try:
                                 _bybit_request("GET", "/v5/market/tickers", params={"category": "spot", "symbol": "BTCUSDT"})
                             except:
