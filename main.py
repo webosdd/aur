@@ -44,12 +44,9 @@ if not BYBIT_API_KEY or not BYBIT_API_SECRET:
 MODELO_VISION = "google/gemini-3.1-flash-image-preview"
 SYMBOLS = ["BTCUSDT", "SOLUSDT"]
 MIN_INVEST_USDT = 20
-HORA_ANALISIS = "07:00"   # UTC
+MIN_APY_PERCENT = 200.0          # Solo ofertas con APY >= 200%
+HORA_ANALISIS = "07:00"          # UTC
 
-# Umbral de APY mínimo para considerar una oferta (en porcentaje)
-MIN_APY = 200.0
-
-# IDs reales de productos
 PRODUCT_IDS = {
     "BTC": "134685",
     "SOL": "134711"
@@ -64,6 +61,7 @@ decision_diaria = {}
 ultimo_resumen = 0
 ws_offers = {}
 ws_connected = False
+ultima_inversion_time = 0
 
 # ================= TELEGRAM =================
 def telegram_mensaje(texto):
@@ -91,34 +89,39 @@ def obtener_saldo_usdt_unificado():
     try:
         resp = bybit_session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
         if resp.get("retCode") != 0:
-            logger.error(f"Error obteniendo saldo USDT: {resp}")
+            logger.error(f"Error saldo USDT: {resp}")
             return 0.0
         for coin in resp["result"]["list"][0]["coin"]:
             if coin["coin"] == "USDT":
                 return float(coin["walletBalance"])
         return 0.0
     except Exception as e:
-        logger.error(f"Excepción obteniendo saldo USDT: {e}")
+        logger.error(f"Excepción saldo USDT: {e}")
         return 0.0
 
 def convertir_activo_a_usdt(coin, amount):
+    """Convierte un activo a USDT usando el par spot coin/USDT."""
     try:
-        ticker = bybit_session.get_ticker(category="spot", symbol=f"{coin}USDT")
-        if ticker.get("retCode") != 0:
-            logger.error(f"Error obteniendo precio {coin}: {ticker}")
+        symbol = f"{coin}USDT"
+        # Verificar si el par existe y obtener precio
+        tickers = bybit_session.get_tickers(category="spot", symbol=symbol)
+        if tickers.get("retCode") != 0 or not tickers["result"]["list"]:
+            logger.warning(f"No se puede convertir {coin}: par {symbol} no encontrado")
             return 0.0
-        price = float(ticker["result"]["list"][0]["lastPrice"])
+        price = float(tickers["result"]["list"][0]["lastPrice"])
+        
+        # Vender al mercado
         order = bybit_session.place_order(
             category="spot",
-            symbol=f"{coin}USDT",
+            symbol=symbol,
             side="Sell",
             orderType="Market",
             qty=str(amount)
         )
-        if order["retCode"] == 0:
+        if order.get("retCode") == 0:
             usdt_received = amount * price
             logger.info(f"Convertido {amount} {coin} -> {usdt_received:.2f} USDT")
-            telegram_mensaje(f"💱 Conversión automática: {amount} {coin} -> {usdt_received:.2f} USDT")
+            telegram_mensaje(f"💱 Conversión: {amount} {coin} -> {usdt_received:.2f} USDT")
             return usdt_received
         else:
             logger.error(f"Error vendiendo {coin}: {order}")
@@ -130,21 +133,29 @@ def convertir_activo_a_usdt(coin, amount):
 def obtener_saldo_total_disponible():
     total = obtener_saldo_usdt_unificado()
     logger.info(f"Saldo USDT inicial: {total:.2f}")
+    
+    # Activos que podemos convertir (los que tienen par spot con USDT)
+    activos_convertibles = ["BTC", "SOL", "ETH", "BNB", "XRP", "DOGE", "ADA", "TRX", "LINK", "MATIC", "AVAX", "UNI"]
     try:
         resp = bybit_session.get_wallet_balance(accountType="UNIFIED")
         if resp.get("retCode") != 0:
-            logger.error(f"Error obteniendo todos los activos: {resp}")
+            logger.error(f"Error obteniendo otros activos: {resp}")
             return total
         for coin_data in resp["result"]["list"][0]["coin"]:
             coin = coin_data["coin"]
-            if coin != "USDT":
-                monto = float(coin_data["walletBalance"])
-                if monto > 0.001:
-                    logger.info(f"Detectado {monto} {coin}, convirtiendo...")
-                    total += convertir_activo_a_usdt(coin, monto)
-                    time.sleep(1)
+            if coin == "USDT":
+                continue
+            monto = float(coin_data["walletBalance"])
+            if monto < 0.001:
+                continue
+            if coin in activos_convertibles:
+                logger.info(f"Detectado {monto} {coin}, convirtiendo...")
+                total += convertir_activo_a_usdt(coin, monto)
+                time.sleep(1)
+            else:
+                logger.info(f"Ignorando {coin} (no convertible)")
     except Exception as e:
-        logger.error(f"Error obteniendo otros activos: {e}")
+        logger.error(f"Error procesando activos: {e}")
     logger.info(f"Saldo total disponible: {total:.2f} USDT")
     return total
 
@@ -285,7 +296,7 @@ def analizar_con_gemini(img, symbol):
 def ejecutar_analisis_diario():
     global decision_diaria
     logger.info("=== ANÁLISIS DIARIO CON IA ===")
-    telegram_mensaje("📈 Iniciando análisis diario con IA...")
+    telegram_mensaje("📈 Iniciando análisis diario...")
     for symbol in SYMBOLS:
         base = symbol.replace("USDT", "")
         df = obtener_velas_diarias(symbol, limit=100)
@@ -312,7 +323,7 @@ def ejecutar_analisis_diario():
             decision_diaria[base] = None
     telegram_mensaje(f"📅 Decisión del día: BTC={decision_diaria.get('BTC')}, SOL={decision_diaria.get('SOL')}")
 
-# ================= WEBSOCKET (ofertas con filtro APY) =================
+# ================= WEBSOCKET (solo para tener ofertas actualizadas) =================
 def on_message(ws, message):
     global ws_offers
     try:
@@ -321,40 +332,16 @@ def on_message(ws, message):
             for product in data["data"]:
                 pid = str(product.get("p"))
                 if pid in [PRODUCT_IDS["BTC"], PRODUCT_IDS["SOL"]]:
-                    # Filtrar ofertas según APY mínimo
-                    # Estructura esperada: product["b"] para Buy Low, product["s"] para Sell High
-                    # Cada elemento contiene "a" = APY en formato E8 (ej 23575% -> 23575 * 1e-8 = 0.0023575??? Revisar)
-                    # Normalmente el APY viene como entero: 23575 significa 235.75%
-                    # Por tanto para comparar con MIN_APY (200) convertimos a porcentaje
-                    def filtrar_ofertas(ofertas):
-                        if not ofertas:
-                            return []
-                        filtradas = []
-                        for quote in ofertas:
-                            apy_raw = int(quote.get("a", 0))
-                            apy_percent = apy_raw / 1e4  # si viene en base 10000? Por ejemplo 2357500 -> 235.75? Depende.
-                            # Según la documentación, "a" es APY en 1e8 (0.00000001). 235.75% = 2.3575 = 235750000 * 1e-8? 
-                            # Mejor usar la lógica que ya tenías: apy = int(quote.get("a",0)) / 1e8 para obtener decimal (ej 2.3575)
-                            # Luego multiplicar por 100 para porcentaje
-                            apy_decimal = int(quote.get("a", 0)) / 1e8  # 2.3575
-                            apy_percent = apy_decimal * 100
-                            if apy_percent >= MIN_APY:
-                                filtradas.append(quote)
-                        return filtradas
-                    if "b" in product:
-                        product["b"] = filtrar_ofertas(product["b"])
-                    if "s" in product:
-                        product["s"] = filtrar_ofertas(product["s"])
-                    # Solo guardar si tiene al menos una oferta válida
-                    if (product.get("b") and len(product["b"]) > 0) or (product.get("s") and len(product["s"]) > 0):
-                        ws_offers[pid] = product
-                        logger.info(f"Oferta guardada para {pid} con APY >= {MIN_APY}%")
-                    else:
-                        # Si no hay ofertas que cumplan, eliminar de ws_offers
-                        if pid in ws_offers:
-                            del ws_offers[pid]
+                    ws_offers[pid] = product
+                    # Mostrar solo cuando detecta APY alto (opcional)
+                    for key in ["b", "s"]:
+                        if key in product:
+                            for quote in product[key]:
+                                apy = int(quote.get("a", 0)) / 1e8
+                                if apy >= MIN_APY_PERCENT:
+                                    logger.info(f"Oferta APY alto: {pid} {key} -> {apy}%")
     except Exception as e:
-        logger.error(f"Error en WS message: {e}")
+        logger.error(f"Error en WS: {e}")
 
 def on_error(ws, error):
     logger.error(f"WS error: {error}")
@@ -370,7 +357,7 @@ def on_open(ws):
     global ws_connected
     ws.send(json.dumps({"op": "subscribe", "args": ["earn.dualassets.offers"]}))
     ws_connected = True
-    logger.info("WebSocket Dual Asset conectado y suscrito.")
+    logger.info("WebSocket Dual Asset conectado.")
 
 def start_websocket():
     websocket.enableTrace(False)
@@ -381,33 +368,31 @@ def start_websocket():
     return ws
 
 def obtener_mejor_oferta(symbol_base, decision):
+    """Devuelve la oferta con mayor APY que cumpla MIN_APY_PERCENT."""
     target_key = "b" if decision == "Buy Low" else "s"
     product_id = PRODUCT_IDS.get(symbol_base)
     if not product_id:
         return None
     product = ws_offers.get(product_id)
     if not product or target_key not in product:
-        logger.warning(f"No hay oferta para {symbol_base} con decisión {decision} (APY>= {MIN_APY}%)")
         return None
-    # Tomar la primera oferta (ya filtrada por APY alto)
-    quotes = product[target_key]
-    if not quotes:
-        return None
-    # Ordenar por APY descendente y elegir la mejor (aunque ya filtradas, por si hay varias)
     mejor = None
     mejor_apy = -1
-    for quote in quotes:
-        apy_decimal = int(quote.get("a", 0)) / 1e8
-        apy_percent = apy_decimal * 100
-        if apy_percent > mejor_apy:
-            mejor_apy = apy_percent
+    for quote in product[target_key]:
+        apy = int(quote.get("a", 0)) / 1e8
+        if apy >= MIN_APY_PERCENT and apy > mejor_apy:
+            mejor_apy = apy
             mejor = {
                 "productId": product_id,
-                "apy": apy_percent,
+                "apy": apy,
                 "maxAmount": float(quote.get("m", 0)),
                 "selectPrice": float(quote.get("s", 0)),
                 "expireTime": int(quote.get("x", 0))
             }
+    if mejor:
+        logger.info(f"Oferta seleccionada para {symbol_base}: APY {mejor['apy']}%")
+    else:
+        logger.warning(f"No hay oferta con APY >= {MIN_APY_PERCENT}% para {symbol_base}")
     return mejor
 
 def obtener_quote_fijo(product_id):
@@ -433,7 +418,7 @@ def obtener_quote_fijo(product_id):
                 "currentPrice": float(data["result"]["currentPrice"])
             }
         else:
-            logger.error(f"Error en quote para {product_id}: {data}")
+            logger.error(f"Error en quote {product_id}: {data}")
             return None
     except Exception as e:
         logger.error(f"Excepción quote: {e}")
@@ -480,10 +465,9 @@ def suscribir_dual_asset(product_id, amount_usdt, decision, quote_info):
             return False, None
     except Exception as e:
         logger.error(f"Excepción suscripción: {e}")
-        telegram_mensaje(f"❌ Excepción suscripción: {e}")
         return False, None
 
-# ================= POSICIONES ACTIVAS (desde API) =================
+# ================= POSICIONES ACTIVAS Y REPORTES =================
 def obtener_posiciones_activas():
     try:
         timestamp = str(int(time.time() * 1000))
@@ -520,47 +504,52 @@ def obtener_posiciones_activas():
 def reporte_posiciones():
     global ultimo_resumen
     ahora = time.time()
-    if ahora - ultimo_resumen >= 10800:  # 3 horas
+    if ahora - ultimo_resumen >= 10800:
         posiciones = obtener_posiciones_activas()
         if not posiciones:
             telegram_mensaje("📊 No hay posiciones activas en este momento.")
         else:
-            texto = f"📊 RESUMEN DE POSICIONES ACTIVAS ({len(posiciones)})\n"
+            texto = f"📊 POSICIONES ACTIVAS ({len(posiciones)})\n"
             for pos in posiciones:
                 venc = datetime.fromtimestamp(pos["expireTime"] / 1000).strftime("%H:%M UTC")
                 texto += f"🔹 {pos['productId']} | {pos['amount']:.0f} {pos['coin']} | vence {venc}\n"
                 tiempo_restante = (pos["expireTime"] / 1000) - ahora
                 if 0 < tiempo_restante <= 3600:
-                    telegram_mensaje(f"⚠️ POSICIÓN PRÓXIMA A VENCER\nProducto: {pos['productId']}\nVence en {tiempo_restante/60:.0f} minutos.")
+                    telegram_mensaje(f"⚠️ Vence pronto: {pos['productId']} en {tiempo_restante/60:.0f} min.")
             telegram_mensaje(texto)
         ultimo_resumen = ahora
 
 # ================= CICLO HORARIO =================
 def ciclo_horario():
+    global ultima_inversion_time
     try:
-        logger.info("🕒 Iniciando ciclo horario")
+        logger.info("🕒 EJECUTANDO CICLO HORARIO")
         telegram_mensaje("🔄 Ciclo horario: revisando saldo y ofertas...")
         
+        # Reporte de posiciones cada 3 horas
         reporte_posiciones()
         
+        # Obtener saldo total
         saldo = obtener_saldo_total_disponible()
-        telegram_mensaje(f"💰 Saldo total disponible: {saldo:.2f} USDT")
+        telegram_mensaje(f"💰 Saldo disponible: {saldo:.2f} USDT")
         
         if saldo < MIN_INVEST_USDT:
-            logger.info(f"Saldo insuficiente ({saldo:.2f} USDT). No se invierte ahora.")
+            logger.info(f"Saldo insuficiente ({saldo:.2f} < {MIN_INVEST_USDT})")
+            telegram_mensaje(f"⚠️ Saldo insuficiente para invertir. Mínimo: {MIN_INVEST_USDT} USDT")
             return
         
+        # Invertir para cada símbolo según decisión
         for symbol in SYMBOLS:
             base = symbol.replace("USDT", "")
             decision = decision_diaria.get(base)
             if not decision or decision == "Hold":
-                logger.info(f"{base}: Sin decisión válida (Hold o None)")
+                logger.info(f"{base}: decisión Hold, no se invierte")
                 continue
             
-            logger.info(f"Buscando oferta para {base} con decisión {decision}")
+            logger.info(f"Buscando oferta para {base} con dirección {decision} (APY mínimo {MIN_APY_PERCENT}%)")
             oferta = obtener_mejor_oferta(base, decision)
             if not oferta:
-                logger.warning(f"No hay oferta para {base} con dirección {decision} y APY>={MIN_APY}%")
+                logger.warning(f"No hay oferta válida para {base}")
                 continue
             
             quote = obtener_quote_fijo(oferta["productId"])
@@ -569,21 +558,22 @@ def ciclo_horario():
             
             monto = min(saldo, oferta["maxAmount"], quote["maxInvestmentAmount"])
             if monto < MIN_INVEST_USDT:
-                logger.info(f"Monto {monto} menor que mínimo {MIN_INVEST_USDT}")
+                logger.info(f"Monto {monto} es menor al mínimo")
                 continue
             
-            logger.info(f"Intentando suscribir {base} con {monto} USDT, APY {oferta['apy']:.2f}%")
+            logger.info(f"INVIRTIENDO: {base} - {decision} - {monto} USDT - APY {oferta['apy']}%")
             exito, order_id = suscribir_dual_asset(oferta["productId"], monto, decision, {**quote, "apy": oferta["apy"]})
             if exito:
                 telegram_mensaje(
-                    f"🟢 NUEVA INVERSIÓN DUAL ASSET\n"
+                    f"🟢 NUEVA INVERSIÓN\n"
                     f"Producto: {oferta['productId']}\n"
                     f"Dirección: {decision}\n"
                     f"Monto: {monto:.2f} USDT\n"
-                    f"APY: {oferta['apy']:.2f}%\n"
-                    f"Vence en 24 horas."
+                    f"APY: {oferta['apy']}%\n"
+                    f"Vence en 24h."
                 )
                 saldo -= monto
+                ultima_inversion_time = time.time()
                 if saldo < MIN_INVEST_USDT:
                     break
             else:
@@ -592,7 +582,7 @@ def ciclo_horario():
     except Exception as e:
         error_msg = f"Error en ciclo horario: {str(e)}\n{traceback.format_exc()}"
         logger.error(error_msg)
-        telegram_mensaje(f"❌ Error en ciclo horario: {str(e)}")
+        telegram_mensaje(f"❌ Error en ciclo: {str(e)}")
 
 # ================= KEEP ALIVE =================
 def keep_alive():
@@ -606,23 +596,28 @@ def keep_alive():
 
 # ================= MAIN =================
 def main():
-    logger.info("🚀 Bot Dual Asset con filtro APY mínimo (200%) iniciado")
-    telegram_mensaje(f"🚀 Bot Dual Asset activo - Solo considerará ofertas con APY >= {MIN_APY}%")
+    logger.info("🚀 Bot Dual Asset con filtro APY >= 200% iniciado")
+    telegram_mensaje("🚀 Bot Dual Asset activo - Filtro APY >= 200%, revisión cada hora")
     
     start_websocket()
     keep_alive()
-    time.sleep(5)
+    time.sleep(5)  # esperar WebSocket
     
+    # Programar análisis diario
     schedule.every().day.at(HORA_ANALISIS).do(ejecutar_analisis_diario)
+    # Programar ciclo horario
     schedule.every(1).hours.do(ciclo_horario)
     
+    # Ejecutar análisis inmediato si no hay decisión
     if not decision_diaria:
         ejecutar_analisis_diario()
     else:
-        telegram_mensaje(f"📌 Decisión del día: BTC={decision_diaria.get('BTC')}, SOL={decision_diaria.get('SOL')}")
+        telegram_mensaje(f"📌 Decisión actual: BTC={decision_diaria.get('BTC')}, SOL={decision_diaria.get('SOL')}")
     
+    # Ejecutar ciclo horario inmediatamente (para que actúe ya)
     ciclo_horario()
     
+    # Bucle principal
     while True:
         schedule.run_pending()
         time.sleep(60)
