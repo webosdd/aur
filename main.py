@@ -212,7 +212,6 @@ def generar_grafico_diario(df, symbol, soporte, resistencia, slope, intercept):
         ax.plot(x, df_plot['ema20'], 'yellow', lw=2, label='EMA20')
         
     if slope != 0:
-        # Corrección del cálculo visual de la línea de tendencia usando su posición real sobre los últimos 60 días
         x_start_idx = len(df_plot) - 60
         x_trend = np.array([x_start_idx, len(df_plot) - 1])
         y_trend = intercept + slope * np.array([0, 59])
@@ -256,16 +255,11 @@ def pil_to_base64(img):
 
 # ================= FILTRADO AVANZADO DE ZONA OPERATIVA =================
 def verificar_zona_operativa(precio_actual, soporte, resistencia):
-    """
-    Define por completo el contexto de la zona operativa.
-    Evita operar si el precio está comprimido en el centro exacto del rango dinámico (zona de ruido).
-    """
     rango_total = resistencia - soporte
     if rango_total <= 0:
         return False
     
     porcentaje_posicion = ((precio_actual - soporte) / rango_total) * 100
-    # Definimos como zona fuera de rango si está en tierra de nadie (entre 40% y 60% del rango de 20 días)
     if 40.0 <= porcentaje_posicion <= 60.0:
         return False
     return True
@@ -321,7 +315,6 @@ def ejecutar_analisis_diario():
         slope = df['trend_slope'].iloc[-1]
         intercept = df['trend_intercept'].iloc[-1]
         
-        # Validación obligatoria de contexto operativo completo
         en_zona = verificar_zona_operativa(precio_actual, soporte, resistencia)
         if not en_zona:
             msg_fuera_zona = f"⚠️ Patrón detectado pero fuera de zona operativa para {base} (Precio: {precio_actual:.2f}, Rango: {soporte:.2f} - {resistencia:.2f})"
@@ -335,7 +328,6 @@ def ejecutar_analisis_diario():
             img_path = f"/tmp/duplo_{base}.png"
             img.save(img_path)
             
-            # Identificar el sesgo de la tendencia para cumplir el log de estructura lineal
             sentido_mercado = "BULLISH" if slope > 0 else "BEARISH"
             logger.info(f"Log de Estructura de Mercado para {base}: {sentido_mercado} | Soporte: {soporte} | Resistencia: {resistencia}")
             
@@ -365,76 +357,69 @@ def ejecutar_analisis_diario():
 # ================= SOLUCIÓN DE CONSULTA DE PRODUCTOS DUAL ASSET =================
 def obtener_productos_dual_asset():
     """
-    CORRECCIÓN CRÍTICA: Se eliminan filtros iniciales restrictivos en los parámetros de URL.
-    Bybit devuelve listas paginadas basadas en el colateral. Consultamos de forma expandida para unificar todo el pool.
+    CORRECCIÓN CRÍTICA GLOBAL: 
+    1. Se eliminan las firmas manuales para este endpoint público evitando el error 'Expecting value'.
+    2. Se realiza una sola consulta limpia para traer TODO el pool de ofertas sin exclusiones.
     """
     productos_encontrados = []
-    # Consultamos tanto productos basados en inversión cripto como inversiones en dólares estables (USDT)
-    monedas_consulta = ["USDT", "BTC", "SOL"]
-    
     try:
-        for m_coin in monedas_consulta:
-            timestamp = str(int(time.time() * 1000))
-            recv_window = "5000"
-            query = f"status=active&coin={m_coin}"
-            payload = timestamp + BYBIT_API_KEY + recv_window + query
-            signature = hmac.new(BYBIT_API_SECRET.encode('utf-8'), payload.encode('utf-8'), hashlib.sha256).hexdigest()
+        url = "https://api.bybit.com/v5/earn/dual-asset/product?status=active"
+        headers = {"Content-Type": "application/json"}
+        
+        logger.info("Enviando petición de catálogo global a Bybit Earn...")
+        resp = requests.get(url, headers=headers, timeout=15)
+        
+        if resp.status_code != 200:
+            logger.error(f"Bybit respondió con código HTTP {resp.status_code}. Contenido: {resp.text[:200]}")
+            return []
             
-            headers = {
-                "X-BAPI-API-KEY": BYBIT_API_KEY,
-                "X-BAPI-TIMESTAMP": timestamp,
-                "X-BAPI-RECV-WINDOW": recv_window,
-                "X-BAPI-SIGN": signature,
-            }
-            url = f"https://api.bybit.com/v5/earn/dual-asset/product?{query}"
-            resp = requests.get(url, headers=headers, timeout=12)
-            data = resp.json()
-            
-            if data.get("retCode") == 0 and "result" in data and "list" in data["result"]:
-                for prod in data["result"]["list"]:
-                    product_id = prod.get("productId")
-                    # El campo 'coin' es la moneda de depósito, 'linkToCoin' es el activo subyacente vinculado
-                    dep_coin = prod.get("coin")
-                    linked_coin = prod.get("linkToCoin")
-                    direction = prod.get("direction") 
-                    
-                    apy_e8 = prod.get("apyE8", "0")
-                    apy_parseado = float(apy_e8) / 1e8 if float(apy_e8) > 0 else 0.0
-                    
-                    min_amount = float(prod.get("minAmount", 0))
-                    max_amount = float(prod.get("maxAmount", 0))
-                    
-                    productos_encontrados.append({
-                        "productId": product_id,
-                        "depositCoin": dep_coin,
-                        "linkToCoin": linked_coin,
-                        "direction": direction,
-                        "apy": apy_parseado,
-                        "minAmount": min_amount,
-                        "maxAmount": max_amount
-                    })
-        logger.info(f"Búsqueda global unificada: Total de productos activos parseados de Bybit: {len(productos_encontrados)}")
+        data = resp.json()
+        if data.get("retCode") == 0 and "result" in data and "list" in data["result"]:
+            for prod in data["result"]["list"]:
+                product_id = prod.get("productId")
+                dep_coin = prod.get("coin")          
+                linked_coin = prod.get("linkToCoin")  
+                direction = prod.get("direction")    
+                
+                apy_e8 = prod.get("apyE8", "0")
+                apy_parseado = float(apy_e8) / 1e8 if float(apy_e8) > 0 else 0.0
+                
+                min_amount = float(prod.get("minAmount", 0))
+                max_amount = float(prod.get("maxAmount", 0))
+                
+                productos_encontrados.append({
+                    "productId": product_id,
+                    "depositCoin": dep_coin,
+                    "linkToCoin": linked_coin,
+                    "direction": direction,
+                    "apy": apy_parseado,
+                    "minAmount": min_amount,
+                    "maxAmount": max_amount
+                })
+        logger.info(f"✔ Catálogo unificado sincronizado: {len(productos_encontrados)} productos analizados internamente.")
         return productos_encontrados
+    except requests.exceptions.RequestException as req_err:
+        logger.error(f"Error de red o timeout al conectar con Bybit: {req_err}")
+        return []
+    except json.JSONDecodeError as json_err:
+        logger.error(f"Error crítico de parseo. Bybit no envió un JSON estructurado. Detalle: {json_err}")
+        return []
     except Exception as e:
-        logger.error(f"Excepción severa escaneando API de productos: {e}")
+        logger.error(f"Excepción inesperada escaneando API de productos: {e}")
         return []
 
 def obtener_mejor_producto(coin, decision):
-    """Filtra y selecciona dinámicamente la oferta con mayor rendimiento."""
     pool_completo = obtener_productos_dual_asset()
     filtrados = []
     
     for p in pool_completo:
-        # Si queremos comprar abajo (Buy Low), depositamos USDT vinculados a la moneda base
         if decision == "Buy Low":
             if p["depositCoin"] == "USDT" and p["linkToCoin"] == coin and p["direction"] == "Buy Low":
                 filtrados.append(p)
-        # Si queremos vender arriba (Sell High), depositamos la cripto base directamente
         elif decision == "Sell High":
             if p["depositCoin"] == coin and p["direction"] == "Sell High":
                 filtrados.append(p)
                 
-    # Filtrar por requerimientos mínimos exigidos por el usuario
     validos = [f for f in filtrados if f["apy"] >= MIN_APY_PERCENT]
     if not validos:
         logger.warning(f"Filtro de Selección Vacío: No hay ofertas en la dirección {decision} para {coin} que superen el APR mínimo de {MIN_APY_PERCENT}%")
@@ -559,7 +544,7 @@ def obtener_posiciones_activas():
 def reporte_posiciones_bloqueadas():
     global ultimo_resumen
     ahora = time.time()
-    if ahora - ultimo_resumen >= 10800: # Registro recurrente informativo de cada 3 horas
+    if ahora - ultimo_resumen >= 10800: 
         posiciones = obtener_posiciones_activas()
         if not posiciones:
             telegram_mensaje("📊 Estado actual: No existen suscripciones bloqueadas en Dual Asset de momento.")
@@ -572,7 +557,7 @@ def reporte_posiciones_bloqueadas():
             telegram_mensaje(texto)
         ultimo_resumen = ahora
 
-# ================= CICLO EJECUTOR HORARIO HORARIO =================
+# ================= CICLO EJECUTOR HORARIO =================
 def ciclo_horario():
     try:
         logger.info("🕒 INICIANDO REVISIÓN EN CICLO HORARIO DE OFERTAS Y BALANCES")
@@ -587,7 +572,6 @@ def ciclo_horario():
                 logger.info(f"Acción para {base}: Omitido (Estado actual en Hold/Neutral). No se buscan suscripciones.")
                 continue
             
-            # Buscar el producto idóneo libre de restricciones erróneas de filtrado de monedas
             mejor_producto = obtener_mejor_producto(base, decision)
             if not mejor_producto:
                 logger.info(f"Rechazo en ciclo para {base}: No se localizaron ofertas vigentes que cumplan las reglas para la dirección {decision}.")
@@ -596,18 +580,13 @@ def ciclo_horario():
             product_id = mejor_producto["productId"]
             apy = mejor_producto["apy"]
             max_amount = mejor_producto["maxAmount"]
-            coin_deposito = mejor_producto["depositCoin"]
             
             quote = obtener_quote_fijo_dual_asset(product_id)
             if not quote:
                 logger.error(f"Fallo de comunicación al solicitar cotización en firme para {product_id}")
                 continue
             
-            # Gestión Dinámica de Colaterales según Requisitos del Contrato Dual Asset
-            monto_inversion = 0.0
-            
             if decision == "Buy Low":
-                # Requiere depositar USDT de forma nativa
                 if saldo_usdt < MIN_INVEST_USDT:
                     logger.info(f"Suscripción cancelada por liquidez: Saldo USDT ({saldo_usdt:.2f}) insuficiente para mínimo requerido ({MIN_INVEST_USDT}).")
                     continue
@@ -620,17 +599,14 @@ def ciclo_horario():
                     saldo_usdt -= monto_inversion
                     
             elif decision == "Sell High":
-                # Requiere stakear la Criptomoneda nativa (BTC/SOL). Verificamos si ya hay balance o compramos en Spot.
                 saldo_cripto_actual = obtener_saldo_cripto_unificado(base)
                 precio_par = quote["currentPrice"]
                 
-                # Definimos un valor equivalente estimado de la inversión traducido a cripto
                 monto_usdt_a_usar = min(saldo_usdt, max_amount * precio_par, quote["maxInvestmentAmount"] * precio_par)
                 if monto_usdt_a_usar < MIN_INVEST_USDT:
                     logger.info("Monto de inversión remanente insuficiente en balance USDT general.")
                     continue
                 
-                # Ejecutar compra spot preventiva inmediata si no contamos con el colateral bloqueable
                 monto_cripto_objetivo = monto_usdt_a_usar / precio_par
                 if saldo_cripto_actual < monto_cripto_objetivo:
                     exito_compra, nuevo_saldo_cripto = comprar_activo_en_spot(base, monto_usdt_a_usar)
@@ -639,14 +615,13 @@ def ciclo_horario():
                         continue
                     saldo_cripto_actual = nuevo_saldo_cripto
                 
-                # Asignamos el monto final en unidades de la moneda cripto correspondiente
                 monto_inversion = min(saldo_cripto_actual, max_amount, quote["maxInvestmentAmount"])
                 
                 logger.info(f"Suscripción autorizada para {base} [Sell High] con {monto_inversion} {base}. APY pactado: {apy}%")
                 exito, order_id = suscribir_dual_asset(product_id, monto_inversion, decision, quote)
                 if exito:
                     telegram_mensaje(f"🟢 SUSCRIPCIÓN ESTABLECIDA\nProducto: {product_id}\nMoneda Base: {base}\nDirección: {decision}\nMonto: {monto_inversion:.6f} {base}\nAPY: {apy}%")
-                    saldo_usdt = obtener_saldo_usdt_unificado() # Refrescar balance remanente real
+                    saldo_usdt = obtener_saldo_usdt_unificado() 
                     
             time.sleep(3)
     except Exception as e:
@@ -668,11 +643,10 @@ def main():
     keep_alive()
     time.sleep(2)
     
-    # Programación exacta de tareas recurrentes cronometradas
     schedule.every().day.at(HORA_ANALISIS).do(ejecutar_analisis_diario)
     schedule.every(1).hours.do(ciclo_horario)
     
-    # Ejecución inmediata inicial al encendido del contenedor de Railway
+    # Ejecuciones iniciales automáticas al levantar el bot
     ejecutar_analisis_diario()
     ciclo_horario()
     
