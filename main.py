@@ -104,7 +104,6 @@ def obtener_saldo_cripto_unificado(coin):
         return 0.0
 
 def comprar_activo_en_spot(coin, monto_usdt):
-    """Compra el activo base en mercado Spot si la dirección exige depositar la cripto (Sell High)"""
     try:
         symbol = f"{coin}USDT"
         logger.info(f"Comprando {coin} en Spot con {monto_usdt} USDT para cumplir requisitos de suscripción...")
@@ -116,7 +115,7 @@ def comprar_activo_en_spot(coin, monto_usdt):
             qty=str(monto_usdt)
         )
         if order.get("retCode") == 0:
-            time.sleep(2)  # Pausa de asentamiento en el balance unificado
+            time.sleep(2) 
             saldo_adquirido = obtener_saldo_cripto_unificado(coin)
             logger.info(f"Compra exitosa en Spot. Saldo disponible actual de {coin}: {saldo_adquirido}")
             return True, saldo_adquirido
@@ -317,8 +316,8 @@ def ejecutar_analisis_diario():
         
         en_zona = verificar_zona_operativa(precio_actual, soporte, resistencia)
         if not en_zona:
-            msg_fuera_zona = f"⚠️ Patrón detectado pero fuera de zona operativa para {base} (Precio: {precio_actual:.2f}, Rango: {soporte:.2f} - {resistencia:.2f})"
-            logger.warning(msg_fuera_zona)
+            msg_fuera_zona = f"⚠️ Patrón detectado pero fuera de zona operativa"
+            logger.warning(f"{msg_fuera_zona} para {base} (Precio: {precio_actual:.2f}, Rango: {soporte:.2f} - {resistencia:.2f})")
             telegram_mensaje(msg_fuera_zona)
             decision_diaria[base] = "Hold"
             continue
@@ -336,20 +335,24 @@ def ejecutar_analisis_diario():
         else:
             decision, razon, confianza = "Hold", "Error crítico generando matriz del gráfico", 0
 
+        # Razón de rechazo o aprobación y contador global de trades/suscripciones
+        estado_aprobacion = "Aprobado" if decision != "Hold" and confianza >= 60 else "Rechazado"
+
         log_completo_heartbeat = (
             f"🤖 Heartbeat de Análisis [{base}] -\n"
-            f"Dirección sugerida por Visión: {decision}\n"
+            f"Tendencia: {sentido_mercado}\n"
+            f"Dirección sugerida por Visión: {decision} ({estado_aprobacion})\n"
             f"Confianza de análisis: {confianza}%\n"
             f"Rango de Red de Soporte/Resistencia: [{soporte:.2f} - {resistencia:.2f}]\n"
-            f"Razón técnica: {razon}"
+            f"Razón técnica: {razon}\n"
+            f"Total histórico suscripciones: {global_suscripciones_count}"
         )
         logger.info(log_completo_heartbeat)
         telegram_mensaje(log_completo_heartbeat)
 
-        if decision != "Hold" and confianza >= 60:
+        if estado_aprobacion == "Aprobado":
             decision_diaria[base] = decision
         else:
-            logger.info(f"Suscripción rechazada o en espera para {base}. Razón: Confianza insuficiente o recomendación neutral de mantenimiento (Hold).")
             decision_diaria[base] = "Hold"
             
     telegram_mensaje(f"📌 Estado consolidado de intenciones del día: BTC={decision_diaria.get('BTC')}, SOL={decision_diaria.get('SOL')}")
@@ -357,16 +360,26 @@ def ejecutar_analisis_diario():
 # ================= SOLUCIÓN DE CONSULTA DE PRODUCTOS DUAL ASSET =================
 def obtener_productos_dual_asset():
     """
-    CORRECCIÓN CRÍTICA GLOBAL: 
-    1. Se eliminan las firmas manuales para este endpoint público evitando el error 'Expecting value'.
-    2. Se realiza una sola consulta limpia para traer TODO el pool de ofertas sin exclusiones.
+    Solución definitiva: Petición autenticada nativa.
+    Se eliminó el filtro '&coin=' de la URL para importar todo el pool.
     """
     productos_encontrados = []
     try:
-        url = "https://api.bybit.com/v5/earn/dual-asset/product?status=active"
-        headers = {"Content-Type": "application/json"}
+        timestamp = str(int(time.time() * 1000))
+        recv_window = "5000"
+        query = "status=active"
+        payload = timestamp + BYBIT_API_KEY + recv_window + query
+        signature = hmac.new(BYBIT_API_SECRET.encode('utf-8'), payload.encode('utf-8'), hashlib.sha256).hexdigest()
         
-        logger.info("Enviando petición de catálogo global a Bybit Earn...")
+        headers = {
+            "X-BAPI-API-KEY": BYBIT_API_KEY,
+            "X-BAPI-TIMESTAMP": timestamp,
+            "X-BAPI-RECV-WINDOW": recv_window,
+            "X-BAPI-SIGN": signature,
+        }
+        url = f"https://api.bybit.com/v5/earn/dual-asset/product?{query}"
+        
+        logger.info("Enviando petición autenticada de catálogo global a Bybit Earn...")
         resp = requests.get(url, headers=headers, timeout=15)
         
         if resp.status_code != 200:
@@ -656,3 +669,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
