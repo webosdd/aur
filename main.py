@@ -1,277 +1,184 @@
 import os
 import time
-import io
 import json
 import logging
 import requests
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-from scipy.stats import linregress
-from datetime import datetime, timezone
-from openai import OpenAI
-from pybit.unified_trading import HTTP
-from PIL import Image
-import base64
 import schedule
+from datetime import datetime, timezone, timedelta
+from openai import OpenAI
 
 # ================= CONFIGURACIÓN =================
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.FileHandler("analisis_btc.log"), logging.StreamHandler()]
+    handlers=[logging.FileHandler("tipster.log"), logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
 
 # Variables de entorno
-BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
-BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-if not all([BYBIT_API_KEY, BYBIT_API_SECRET, OPENROUTER_API_KEY, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
-    raise ValueError("❌ Faltan variables de entorno")
+if not all([OPENROUTER_API_KEY, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
+    raise ValueError("❌ Faltan variables de entorno: OPENROUTER_API_KEY, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID")
 
-SYMBOL = "BTCUSDT"
-INTERVALO_VELAS = "D"      # Velas diarias
-LIMITE_VELAS = 120         # Últimas 120 velas para gráfico
-
-# Cliente OpenRouter (Gemini con visión + internet)
+# Cliente OpenRouter con modelo que tiene acceso a internet
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=OPENROUTER_API_KEY,
     default_headers={
         "HTTP-Referer": "https://railway.app",
-        "X-Title": "BTC Dual Analyst"
+        "X-Title": "Tipster Deportivo IA"
     }
 )
-MODELO = "google/gemini-3.1-flash-image-preview:online"   # con internet
+MODELO = "google/gemini-3.1-flash-image-preview:online"   # con capacidad de navegación web
 
-# Cliente Bybit (solo para datos)
-bybit = HTTP(testnet=False, api_key=BYBIT_API_KEY, api_secret=BYBIT_API_SECRET)
+FUENTES_CONFIABLES = """
+- www.espn.com (estadísticas, resultados, lesiones)
+- www.flashscore.com (resultados en vivo, enfrentamientos directos)
+- www.sports-reference.com (estadísticas históricas)
+- www.understat.com (xG y estadísticas avanzadas de fútbol)
+- www.basketball-reference.com (NBA y baloncesto)
+- www.mlb.com (béisbol: calendarios, estadísticas, lesiones)
+- www.fangraphs.com (estadísticas avanzadas de béisbol)
+"""
 
 # ================= TELEGRAM =================
-def telegram_mensaje(texto):
+def telegram_mensaje(texto, parse_mode="HTML"):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": texto}, timeout=10)
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": texto,
+            "parse_mode": parse_mode,
+            "disable_web_page_preview": True
+        }
+        requests.post(url, data=payload, timeout=15)
     except Exception as e:
-        logger.error(f"Telegram error: {e}")
+        logger.error(f"Error Telegram: {e}")
 
-def telegram_enviar_imagen(fig, caption=""):
-    try:
-        buf = io.BytesIO()
-        fig.savefig(buf, format='png', bbox_inches='tight')
-        buf.seek(0)
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
-        files = {'photo': buf}
-        data = {'chat_id': TELEGRAM_CHAT_ID, 'caption': caption}
-        requests.post(url, files=files, data=data, timeout=15)
-        buf.close()
-        plt.close(fig)
-    except Exception as e:
-        logger.error(f"Error enviando imagen: {e}")
+# ================= BÚSQUEDA DE PARTIDOS (6 POR DEPORTE) =================
+def buscar_partidos_destacados():
+    """
+    Pide a la IA que busque en internet al menos 6 partidos de fútbol,
+    6 de baloncesto y 6 de béisbol para el día siguiente.
+    """
+    manana = (datetime.now(timezone.utc) + timedelta(days=1)).strftime('%Y-%m-%d')
+    prompt = f"""
+    Eres un tipster profesional con acceso a internet. Necesito que busques en internet los partidos más importantes que se jugarán el día {manana} (mañana) en los siguientes deportes:
 
-# ================= OBTENER DATOS BYBIT =================
-def obtener_velas_diarias(limit=100):
-    try:
-        resp = bybit.get_kline(category="spot", symbol=SYMBOL, interval=INTERVALO_VELAS, limit=limit)
-        if resp.get("retCode") != 0:
-            return pd.DataFrame()
-        lista = resp["result"]["list"][::-1]
-        df = pd.DataFrame(lista, columns=['time','open','high','low','close','volume','turnover'])
-        for col in ['open','high','low','close','volume']:
-            df[col] = df[col].astype(float)
-        df['time'] = pd.to_datetime(df['time'].astype(np.int64), unit='ms', utc=True)
-        df.set_index('time', inplace=True)
-        return df
-    except Exception as e:
-        logger.error(f"Error velas: {e}")
-        return pd.DataFrame()
+    - **Fútbol** (ligas: Champions, Europa League, Premier, LaLiga, Serie A, Bundesliga, Ligue 1, Libertadores, Brasileirão, etc.)
+    - **Baloncesto** (NBA, Euroliga, ACB, Liga Endesa, etc.)
+    - **Béisbol** (MLB, Liga Mexicana, ligas invernales, etc.)
 
-# ================= INDICADORES =================
-def calcular_indicadores(df):
-    if df.empty:
-        return df
-    df['ema20'] = df['close'].ewm(span=20).mean()
-    df['ema50'] = df['close'].ewm(span=50).mean()
-    delta = df['close'].diff()
-    gain = delta.where(delta > 0, 0).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    df['rsi'] = 100 - (100 / (1 + rs))
-    exp12 = df['close'].ewm(span=12, adjust=False).mean()
-    exp26 = df['close'].ewm(span=26, adjust=False).mean()
-    df['macd'] = exp12 - exp26
-    df['signal'] = df['macd'].ewm(span=9, adjust=False).mean()
-    df['histogram'] = df['macd'] - df['signal']
-    return df.dropna()
+    Para CADA deporte, selecciona al menos **6 partidos/eventos** (si hay más de 6 destacados, puedes incluir más). Debes priorizar:
+    - Partidos de alta relevancia (playoffs, clásicos, eliminatorias directas)
+    - Rivalidades históricas
+    - Momento de forma actual
+    - Interés mediático y de apuestas
 
-def soporte_resistencia_historicos(df):
-    if len(df) < 20:
-        return 0, 0
-    soporte = df['low'].rolling(20).min().iloc[-1]
-    resistencia = df['high'].rolling(20).max().iloc[-1]
-    return soporte, resistencia
+    Para cada partido, proporciona:
+    - deporte ("fútbol", "baloncesto" o "béisbol")
+    - liga/torneo (ej. "MLB", "NBA", "Champions League")
+    - encuentro (ej. "Yankees vs Red Sox", "Lakers vs Celtics")
+    - fecha_hora_utc (si la encuentras, en formato "YYYY-MM-DD HH:MM UTC", si no, pon "Horario por confirmar")
+    - destacado_razon (breve, máximo 30 palabras)
 
-def tendencia_regresion(df, ventana=80):
-    y = df['close'].values[-ventana:]
-    x = np.arange(len(y))
-    slope, intercept, r, _, _ = linregress(x, y)
-    return slope, intercept
+    Responde ÚNICAMENTE con un JSON válido, sin texto adicional, con esta estructura:
 
-# ================= GRÁFICO COMPLETO =================
-def generar_grafico(df, soporte, resistencia, slope, intercept):
-    df_plot = df.tail(LIMITE_VELAS).copy()
-    if df_plot.empty:
-        return None
+    {{
+      "partidos": [
+        {{ "deporte": "fútbol", "liga": "...", "encuentro": "...", "fecha_hora_utc": "...", "destacado_razon": "..." }},
+        ... (al menos 6 de fútbol)
+        {{ "deporte": "baloncesto", ... }}, ... (al menos 6)
+        {{ "deporte": "béisbol", ... }}, ... (al menos 6)
+      ]
+    }}
 
-    fig, ax = plt.subplots(figsize=(16, 10))
-    x = np.arange(len(df_plot))
-
-    # Velas japonesas
-    for i in range(len(df_plot)):
-        o = df_plot['open'].iloc[i]
-        h = df_plot['high'].iloc[i]
-        l = df_plot['low'].iloc[i]
-        c = df_plot['close'].iloc[i]
-        color = '#00ff00' if c >= o else '#ff0000'
-        ax.vlines(x[i], l, h, color=color, linewidth=1.5)
-        ax.add_patch(plt.Rectangle((x[i]-0.35, min(o,c)), 0.7, abs(c-o)+0.1, color=color, alpha=0.9))
-
-    # Soporte / Resistencia
-    ax.axhline(soporte, color='cyan', ls='--', lw=2, label=f'Soporte ({soporte:.0f})')
-    ax.axhline(resistencia, color='magenta', ls='--', lw=2, label=f'Resistencia ({resistencia:.0f})')
-
-    # EMAs
-    ax.plot(x, df_plot['ema20'], 'yellow', lw=2, label='EMA20')
-    ax.plot(x, df_plot['ema50'], 'orange', lw=2, label='EMA50')
-
-    # Línea de tendencia (regresión lineal)
-    y_trend = intercept + slope * x
-    ax.plot(x, y_trend, 'white', linestyle='-.', lw=2, label=f'Tendencia (pendiente {slope:.2f})')
-
-    # RSI en eje Y derecho
-    ax2 = ax.twinx()
-    ax2.plot(x, df_plot['rsi'], color='orange', lw=1.5, alpha=0.7, label='RSI')
-    ax2.axhline(70, color='red', linestyle='--', alpha=0.5)
-    ax2.axhline(30, color='green', linestyle='--', alpha=0.5)
-    ax2.set_ylabel('RSI', color='orange')
-
-    # MACD en otro eje Y
-    ax3 = ax.twinx()
-    ax3.spines['right'].set_position(('outward', 60))
-    ax3.plot(x, df_plot['macd'], 'blue', lw=1, label='MACD')
-    ax3.plot(x, df_plot['signal'], 'red', lw=1, label='Señal')
-    ax3.bar(x, df_plot['histogram'], color='gray', alpha=0.3, width=0.8)
-    ax3.set_ylabel('MACD', color='blue')
-
-    # Puntos de liquidez (máximos/mínimos recientes)
-    # Detectamos picos locales en highs y lows
-    highs = df_plot['high'].values
-    lows = df_plot['low'].values
-    for i in range(2, len(df_plot)-2):
-        if highs[i] > highs[i-1] and highs[i] > highs[i-2] and highs[i] > highs[i+1] and highs[i] > highs[i+2]:
-            ax.scatter(x[i], highs[i], s=100, c='white', marker='v', edgecolors='red', linewidth=2, zorder=5)
-        if lows[i] < lows[i-1] and lows[i] < lows[i-2] and lows[i] < lows[i+1] and lows[i] < lows[i+2]:
-            ax.scatter(x[i], lows[i], s=100, c='white', marker='^', edgecolors='green', linewidth=2, zorder=5)
-
-    ax.set_title(f"{SYMBOL} - Análisis Técnico Diario", color='white')
-    ax.set_xlabel('Días atrás', color='white')
-    ax.set_ylabel('Precio (USDT)', color='white')
-    ax.tick_params(colors='white')
-    for spine in ax.spines.values():
-        spine.set_color('white')
-    ax.set_facecolor('#121212')
-    fig.patch.set_facecolor('#121212')
-    ax.legend(loc='upper left')
-    fig.tight_layout()
-    return fig
-
-def fig_a_base64(fig):
-    buf = io.BytesIO()
-    fig.savefig(buf, format='png', bbox_inches='tight')
-    buf.seek(0)
-    img = Image.open(buf)
-    img = img.convert('RGB')
-    if img.width > 1200:
-        ratio = 1200 / img.width
-        new_size = (1200, int(img.height * ratio))
-        img = img.resize(new_size, Image.Resampling.LANCZOS)
-    out_buf = io.BytesIO()
-    img.save(out_buf, format='JPEG', quality=85)
-    b64 = base64.b64encode(out_buf.getvalue()).decode('utf-8')
-    plt.close(fig)
-    return f"data:image/jpeg;base64,{b64}"
-
-# ================= LLAMADAS A LA IA =================
-def analisis_tecnico_por_imagen(img_base64):
-    prompt = """
-    Eres un analista técnico experto. Analiza el gráfico diario de BTC/USDT y extrae la siguiente información. Responde SOLO con un JSON válido, sin texto adicional.
-
-    {
-      "precio_actual_usd": float,
-      "soporte_inmediato_usd": float,
-      "resistencia_inmediata_usd": float,
-      "tendencia": "Alcista | Bajista | Lateral",
-      "confianza_tecnica": 0-100,
-      "momentum": "Alcista | Bajista | Neutro",
-      "puntos_liquidez": ["zona de liquidez 1", "zona 2"],
-      "analisis_ema": "posición del precio vs EMAs",
-      "analisis_rsi": "nivel RSI e interpretación",
-      "analisis_macd": "estado del MACD",
-      "resumen_tecnico": "breve resumen"
-    }
+    Asegúrate de que los eventos sean REALES y estén programados para mañana. Usa tu capacidad de navegación web para verificarlo.
+    Si algún deporte no tiene suficientes partidos relevantes, incluye los que haya y nota que son pocos.
     """
     try:
         response = client.chat.completions.create(
             model=MODELO,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": img_base64}}
-                ]
-            }],
+            messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
-            max_tokens=800
+            max_tokens=2500
         )
         content = response.choices[0].message.content
         content = content.strip().strip('```json').strip('```').strip()
-        return json.loads(content)
+        data = json.loads(content)
+        partidos = data.get("partidos", [])
+        logger.info(f"Se encontraron {len(partidos)} partidos en total.")
+        return partidos
     except Exception as e:
-        logger.error(f"Error IA técnica: {e}")
-        return None
+        logger.error(f"Error en buscar_partidos_destacados: {e}")
+        return []
 
-def analisis_fundamental_y_unificado(tecnico_json):
+# ================= ANÁLISIS POR DEPORTE =================
+def analizar_partido(partido):
+    deporte = partido.get("deporte", "").lower()
+    encuentro = partido.get("encuentro", "")
+    liga = partido.get("liga", "")
+    
+    # Prompt base según deporte
+    if deporte == "fútbol":
+        prompt_detalle = """
+        - Predicción principal: resultado exacto o doble oportunidad.
+        - ¿Más o menos de 2.5 goles? (justifica)
+        - Total de tarjetas (amarillas+rojas) esperado (ej. "Entre 4 y 6")
+        - Total de córners esperado (ej. "Entre 8 y 10")
+        - ¿Ambos equipos marcan? (Sí/No)
+        - Jugador clave (ej. "Mbappé: más de 0.5 goles")
+        """
+    elif deporte == "baloncesto":
+        prompt_detalle = """
+        - Total de puntos del partido (más/menos de) con número (ej. "Más de 215.5")
+        - Hándicap favorito (ej. "Celtics -5.5")
+        - Jugador estrella y su línea de puntos (ej. "Tatum más de 28.5 pts")
+        - ¿Quién ganará el rebote total? (equipo)
+        """
+    elif deporte == "béisbol":
+        prompt_detalle = """
+        - Ganador del partido (moneyline)
+        - Total de carreras (más/menos de) (ej. "Más de 8.5")
+        - Hándicap de carreras (run line) (ej. "Yankees -1.5")
+        - Lanzador abridor clave y su efectividad esperada
+        - ¿Habrá jonrón? (Sí/No, y qué jugador tiene más probabilidad)
+        """
+    else:
+        prompt_detalle = "- Predicción principal y mercados relevantes."
+    
     prompt = f"""
-    Actúa como analista fundamental. Usa tu capacidad de navegación por internet para buscar información actualizada (fecha: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}) sobre Bitcoin:
+    Actúa como un tipster profesional con acceso a internet. Analiza el siguiente evento:
 
-    1. Crypto Fear & Greed Index (valor numérico y texto)
-    2. Flujo neto de ETFs de Bitcoin al contado (en millones USD, con signo + o -)
-    3. Noticias macroeconómicas relevantes (Fed, tasas, dólar)
-    4. Novedades regulatorias (ej. Ley GENIUS, noticias recientes)
-    5. Comportamiento de ballenas (acumulación o distribución)
-    6. Otras 2-3 noticias importantes
+    Deporte: {deporte}
+    Liga: {liga}
+    Encuentro: {encuentro}
+    Fecha (mañana): { (datetime.now(timezone.utc) + timedelta(days=1)).strftime('%Y-%m-%d') }
 
-    Luego integra esta información con el siguiente análisis técnico:
-    {json.dumps(tecnico_json, indent=2)}
+    Busca información actualizada (estadísticas recientes, lesiones, enfrentamientos directos, clima si aplica, etc.) y realiza las predicciones específicas:
 
-    Emite un veredicto unificado para las próximas horas/días (alcista, bajista o neutral), con confianza (0-100) y explicación.
-    Responde SOLO con JSON, sin texto extra:
+    {prompt_detalle}
 
+    Asigna un **nivel de confianza** del 0 al 100% para la predicción principal, justificándolo con datos concretos (ej. "últimos 5 partidos: 4 veces más de 2.5 goles", "lanzador con ERA 1.20 en últimos 3 salidas").
+
+    Escribe un análisis completo de 120-200 palabras explicando el razonamiento, citando estadísticas clave.
+
+    Responde SOLO con JSON válido:
     {{
-      "fear_greed_index": "ej. 22 - Miedo extremo",
-      "etf_flow_usd": -733,
-      "tendencias_macro": "texto breve",
-      "regulaciones_clave": "texto breve",
-      "comportamiento_ballenas": "texto breve",
-      "otras_noticias": ["noticia1", "noticia2"],
-      "resumen_fundamental": "resumen ejecutivo",
-      "veredicto_unificado": "Alcista | Bajista | Neutral",
-      "confianza_unificada": 0-100,
-      "explicacion_unificada": "explicación detallada"
+      "predicciones": {{
+        "prediccion_principal": "texto claro",
+        "detalles_mercados": {{
+          "mercado1": "valor",
+          "mercado2": "valor"
+        }},
+        "confianza": 85,
+        "justificacion_confianza": "breve texto"
+      }},
+      "analisis_completo": "texto extenso con el análisis detallado...",
+      "tips_adicionales": ["tip1", "tip2"]
     }}
     """
     try:
@@ -279,93 +186,206 @@ def analisis_fundamental_y_unificado(tecnico_json):
             model=MODELO,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
+            max_tokens=2000
+        )
+        content = response.choices[0].message.content
+        content = content.strip().strip('```json').strip('```').strip()
+        return json.loads(content)
+    except Exception as e:
+        logger.error(f"Error analizando {encuentro}: {e}")
+        return None
+
+def generar_combinada_sugerida(analisis_resumen):
+    """
+    Analisis_resumen es una lista de dicts con campos: encuentro, deporte, prediccion_principal, confianza.
+    """
+    prompt = f"""
+    Eres un tipster experto en combinadas. Con base en estos análisis:
+
+    {json.dumps(analisis_resumen, indent=2, ensure_ascii=False)}
+
+    Genera 2 o 3 apuestas combinadas (múltiples) uniendo las selecciones con mayor confianza y que no estén correlacionadas negativamente.
+    Para cada combinada, incluye:
+    - Nombre descriptivo
+    - Lista de selecciones (texto claro)
+    - Confianza global (0-100%)
+    - Razonamiento breve
+
+    Responde SOLO con JSON:
+    {{
+      "combinadas": [
+        {{
+          "nombre": "Combinada MLB + NBA",
+          "selecciones": ["selección 1", "selección 2", "selección 3"],
+          "confianza_global": 70,
+          "razonamiento": "texto"
+        }}
+      ]
+    }}
+    """
+    try:
+        response = client.chat.completions.create(
+            model=MODELO,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
             max_tokens=1200
         )
         content = response.choices[0].message.content
         content = content.strip().strip('```json').strip('```').strip()
         return json.loads(content)
     except Exception as e:
-        logger.error(f"Error IA fundamental: {e}")
-        return None
+        logger.error(f"Error generando combinada: {e}")
+        return {"combinadas": []}
 
-# ================= CICLO PRINCIPAL (CADA 5 HORAS) =================
-def ciclo_analisis():
-    logger.info("🔄 Iniciando ciclo de análisis dual (técnico + fundamental)")
-    telegram_mensaje("🔍 Iniciando análisis dual de BTC (gráfico + noticias) - cada 5h")
+# ================= FORMATEO Y ENVÍO A TELEGRAM =================
+def formatear_mensaje_partido(partido, analisis):
+    deporte = partido.get("deporte", "").capitalize()
+    encuentro = partido.get("encuentro", "Desconocido")
+    liga = partido.get("liga", "")
+    fecha = partido.get("fecha_hora_utc", "Horario por confirmar")
+    
+    predicciones = analisis.get("predicciones", {})
+    pred_principal = predicciones.get("prediccion_principal", "N/A")
+    confianza = predicciones.get("confianza", 0)
+    justificacion_confianza = predicciones.get("justificacion_confianza", "")
+    detalles = predicciones.get("detalles_mercados", {})
+    analisis_texto = analisis.get("analisis_completo", "Sin análisis.")
+    tips = analisis.get("tips_adicionales", [])
+    
+    msg = f"""
+<b>⚽ {deporte} - {liga}</b>
+<b>🏟️ {encuentro}</b>
+📅 <i>{fecha}</i>
 
-    # 1. Obtener datos y generar gráfico
-    df = obtener_velas_diarias(limit=LIMITE_VELAS)
-    if df.empty:
-        logger.error("No se obtuvieron velas")
-        telegram_mensaje("❌ Error: No se pudieron obtener velas de Bybit")
+🎯 <b>PRONÓSTICO PRINCIPAL:</b>
+<blockquote>{pred_principal}</blockquote>
+
+🔍 <b>Mercados específicos:</b>
+"""
+    for mercado, valor in detalles.items():
+        msg += f"• <b>{mercado}:</b> {valor}\n"
+    
+    msg += f"""
+😎 <b>Confianza:</b> {confianza}%
+💬 <i>{justificacion_confianza}</i>
+
+💎 <b>Análisis completo:</b>
+{analisis_texto}
+
+"""
+    if tips:
+        msg += "<b>💡 Tips adicionales:</b>\n"
+        for tip in tips:
+            msg += f"• {tip}\n"
+    msg += "\n" + "="*40 + "\n"
+    return msg
+
+def enviar_analisis_completo(partidos_con_analisis, combinadas):
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    intro = f"""
+🚀 <b>BOT TIPSTER DEPORTIVO - PREDICCIONES PARA MAÑANA</b>
+🤖 <i>Análisis generado el {now}</i>
+
+Se analizaron los partidos más destacados de fútbol, baloncesto y béisbol (mínimo 6 por deporte).
+    """
+    telegram_mensaje(intro, parse_mode="HTML")
+    
+    # Agrupar por deporte para mejor organización (opcional)
+    for item in partidos_con_analisis:
+        partido = item["partido"]
+        analisis = item["analisis"]
+        if analisis:
+            msg = formatear_mensaje_partido(partido, analisis)
+            telegram_mensaje(msg, parse_mode="HTML")
+            time.sleep(0.8)  # evitar flood
+    
+    if combinadas and combinadas.get("combinadas"):
+        msg_combi = "<b>🎲 COMBINADAS SUGERIDAS</b>\n\n"
+        for idx, comb in enumerate(combinadas["combinadas"], 1):
+            msg_combi += f"<b>🔹 {comb.get('nombre', f'Combinada {idx}')}</b>\n"
+            msg_combi += "Selecciones:\n"
+            for sel in comb.get("selecciones", []):
+                msg_combi += f"  • {sel}\n"
+            msg_combi += f"🎯 Confianza global: {comb.get('confianza_global', 0)}%\n"
+            msg_combi += f"🧠 Razonamiento: {comb.get('razonamiento', '')}\n\n"
+        telegram_mensaje(msg_combi, parse_mode="HTML")
+    else:
+        telegram_mensaje("No se generaron combinadas suficientes.", parse_mode="HTML")
+
+# ================= CICLO PRINCIPAL =================
+def ciclo_tipster():
+    logger.info("🔄 Iniciando ciclo tipster deportivo (fútbol, baloncesto, béisbol - 6+ cada uno)")
+    telegram_mensaje("🔍 Buscando al menos 6 partidos de fútbol, 6 de baloncesto y 6 de béisbol para mañana...", parse_mode="HTML")
+    
+    # 1. Obtener partidos (mínimo 18 en total)
+    partidos = buscar_partidos_destacados()
+    if not partidos:
+        logger.warning("No se encontraron partidos.")
+        telegram_mensaje("⚠️ No se pudo obtener lista de partidos. La IA no encontró suficientes eventos.", parse_mode="HTML")
         return
-
-    df = calcular_indicadores(df)
-    sop_hist, res_hist = soporte_resistencia_historicos(df)
-    slope, intercept = tendencia_regresion(df)
-
-    fig = generar_grafico(df, sop_hist, res_hist, slope, intercept)
-    if fig is None:
-        logger.error("Error generando gráfico")
+    
+    # Opcional: verificar que haya al menos 6 por deporte, si no, advertir
+    conteo = {"fútbol": 0, "baloncesto": 0, "béisbol": 0}
+    for p in partidos:
+        d = p.get("deporte", "").lower()
+        if d in conteo:
+            conteo[d] += 1
+    aviso = ""
+    for dep, cnt in conteo.items():
+        if cnt < 6:
+            aviso += f"⚠️ Solo {cnt} partidos de {dep} (se pidieron 6). "
+    if aviso:
+        telegram_mensaje(aviso, parse_mode="HTML")
+    
+    logger.info(f"Partidos obtenidos: Fútbol={conteo['fútbol']}, Baloncesto={conteo['baloncesto']}, Béisbol={conteo['béisbol']}")
+    
+    # 2. Analizar cada partido
+    analisis_resultados = []
+    for partido in partidos:
+        logger.info(f"Analizando: {partido.get('encuentro')} ({partido.get('deporte')})")
+        analisis = analizar_partido(partido)
+        if analisis:
+            analisis_resultados.append({"partido": partido, "analisis": analisis})
+        else:
+            logger.error(f"Falló análisis para {partido.get('encuentro')}")
+        time.sleep(2)  # pausa entre llamadas a la API
+    
+    if not analisis_resultados:
+        logger.error("No se pudo analizar ningún partido.")
+        telegram_mensaje("❌ Error crítico: ningún análisis válido obtenido.", parse_mode="HTML")
         return
+    
+    # 3. Preparar resumen para combinadas
+    resumen_combinada = []
+    for item in analisis_resultados:
+        p = item["partido"]
+        a = item["analisis"]
+        resumen_combinada.append({
+            "encuentro": p.get("encuentro"),
+            "deporte": p.get("deporte"),
+            "prediccion_principal": a.get("predicciones", {}).get("prediccion_principal"),
+            "confianza": a.get("predicciones", {}).get("confianza", 0)
+        })
+    combinadas = generar_combinada_sugerida(resumen_combinada)
+    
+    # 4. Enviar a Telegram
+    enviar_analisis_completo(analisis_resultados, combinadas)
+    logger.info("✅ Ciclo completado y enviado.")
 
-    # Enviar gráfico a Telegram
-    telegram_enviar_imagen(fig, caption=f"📊 Análisis Técnico {SYMBOL} - {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}")
-
-    # Convertir gráfico a base64 para IA
-    img_b64 = fig_a_base64(fig)
-
-    # 2. Análisis técnico por IA
-    tech = analisis_tecnico_por_imagen(img_b64)
-    if not tech:
-        telegram_mensaje("⚠️ Falló el análisis técnico con IA")
-        return
-
-    # Enviar resumen técnico a Telegram
-    msg_tech = (
-        f"📈 ANÁLISIS TÉCNICO\n"
-        f"Precio: ${tech.get('precio_actual_usd')}\n"
-        f"Soporte: ${tech.get('soporte_inmediato_usd')}\n"
-        f"Resistencia: ${tech.get('resistencia_inmediata_usd')}\n"
-        f"Tendencia: {tech.get('tendencia')}\n"
-        f"Confianza: {tech.get('confianza_tecnica')}%\n"
-        f"Resumen: {tech.get('resumen_tecnico')}"
-    )
-    telegram_mensaje(msg_tech)
-
-    # 3. Análisis fundamental + unificado (con internet)
-    fund = analisis_fundamental_y_unificado(tech)
-    if not fund:
-        telegram_mensaje("⚠️ Falló el análisis fundamental con internet")
-        return
-
-    msg_fund = (
-        f"🌍 ANÁLISIS FUNDAMENTAL + UNIFICADO\n"
-        f"Fear & Greed: {fund.get('fear_greed_index')}\n"
-        f"ETFs: {fund.get('etf_flow_usd')}M USD\n"
-        f"Macro: {fund.get('tendencias_macro')}\n"
-        f"Regulaciones: {fund.get('regulaciones_clave')}\n"
-        f"Ballenas: {fund.get('comportamiento_ballenas')}\n"
-        f"Noticias: {', '.join(fund.get('otras_noticias', []))}\n\n"
-        f"🎯 VEREDICTO UNIFICADO: {fund.get('veredicto_unificado')}\n"
-        f"🔒 Confianza: {fund.get('confianza_unificada')}%\n"
-        f"💡 Explicación: {fund.get('explicacion_unificada')}"
-    )
-    telegram_mensaje(msg_fund)
-
-    logger.info("✅ Ciclo de análisis completado")
-
-# ================= MAIN =================
-if __name__ == "__main__":
-    logger.info("🚀 Bot de Análisis Dual BTC iniciado")
-    telegram_mensaje("🚀 Bot de Análisis Dual BTC activo - Análisis cada 5 horas")
-
-    # Ejecutar una vez al inicio
-    ciclo_analisis()
-
-    # Programar cada 5 horas
-    schedule.every(5).hours.do(ciclo_analisis)
-
+# ================= MAIN CON SCHEDULE =================
+def main():
+    logger.info("🚀 Bot Tipster Deportivo (fútbol, baloncesto, béisbol) iniciado")
+    telegram_mensaje("🚀 Bot activo. Se ejecutará diariamente a las 21:00 UTC (18:00 ART/Brasil) y buscará 6+ partidos de cada deporte.", parse_mode="HTML")
+    
+    # Ejecutar una prueba inmediata (comentar si no se desea)
+    ciclo_tipster()
+    
+    # Programar cada día a las 21:00 UTC
+    schedule.every().day.at("21:00").do(ciclo_tipster)
+    
     while True:
         schedule.run_pending()
         time.sleep(60)
+
+if __name__ == "__main__":
+    main()
