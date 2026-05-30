@@ -1,2 +1,4 @@
 export MISE_PYTHON_GITHUB_ATTESTATIONS=false
 mise install python@3.11.10
+[tools]
+python = "3.12.4"
