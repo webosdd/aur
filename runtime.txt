@@ -1,1 +1,2 @@
-python-3.11.10
+export MISE_PYTHON_GITHUB_ATTESTATIONS=false
+mise install python@3.11.10
