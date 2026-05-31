@@ -53,9 +53,9 @@ if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
 if not SILICONFLOW_API_KEY:
     raise Exception("❌ Faltan SILICONFLOW_API_KEY")
 
-# Cliente SiliconFlow
+# Cliente SiliconFlow con el modelo de visión correcto
 client = OpenAI(api_key=SILICONFLOW_API_KEY, base_url="https://api.siliconflow.cn/v1")
-MODELO_VISION = "Tongyi-MAI/Z-Image-Turbo"   # Modelo de visión
+MODELO_VISION = "Qwen/Qwen2-VL-72B-Instruct"   # Modelo de visión-lenguaje
 
 # ================= FUNCIONES BYBIT =================
 def obtener_velas(limit=300):
@@ -389,7 +389,7 @@ def ciclo_trading():
 
 # ================= MAIN =================
 if __name__ == "__main__":
-    telegram_mensaje("🤖 Bot de Trading con IA Visión (Tongyi-MAI/Z-Image-Turbo) iniciado. Ciclo cada 3 minutos.")
+    telegram_mensaje("🤖 Bot de Trading con IA Visión (Qwen/Qwen2-VL-72B-Instruct) iniciado. Ciclo cada 3 minutos.")
     while True:
         ciclo_trading()
         time.sleep(CICLO_SEGUNDOS)
