@@ -9,3 +9,4 @@ pybit
 openai
 json-repair
 schedule
+python-telegram-bot==20.7
